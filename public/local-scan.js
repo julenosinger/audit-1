@@ -43,7 +43,11 @@
       risk: risk,
       contract: result.contract,
       capabilities: result.capabilities,
-      completeness: result.analysis && result.analysis.completeness
+      completeness: result.analysis && result.analysis.completeness,
+      bytecodeHash: result.bytecodeHash,
+      analysisVersion: result.analysisVersion,
+      payload: result.payload || null,
+      evidenceGraph: result.evidenceGraph || null
     };
   }
 

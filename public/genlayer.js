@@ -69,6 +69,16 @@
     return Promise.reject(new Error('genlayer-js not available'));
   }
 
+  // Synchronous accessor for the GenLayer client (null if not wired).
+  // The client must expose an `analyzeEvidence(payload)` or `write(payload)`
+  // method (see public/genlayer-auditor.js). Bundling genlayer-js and assigning
+  // `window.genlayer` is the supported wiring path for this no-bundler SPA.
+  function getClient() {
+    if (_client) return _client;
+    if (window.genlayer) { _client = window.genlayer; return _client; }
+    return null;
+  }
+
   // ── public API ─────────────────────────────────────────────────────────────
   // publish(contractAddr, score, verdict, summary) -> Promise<{ok, message, calldata?}>
   function publish(contractAddr, score, verdict, summary) {
@@ -177,6 +187,7 @@
     getOnChain: getOnChain,
     analyzeAndPublish: analyzeAndPublish,
     getAudit: getAudit,
+    getClient: getClient,
     copyToClipboard: copyToClipboard
   };
 })();

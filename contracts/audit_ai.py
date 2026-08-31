@@ -23,6 +23,7 @@ class AuditAI(gl.Contract):
     scores: TreeMap[str, str]      # contract address -> "0".."100"
     verdicts: TreeMap[str, str]    # contract address -> SAFE | WARNING | DANGER
     authors: TreeMap[str, str]     # contract address -> sender hex
+    analyses: TreeMap[str, str]    # contract address -> structured AI analysis (JSON text)
 
     def __init__(self):
         # TreeMaps are zero-initialized, but explicit construction makes the
@@ -31,6 +32,7 @@ class AuditAI(gl.Contract):
         self.scores = TreeMap[str, str]()
         self.verdicts = TreeMap[str, str]()
         self.authors = TreeMap[str, str]()
+        self.analyses = TreeMap[str, str]()
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -131,6 +133,39 @@ class AuditAI(gl.Contract):
 
         return score, verdict
 
+    # ── GenLayer-native write (structured evidence → semantic assessment) ────
+
+    @gl.public.write
+    def analyze_evidence(self, contract_addr: str, evidence_json: str) -> None:
+        if not self._valid_address(contract_addr):
+            raise RuntimeError("contract_addr must start with 0x and be 42 chars")
+
+        def get_input() -> str:
+            return evidence_json
+
+        result: str = gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task=(
+                "You are a smart-contract security analysis verifier. Based ONLY "
+                "on the supplied evidence JSON, produce a structured assessment "
+                "with: verdict (one of NO_CONFIRMED_VULNERABILITY, "
+                "POTENTIAL_VULNERABILITY, LIKELY_VULNERABILITY, "
+                "CONFIRMED_VULNERABILITY, NEEDS_REVIEW), confidence "
+                "(HIGH/MEDIUM/LOW), and a findings array where each finding has "
+                "id, category, severity, confidence, verdict, reasoning, "
+                "evidenceRefs (only ids present in the evidence), "
+                "contradictions, and recommendation."
+            ),
+            criteria="""
+                The response is a valid JSON object with verdict, confidence, and findings.
+                Every evidence reference points to an evidence id present in the supplied evidence.
+                The response does not invent facts, function names, storage slots, permissions, addresses, fees, selectors, or vulnerabilities.
+                The response distinguishes OBSERVED, INFERRED, and UNKNOWN.
+                The response is conservative and never confirms a vulnerability without explicit support in the evidence.
+            """,
+        )
+        self.analyses[contract_addr] = result
+
     # ── views ────────────────────────────────────────────────────────────────
 
     @gl.public.view
@@ -160,3 +195,7 @@ class AuditAI(gl.Contract):
     @gl.public.view
     def has_audit(self, contract_addr: str) -> bool:
         return self.reports.get(contract_addr, "") != ""
+
+    @gl.public.view
+    def get_analysis(self, contract_addr: str) -> str:
+        return self.analyses.get(contract_addr, "NO_ANALYSIS")

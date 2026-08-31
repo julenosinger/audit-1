@@ -686,6 +686,253 @@
     return res;
   }
 
+  // ── 2d. Interprocedural Analysis + Evidence Graph ──────────────────────────
+  function fnv1a32(str, seed) {
+    var h = (seed === undefined) ? 0x811c9dc5 : seed;
+    for (var i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = (h * 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  }
+
+  // Deterministic (non-cryptographic) fingerprint of the bytecode hex.
+  function bytecodeHash(hex) {
+    var s = hex || '';
+    var a = fnv1a32(s, 0x811c9dc5);
+    var b = fnv1a32(s.split('').reverse().join(''), 0x01000193);
+    function h8(n) { return ('0000000' + n.toString(16)).slice(-8); }
+    return '0x' + h8(a) + h8(b);
+  }
+
+  function blockIdAtPc(cfg, pc) {
+    for (var i = 0; i < cfg.blocks.length; i++) {
+      var b = cfg.blocks[i];
+      if (pc >= b.startPc && pc < (b.endPc || (b.startPc + 1))) return b.id;
+    }
+    return null;
+  }
+
+  function buildFunctionGraph(cfg, functionMap) {
+    var nodes = [], edges = [];
+    var fns = [];
+    Object.keys(functionMap).forEach(function (sel) {
+      var f = functionMap[sel];
+      if (f.entryPc !== null && f.entryPc !== undefined) fns.push({ selector: f.selector, name: f.name, entryPc: f.entryPc, confidence: f.confidence });
+    });
+    fns.sort(function (a, b) { return a.entryPc - b.entryPc; });
+
+    var entryToId = {};
+    fns.forEach(function (f, i) {
+      var id = 'fn_' + i;
+      nodes.push({ id: id, selector: f.selector, name: f.name, entryPc: f.entryPc, entryBlock: blockIdAtPc(cfg, f.entryPc), confidence: f.confidence, reachability: 'REACHABLE' });
+      entryToId[f.entryPc] = id;
+    });
+
+    // Function ownership per block (last function entry <= block start).
+    var blockFn = {};
+    cfg.blocks.forEach(function (b) {
+      var owner = null;
+      for (var i = 0; i < fns.length; i++) {
+        if (fns[i].entryPc <= b.startPc) owner = entryToId[fns[i].entryPc];
+        else break;
+      }
+      blockFn[b.id] = owner;
+    });
+
+    cfg.blocks.forEach(function (b) {
+      var fromFn = blockFn[b.id];
+      if (b.terminator === 'JUMP' || b.terminator === 'JUMPI') {
+        if (b.jumpTargetPc !== null && entryToId[b.jumpTargetPc]) {
+          var toFn = entryToId[b.jumpTargetPc];
+          edges.push({ from: fromFn, to: toFn, type: 'INTERNAL', pc: b.jumpTargetPc, blockId: b.id, confidence: 'HIGH' });
+        } else if (b.dynamicJump) {
+          edges.push({ from: fromFn, to: 'UNKNOWN', type: 'DYNAMIC', pc: null, blockId: b.id, confidence: 'LOW' });
+        }
+      }
+    });
+
+    return { nodes: nodes, edges: edges, blockFn: blockFn, entryToId: entryToId };
+  }
+
+  function buildStorageGraph(dataFlow) {
+    var slots = [];
+    var slotSet = {};
+    dataFlow.storageReads.concat(dataFlow.storageWrites).forEach(function (e) {
+      if (e.slotKey && !slotSet[e.slotKey]) { slotSet[e.slotKey] = true; slots.push(e.slotKey); }
+    });
+    slots.sort();
+
+    var reads = dataFlow.storageReads.filter(function (e) { return e.slotKey; });
+    var writes = dataFlow.storageWrites.filter(function (e) { return e.slotKey; });
+
+    // Dependencies within the same slot, ordered by pc.
+    var dependencies = [];
+    slots.forEach(function (slot) {
+      var evs = dataFlow.storageReads.concat(dataFlow.storageWrites)
+        .filter(function (e) { return e.slotKey === slot; })
+        .sort(function (a, b) { return a.pc - b.pc; });
+      for (var i = 0; i + 1 < evs.length; i++) {
+        var a = evs[i], b = evs[i + 1];
+        var type;
+        if (a.type === 'storage-write' && b.type === 'storage-read') type = 'WRITE_TO_READ';
+        else if (a.type === 'storage-write' && b.type === 'storage-write') type = 'WRITE_TO_WRITE';
+        else type = 'READ_TO_READ';
+        dependencies.push({ type: type, slot: slot, fromPc: a.pc, toPc: b.pc, confidence: 'HIGH' });
+      }
+    });
+
+    return { slots: slots, reads: reads, writes: writes, dependencies: dependencies };
+  }
+
+  function buildFunctionSummaries(cfg, functionMap, functionGraph, dataFlow) {
+    var summaries = {};
+    functionGraph.nodes.forEach(function (n) {
+      var entryPc = null;
+      Object.keys(functionMap).forEach(function (sel) { if (functionMap[sel].entryPc === n.entryPc) entryPc = functionMap[sel].entryPc; });
+      var blockIds = [];
+      cfg.blocks.forEach(function (b) { if (blockIdAtPc(cfg, n.entryPc) === b.id || b.startPc >= n.entryPc) { /* simplistic: blocks >= entry */ } });
+      // Determine owned blocks: blocks whose startPc >= entryPc and < next entry.
+      var nextEntry = Infinity;
+      functionGraph.nodes.forEach(function (m) { if (m.entryPc > n.entryPc && m.entryPc < nextEntry) nextEntry = m.entryPc; });
+      var ownedBlocks = cfg.blocks.filter(function (b) { return b.startPc >= n.entryPc && b.startPc < nextEntry; });
+
+      var reads = [], writes = [], externalCalls = [], conditions = [];
+      ownedBlocks.forEach(function (b) {
+        dataFlow.storageReads.forEach(function (r) { if (r.blockId === b.id) reads.push(r.slot); });
+        dataFlow.storageWrites.forEach(function (w) { if (w.blockId === b.id) writes.push(w.slot); });
+        dataFlow.externalCalls.forEach(function (c) { if (c.blockId === b.id) externalCalls.push(c.opcode); });
+        dataFlow.comparisons.forEach(function (c) { if (c.blockId === b.id) conditions.push(c.pc); });
+      });
+      summaries[n.id] = {
+        functionId: n.id,
+        selector: n.selector,
+        entryPc: n.entryPc,
+        reads: reads,
+        writes: writes,
+        internalCalls: functionGraph.edges.filter(function (e) { return e.from === n.id; }).map(function (e) { return e.to; }),
+        externalCalls: externalCalls,
+        conditions: conditions,
+        guards: [],
+        confidence: n.confidence
+      };
+    });
+    return summaries;
+  }
+
+  function buildEvidenceGraph(cfg, functionMap, dataFlow, findings, functionGraph) {
+    var nodes = [], edges = [];
+    var idSeq = 0;
+    function nid(prefix) { idSeq++; return prefix + '_' + idSeq; }
+
+    // FUNCTION nodes
+    var fnNode = {};
+    functionGraph.nodes.forEach(function (n) {
+      fnNode[n.id] = n.id;
+      nodes.push({ id: n.id, type: 'FUNCTION', selector: n.selector, entryPc: n.entryPc });
+    });
+
+    // STORAGE_SLOT nodes
+    var slotNode = {};
+    var slotSet = {};
+    dataFlow.storageReads.concat(dataFlow.storageWrites).forEach(function (e) {
+      if (e.slotKey && !slotSet[e.slotKey]) {
+        slotSet[e.slotKey] = true;
+        var sid = 'slot_' + e.slotKey.replace('0x', '');
+        slotNode[e.slotKey] = sid;
+        nodes.push({ id: sid, type: 'STORAGE_SLOT', slot: e.slotKey });
+      }
+    });
+
+    // EXTERNAL_CALL nodes
+    dataFlow.externalCalls.forEach(function (c) {
+      var id = 'call_' + c.pc;
+      nodes.push({ id: id, type: 'EXTERNAL_CALL', opcode: c.opcode, pc: c.pc });
+      var owner = functionGraph.blockFn[c.blockId];
+      if (owner) edges.push({ from: owner, to: id, type: 'CALLS', pc: c.pc });
+    });
+
+    // BASIC_BLOCK nodes
+    cfg.blocks.forEach(function (b) {
+      nodes.push({ id: 'blk_' + b.id, type: 'BASIC_BLOCK', startPc: b.startPc, reach: b.reach });
+    });
+
+    // CONDITION nodes
+    dataFlow.comparisons.forEach(function (c) {
+      var id = 'cond_' + c.pc;
+      nodes.push({ id: id, type: 'CONDITION', opcode: c.opcode, pc: c.pc });
+      var owner = functionGraph.blockFn[c.blockId];
+      if (owner) edges.push({ from: owner, to: id, type: 'USES', pc: c.pc });
+    });
+
+    // READ/WRITE edges (function -> slot)
+    dataFlow.storageReads.forEach(function (r) {
+      if (!r.slotKey) return;
+      var owner = functionGraph.blockFn[r.blockId];
+      if (owner && slotNode[r.slotKey]) edges.push({ from: owner, to: slotNode[r.slotKey], type: 'READS', pc: r.pc });
+    });
+    dataFlow.storageWrites.forEach(function (w) {
+      if (!w.slotKey) return;
+      var owner = functionGraph.blockFn[w.blockId];
+      if (owner && slotNode[w.slotKey]) edges.push({ from: owner, to: slotNode[w.slotKey], type: 'WRITES', pc: w.pc });
+    });
+
+    // FINDING nodes + DEPENDS_ON edges (to external-call / storage slots referenced in dataFlowEvidence)
+    (findings || []).forEach(function (f) {
+      var fnode = { id: f.id, type: 'FINDING', severity: f.severity, category: f.category };
+      nodes.push(fnode);
+      (f.dataFlowEvidence || []).forEach(function (d) {
+        // best-effort: link finding to referenced external-call/slot nodes
+        dataFlow.externalCalls.forEach(function (c) { if (String(d).indexOf('CALL @' + c.pc) !== -1) edges.push({ from: f.id, to: 'call_' + c.pc, type: 'DEPENDS_ON' }); });
+      });
+    });
+
+    return { nodes: nodes, edges: edges };
+  }
+
+  function collectEvidenceIds(evidenceGraph) {
+    var ids = {};
+    (evidenceGraph.nodes || []).forEach(function (n) { ids[n.id] = true; });
+    return ids;
+  }
+
+  function buildEvidenceTrace(result, findingId) {
+    var finding = (result.findings || []).filter(function (f) { return f.id === findingId; })[0];
+    if (!finding) return { findingId: findingId, trace: [] };
+    var trace = [{ type: 'FINDING', id: finding.id, severity: finding.severity }];
+    (finding.dataFlowEvidence || []).forEach(function (d) { trace.push({ type: 'DATA_FLOW', text: d }); });
+    (finding.controlFlowEvidence || []).forEach(function (c) { trace.push({ type: 'CONTROL_FLOW', text: c }); });
+    return { findingId: findingId, trace: trace };
+  }
+
+  function buildAuditPayload(result) {
+    return {
+      version: '5.0.0',
+      contract: {
+        address: result.contract.address,
+        chainId: result.contract.chainId,
+        bytecodeHash: result.bytecodeHash,
+        bytecodeSize: result.contract.bytecodeSize
+      },
+      analysis: {
+        completeness: result.analysis.completeness,
+        components: result.analysis.components,
+        functionGraph: result.functionGraph,
+        storageGraph: result.storageGraph,
+        functionSummaries: result.functionSummaries,
+        dataFlow: {
+          storageReads: result.dataFlow.storageReads,
+          storageWrites: result.dataFlow.storageWrites,
+          externalCalls: result.dataFlow.externalCalls,
+          reentrancy: result.dataFlow.reentrancy,
+          reentrancyGuard: result.dataFlow.reentrancyGuard
+        },
+        evidenceGraph: result.evidenceGraph
+      },
+      findings: result.findings
+    };
+  }
+
   // ── 3. Finding engine ──────────────────────────────────────────────────────
   var SEVERITY_WEIGHT = { CRITICAL: 60, HIGH: 25, MEDIUM: 12, LOW: 5, INFO: 0 };
   var CONFIDENCE_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.4 };
@@ -1337,6 +1584,8 @@
     var dis = disassemble(hex);
     var bodyLen = hex.length / 2;
     result.contract.bytecodeSize = bodyLen;
+    result.bytecodeHash = bytecodeHash(hex);
+    result.analysisVersion = '5.0.0';
 
     // Control-flow analysis.
     var cfg = buildCfg(dis.instructions);
@@ -1400,6 +1649,12 @@
     var originGate = hasConditionalGate(executable, 'ORIGIN');
     var functionMap = analyzeSelectorDispatcher(cfg.blocks);
     result.functionMap = functionMap;
+
+    // Interprocedural analysis.
+    var functionGraph = buildFunctionGraph(cfg, functionMap);
+    result.functionGraph = functionGraph;
+    result.storageGraph = buildStorageGraph(dataFlow);
+    result.functionSummaries = buildFunctionSummaries(cfg, functionMap, functionGraph, dataFlow);
 
     var ctx = {
       instructions: dis.instructions,
@@ -1465,6 +1720,9 @@
       return (sevRank[a.severity] - sevRank[b.severity]) || (confRank[a.confidence] - confRank[b.confidence]);
     });
 
+    result.evidenceGraph = buildEvidenceGraph(cfg, functionMap, dataFlow, result.findings, functionGraph);
+    result.evidenceIds = collectEvidenceIds(result.evidenceGraph);
+
     result.risk = assessRisk(result.findings, completeness);
 
     // Inferred / unknown summaries (kept separate from observed facts)
@@ -1477,6 +1735,7 @@
     result.summary = buildSummary(result);
     result.analysisText = result.summary;
     result.context = buildContext(result, hex);
+    result.payload = buildAuditPayload(result);
 
     return result;
   }
@@ -1556,6 +1815,12 @@
     execBlockStackDF: execBlockStackDF,
     analyzeDataFlow: analyzeDataFlow,
     resolveJumpTarget: resolveJumpTarget,
+    buildFunctionGraph: buildFunctionGraph,
+    buildStorageGraph: buildStorageGraph,
+    buildEvidenceGraph: buildEvidenceGraph,
+    buildEvidenceTrace: buildEvidenceTrace,
+    buildAuditPayload: buildAuditPayload,
+    bytecodeHash: bytecodeHash,
     analyze: analyze,
     auditContract: auditContract,
     getFindings: getFindings,

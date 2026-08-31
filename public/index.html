@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="genlayer.js"></script>
+<script src="genlayer-auditor.js"></script>
 <script src="audit-engine.js"></script>
 <script src="local-scan.js"></script>
 <style>
@@ -161,6 +162,13 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .rc-footer-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .llm-btn{color:var(--blue);border-color:rgba(74,158,255,.4);background:rgba(74,158,255,.06)}
 .llm-btn:hover{background:rgba(74,158,255,.14)}
+.rc-glstatus{display:flex;flex-direction:column;gap:4px;padding:8px 18px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:9px}
+.gl-status-item{display:flex;justify-content:space-between;align-items:center;color:var(--muted)}
+.gl-status-badge{font-weight:700;padding:1px 6px;border-radius:4px;border:1px solid var(--border)}
+.gl-ok{color:var(--green);border-color:rgba(0,255,136,.25)}
+.gl-pending{color:var(--yellow);border-color:rgba(245,166,35,.25)}
+.gl-fail{color:var(--red);border-color:rgba(255,59,59,.25)}
+.gl-finalized{color:var(--blue);border-color:rgba(74,158,255,.25)}
 
 /* ── PORTFOLIO CARD ── */
 .portfolio-card{background:var(--surf2);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
@@ -677,7 +685,8 @@ function buildResultCard(data, address, chainId) {
     verdict: level,
     confidence: confidence,
     summary: (data.summary || data.analysis || ''),
-    context: data.context || data.summary || data.analysis || ''
+    context: data.context || data.summary || data.analysis || '',
+    payload: data.payload || null
   };
 
   const glPublished = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(address);
@@ -733,11 +742,15 @@ function buildResultCard(data, address, chainId) {
       <div class="rc-findings-title">Findings</div>
       ${findingsHtml}
     </div>
+    <div class="rc-glstatus">
+      <span class="gl-status-item">Local Analysis <span class="gl-status-badge gl-ok">Complete</span></span>
+      <span class="gl-status-item">GenLayer Analysis <span class="gl-status-badge" id="gl-analysis-${address.toLowerCase()}">Not requested</span></span>
+    </div>
     <div class="rc-footer">
       <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
       <div class="rc-footer-actions">
         ${glActionHtml}
-        <button type="button" class="publish-btn llm-btn" data-gl-analyze="${address.toLowerCase()}" onclick="adjudicateGL('${address}')">Adjudicate with GenLayer LLM</button>
+        <button type="button" class="publish-btn llm-btn" onclick="requestGenLayerAnalysis('${address}')">Analyze with GenLayer AI</button>
       </div>
       <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
     </div>
@@ -1320,6 +1333,68 @@ function applyOnChainResult(addr, raw) {
     if (b && b.textContent.indexOf('LLM') === -1) b.textContent += ' · LLM';
   });
   appendAIMessage(`🧠 **GenLayer LLM adjudicated:**\nScore **${parts[0]}** · Verdict **${parts[1]}**\n\n${parts[2]}`);
+}
+
+function setGLAnalysisStatus(addr, status) {
+  const el = document.getElementById('gl-analysis-' + String(addr).toLowerCase());
+  if (!el) return;
+  const map = {
+    'PENDING':   { text: 'Analyzing…',        cls: 'gl-pending' },
+    'FINALIZED': { text: 'Finalized',         cls: 'gl-finalized' },
+    'FAILED':    { text: 'Unavailable',       cls: 'gl-fail' },
+    'TIMEOUT':   { text: 'Timed out',         cls: 'gl-fail' },
+    'INVALID':   { text: 'Invalid response',  cls: 'gl-fail' },
+    'NOT_REQUESTED': { text: 'Not requested', cls: '' }
+  };
+  const m = map[status] || { text: status, cls: '' };
+  el.textContent = m.text;
+  el.className = 'gl-status-badge ' + m.cls;
+}
+
+async function requestGenLayerAnalysis(addr) {
+  const lower = String(addr).toLowerCase();
+  const data = GL_AUDIT_STORE[lower];
+  if (!data || !data.payload) { alert('No local analysis available for this address.'); return; }
+  if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
+    alert('Set the GenLayer contract address first (top bar).');
+    if (window.AuditAIGenLayer) setGenlayerContractUI();
+    if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
+  }
+  const auditor = window.AuditAIGenLayerAuditor;
+  if (!auditor) { setGLAnalysisStatus(addr, 'FAILED'); return; }
+
+  setGLAnalysisStatus(addr, 'PENDING');
+  const client = window.AuditAIGenLayer.getClient();
+  const res = await auditor.analyze(client, data.payload, { timeoutMs: 90000 });
+
+  if (res.status === 'FINALIZED') {
+    setGLAnalysisStatus(addr, 'FINALIZED');
+    showGenLayerResult(addr, res);
+  } else if (res.status === 'TIMEOUT') {
+    setGLAnalysisStatus(addr, 'TIMEOUT');
+    appendAIMessage('⚠️ GenLayer analysis timed out — local analysis remains valid.');
+  } else if (res.status === 'INVALID') {
+    setGLAnalysisStatus(addr, 'INVALID');
+    appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
+  } else {
+    setGLAnalysisStatus(addr, 'FAILED');
+    appendAIMessage('⚠️ GenLayer analysis unavailable — local analysis remains valid.');
+  }
+}
+
+function showGenLayerResult(addr, res) {
+  const gl = res.genlayer;
+  const merged = res.merged && res.merged.final;
+  let msg = '🧠 **GenLayer AI analysis finalized.**\n';
+  if (gl) {
+    msg += 'Verdict: **' + gl.verdict + '** (confidence ' + (gl.confidence || '?') + ')\n';
+    if (gl.globalAssessment && gl.globalAssessment.riskLevel) msg += 'AI risk level: **' + gl.globalAssessment.riskLevel + '**\n';
+    (gl.findings || []).forEach(function (f) {
+      msg += '• [' + f.severity + '/' + f.confidence + '] ' + (f.title || f.category) + (f.reasoning ? ' — ' + f.reasoning : '') + '\n';
+    });
+  }
+  if (merged) msg += '\nFinal risk: **' + merged.risk + '** (' + merged.status + ')';
+  appendAIMessage(msg);
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
