@@ -162,22 +162,33 @@
     return Promise.reject(new Error('client does not implement analyzeEvidence/write'));
   }
 
+  function emit(opts, state, detail) {
+    if (opts && typeof opts.onStatus === 'function') {
+      try { opts.onStatus(state, detail); } catch (e) {}
+    }
+  }
+
   async function analyze(client, result, opts) {
     opts = opts || {};
     var payload = buildPayload(result);
     var timeoutMs = opts.timeoutMs || 90000;
     if (!client) {
+      emit(opts, 'FAILED', 'GENLAYER_UNAVAILABLE');
       return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null };
     }
     try {
       var resp = await withTimeout(doRequest(client, payload, opts), timeoutMs);
-      if (resp === 'TIMEOUT') return { status: 'TIMEOUT', payload: payload, local: result, genlayer: null };
-      if (resp === null) return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null };
+      if (resp === 'TIMEOUT') { emit(opts, 'TIMEOUT'); return { status: 'TIMEOUT', payload: payload, local: result, genlayer: null }; }
+      if (resp === null) { emit(opts, 'FAILED', 'GENLAYER_UNAVAILABLE'); return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null }; }
+      emit(opts, 'VALIDATING');
       var v = validateResponse(resp, payload);
-      if (!v.valid) return { status: 'INVALID', errors: v.errors, payload: payload, local: result, genlayer: null };
+      if (!v.valid) { emit(opts, 'INVALID', v.errors); return { status: 'INVALID', errors: v.errors, payload: payload, local: result, genlayer: null }; }
+      emit(opts, 'VALIDATED');
       return { status: 'FINALIZED', payload: payload, local: result, genlayer: resp, merged: mergeResults(result, resp) };
     } catch (e) {
-      return { status: 'FAILED', error: (e && e.message) || 'GENLAYER_ERROR', payload: payload, local: result, genlayer: null };
+      var code = (e && e.message) || 'GENLAYER_ERROR';
+      emit(opts, 'FAILED', code);
+      return { status: 'FAILED', error: code, payload: payload, local: result, genlayer: null };
     }
   }
 

@@ -14,6 +14,12 @@
   var STORAGE_KEY = 'auditai.genlayer.contract';
   var PUBLISHED_KEY = 'auditai.genlayer.published';
 
+  // ── Production contract configuration (single authoritative source) ────────
+  // The real AuditAI Intelligent Contract address on Bradbury. Empty means the
+  // contract is not deployed yet (GENLAYER_AUDITOR_NOT_DEPLOYED). The UI keeps a
+  // localStorage override (STORAGE_KEY) as an advanced/debug escape hatch only.
+  var DEFAULT_CONTRACT_ADDRESS = '';
+
   // ── GenLayer networks ──────────────────────────────────────────────────────
   // chainId + RPC from the official Networks docs:
   //   https://docs.genlayer.com/developers/networks
@@ -23,7 +29,9 @@
   };
 
   function getContract() {
-    try { return localStorage.getItem(STORAGE_KEY) || ''; } catch (e) { return ''; }
+    var stored = '';
+    try { stored = localStorage.getItem(STORAGE_KEY) || ''; } catch (e) { stored = ''; }
+    return stored || DEFAULT_CONTRACT_ADDRESS;
   }
 
   function setContract(addr) {
@@ -182,6 +190,7 @@
     STORAGE_KEY: STORAGE_KEY,
     PUBLISHED_KEY: PUBLISHED_KEY,
     NETWORKS: NETWORKS,
+    DEFAULT_CONTRACT_ADDRESS: DEFAULT_CONTRACT_ADDRESS,
     getContract: getContract,
     setContract: setContract,
     short: short,

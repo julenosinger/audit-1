@@ -752,7 +752,7 @@ function buildResultCard(data, address, chainId) {
       <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
       <div class="rc-footer-actions">
         ${glActionHtml}
-        <button type="button" class="publish-btn llm-btn" onclick="requestGenLayerAnalysis('${address}')">Analyze with GenLayer AI</button>
+        <button type="button" class="publish-btn llm-btn" data-gl-analyze="${address.toLowerCase()}" onclick="requestGenLayerAnalysis('${address}')">Analyze with GenLayer AI</button>
       </div>
       <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
     </div>
@@ -1341,16 +1341,54 @@ function setGLAnalysisStatus(addr, status) {
   const el = document.getElementById('gl-analysis-' + String(addr).toLowerCase());
   if (!el) return;
   const map = {
-    'PENDING':   { text: 'Analyzing with GenLayer…', cls: 'gl-pending' },
-    'FINALIZED': { text: 'Complete',               cls: 'gl-finalized' },
-    'FAILED':    { text: 'Unavailable',            cls: 'gl-fail' },
-    'TIMEOUT':   { text: 'Timed out',              cls: 'gl-fail' },
-    'INVALID':   { text: 'Invalid response',       cls: 'gl-fail' },
-    'NOT_REQUESTED': { text: 'Not requested',      cls: '' }
+    'PREPARING':   { text: 'Preparing evidence…',     cls: 'gl-pending' },
+    'CONNECTING':  { text: 'Connecting to GenLayer…', cls: 'gl-pending' },
+    'WAITING_WALLET': { text: 'Waiting for wallet…',  cls: 'gl-pending' },
+    'SUBMITTED':   { text: 'Transaction submitted…',  cls: 'gl-pending' },
+    'FINALIZING':  { text: 'Finalizing…',             cls: 'gl-pending' },
+    'RETRIEVING':  { text: 'Retrieving result…',      cls: 'gl-pending' },
+    'VALIDATING':  { text: 'Validating result…',      cls: 'gl-pending' },
+    'PENDING':     { text: 'Analyzing with GenLayer…', cls: 'gl-pending' },
+    'COMPLETE':    { text: 'Complete',                cls: 'gl-finalized' },
+    'FINALIZED':   { text: 'Complete',                cls: 'gl-finalized' },
+    'FAILED':      { text: 'Unavailable',             cls: 'gl-fail' },
+    'TIMEOUT':     { text: 'Timed out',               cls: 'gl-fail' },
+    'INVALID':     { text: 'Invalid response',        cls: 'gl-fail' },
+    'NOT_REQUESTED': { text: 'Not requested',         cls: '' }
   };
   const m = map[status] || { text: status, cls: '' };
   el.textContent = m.text;
   el.className = 'gl-status-badge ' + m.cls;
+}
+
+const GL_INFLIGHT = {};
+
+function setGLAnalyzeBusy(addr, busy) {
+  document.querySelectorAll(`[data-gl-analyze="${String(addr).toLowerCase()}"]`).forEach(btn => {
+    btn.disabled = !!busy;
+    btn.textContent = busy ? 'Analyzing…' : 'Analyze with GenLayer AI';
+  });
+}
+
+function showGenLayerError(err) {
+  const base = String(err || '').split(':')[0];
+  const map = {
+    'GENLAYER_AUDITOR_NOT_DEPLOYED': 'no AuditAI contract is deployed/configured on Bradbury. Deploy `contracts/audit_ai.py` and set the address.',
+    'WALLET_REQUIRED': 'a connected wallet is required to sign the transaction.',
+    'WRONG_NETWORK': 'your wallet is on the wrong network. Switch to Bradbury (chain 4221).',
+    'USER_REJECTED': 'the transaction was rejected in your wallet.',
+    'INSUFFICIENT_BALANCE': 'your wallet has insufficient balance to pay for the transaction.',
+    'TRANSACTION_FAILED': 'the GenLayer transaction failed/reverted.',
+    'TRANSACTION_TIMEOUT': 'the GenLayer transaction timed out waiting for finalization.',
+    'NO_RESULT': 'the contract has no stored analysis yet (the validator may still be executing, or none is running).',
+    'INVALID_RESULT_JSON': 'GenLayer returned a result that could not be parsed.',
+    'GENLAYER_NETWORK_UNAVAILABLE': 'the GenLayer Bradbury network is unreachable.',
+    'SDK_UNAVAILABLE': 'the GenLayer SDK failed to initialize.',
+    'METHOD_MISSING': 'the deployed contract does not expose analyze_evidence/get_analysis.',
+    'NO_TX_HASH': 'the transaction was submitted but no hash was returned.',
+    'CONTRACT_UNAVAILABLE': 'the AuditAI contract is not reachable on Bradbury.'
+  };
+  appendAIMessage('⚠️ **' + base + '** — ' + (map[base] || (err + '.')) + ' Local analysis remains valid.');
 }
 
 async function requestGenLayerAnalysis(addr) {
@@ -1358,10 +1396,12 @@ async function requestGenLayerAnalysis(addr) {
   const data = GL_AUDIT_STORE[lower];
   if (!data || !data.payload) { alert('No local analysis available for this address.'); return; }
 
+  if (GL_INFLIGHT[lower]) { appendAIMessage('⏳ GenLayer analysis already in progress for this contract — please wait.'); return; }
+
   if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
-    alert('Set the GenLayer contract address first (top bar).');
+    appendAIMessage('⚠️ **GENLAYER_AUDITOR_NOT_DEPLOYED** — no AuditAI contract is configured on Bradbury. Deploy `contracts/audit_ai.py` and set the address. Local analysis remains valid.');
     if (window.AuditAIGenLayer) setGenlayerContractUI();
-    if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
+    return;
   }
 
   const auditor = window.AuditAIGenLayerAuditor;
@@ -1370,41 +1410,61 @@ async function requestGenLayerAnalysis(addr) {
   const client = window.AuditAIGenLayer.getClient();
   if (!client) { setGLAnalysisStatus(addr, 'FAILED'); appendAIMessage('⚠️ GenLayer SDK not initialized.'); return; }
 
-  setGLAnalysisStatus(addr, 'PENDING');
-  const account = walletAddress || null; // must be connected to Bradbury (chainId 4221)
-
-  const res = await auditor.analyze(client, data.payload, {
-    timeoutMs: 180000,
-    contractAddress: window.AuditAIGenLayer.getContract(),
-    account: account
-  });
-
-  if (res.status === 'FINALIZED') {
-    setGLAnalysisStatus(addr, 'FINALIZED');
-    showGenLayerResult(addr, res);
-  } else if (res.status === 'TIMEOUT') {
-    setGLAnalysisStatus(addr, 'TIMEOUT');
-    appendAIMessage('⚠️ GenLayer analysis timed out — local analysis remains valid.');
-  } else if (res.status === 'INVALID') {
-    setGLAnalysisStatus(addr, 'INVALID');
-    appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
-  } else {
+  if (!walletAddress) {
+    setGLAnalysisStatus(addr, 'NOT_REQUESTED');
+    appendAIMessage('⚠️ **WALLET_REQUIRED** — connect a wallet to sign the GenLayer transaction, then retry. Local analysis remains valid.');
+    await connectWallet();
+    return;
+  }
+  if (String(walletChainId) !== '4221') {
     setGLAnalysisStatus(addr, 'FAILED');
-    const err = res.error || 'unknown';
-    if (err === 'WALLET_REQUIRED') {
-      appendAIMessage('⚠️ GenLayer analysis needs a wallet connected to **Bradbury (chain 4221)** to sign the transaction. Connect your wallet and retry — local analysis remains valid.');
-    } else if (err === 'NO_CONTRACT' || err === 'CONTRACT_UNAVAILABLE') {
-      appendAIMessage('⚠️ GenLayer audit contract is not deployed/reachable on Bradbury. Deploy `contracts/audit_ai.py` and set its address in the top bar. Local analysis remains valid.');
+    appendAIMessage('⚠️ **WRONG_NETWORK** — wallet is on chain ' + (walletChainId || 'unknown') + ' but GenLayer requires **Bradbury (chain 4221)**. Switch networks in your wallet, then retry. Local analysis remains valid.');
+    return;
+  }
+
+  GL_INFLIGHT[lower] = true;
+  setGLAnalysisStatus(addr, 'PREPARING');
+  setGLAnalyzeBusy(addr, true);
+  data.glTxHash = null;
+
+  try {
+    const res = await auditor.analyze(client, data.payload, {
+      timeoutMs: 180000,
+      contractAddress: window.AuditAIGenLayer.getContract(),
+      account: walletAddress,
+      onStatus: function (state, detail) {
+        if (state === 'SUBMITTED') data.glTxHash = detail;
+        setGLAnalysisStatus(addr, state);
+      }
+    });
+
+    if (res.status === 'FINALIZED') {
+      setGLAnalysisStatus(addr, 'FINALIZED');
+      showGenLayerResult(addr, res);
+    } else if (res.status === 'TIMEOUT') {
+      setGLAnalysisStatus(addr, 'TIMEOUT');
+      appendAIMessage('⚠️ GenLayer analysis timed out — local analysis remains valid.');
+    } else if (res.status === 'INVALID') {
+      setGLAnalysisStatus(addr, 'INVALID');
+      appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
     } else {
-      appendAIMessage('⚠️ GenLayer analysis failed: ' + err + '. Local analysis remains valid.');
+      setGLAnalysisStatus(addr, 'FAILED');
+      showGenLayerError(res.error);
     }
+  } finally {
+    setGLAnalyzeBusy(addr, false);
+    delete GL_INFLIGHT[lower];
   }
 }
 
 function showGenLayerResult(addr, res) {
   const gl = res.genlayer;
   const merged = res.merged && res.merged.final;
+  const data = GL_AUDIT_STORE[String(addr).toLowerCase()];
   let msg = '🧠 **GenLayer AI analysis finalized.**\n';
+  if (data && data.glTxHash && window.AuditAIGenLayer) {
+    msg += 'Transaction: `' + data.glTxHash + '`\nNetwork: **Bradbury** · Contract: `' + window.AuditAIGenLayer.getContract() + '`\n';
+  }
   if (gl) {
     msg += 'Verdict: **' + gl.verdict + '** (confidence ' + (gl.confidence || '?') + ')\n';
     if (gl.globalAssessment && gl.globalAssessment.riskLevel) msg += 'AI risk level: **' + gl.globalAssessment.riskLevel + '**\n';
