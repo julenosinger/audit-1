@@ -259,7 +259,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
       <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
-      <div class="topbar-pill gl-pill" id="glPill" onclick="setGenlayerContractUI()" title="Set GenLayer contract address">GenLayer contract: <span id="glStatus">not set</span></div>
+      <div class="topbar-pill gl-pill" id="glContractPill" onclick="setGenlayerContractUI()" title="Set GenLayer contract address">GenLayer: <span id="glStatus">not set</span></div>
     </div>
     <button class="wallet-btn" id="walletBtn" onclick="connectWallet()">
       <div class="wallet-dot" id="walletDot"></div>
@@ -628,6 +628,11 @@ function buildResultCard(data, address, chainId) {
     summary: (data.analysis || '') + (data.findings || []).map(f => f.title).join('; ')
   };
 
+  const glPublished = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(address);
+  const glActionHtml = glPublished
+    ? '<span class="onchain-badge">ON-CHAIN</span>'
+    : `<button type="button" class="publish-btn" data-gl-publish="${address.toLowerCase()}" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>`;
+
   const SEV_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2, INFO: 3 };
   const findings = (data.findings || []).slice().sort((a,b) => (SEV_ORDER[a.severity]??9)-(SEV_ORDER[b.severity]??9));
 
@@ -670,7 +675,7 @@ function buildResultCard(data, address, chainId) {
     </div>
     <div class="rc-footer">
       <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
-      <button class="publish-btn" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>
+      ${glActionHtml}
       <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
     </div>
   </div>`;
@@ -1075,46 +1080,62 @@ document.addEventListener('keydown', e => {
 // ═══════════════════════════════════════════════════════════════════════════════
 function updateGLStatus() {
   const el = document.getElementById('glStatus');
-  if (el) el.textContent = window.AuditAIGenLayer.short(window.AuditAIGenLayer.getContract());
+  if (!el || !window.AuditAIGenLayer) return;
+  el.textContent = window.AuditAIGenLayer.short(window.AuditAIGenLayer.getContract());
 }
 
 function setGenlayerContractUI() {
+  if (!window.AuditAIGenLayer) return;
   const cur = window.AuditAIGenLayer.getContract();
   const input = prompt('GenLayer Intelligent Contract address (contracts/audit_ai.py):', cur || '0x');
   if (input === null) return;
   const addr = String(input).trim();
+  if (!window.AuditAIGenLayer.isSet(addr)) {
+    alert('Invalid address. Expected 0x followed by 40 hex characters.');
+    return;
+  }
   window.AuditAIGenLayer.setContract(addr);
   updateGLStatus();
-  if (window.AuditAIGenLayer.isSet(addr)) {
-    appendAIMessage(`✅ GenLayer contract set: \`${addr}\`. Audit results can now be published on-chain.`);
-  } else {
-    appendAIMessage('⚠️ That does not look like a 0x address (42 hex chars). Saved anyway.');
-  }
+}
+
+function markGLButtonPublished(addr) {
+  const lower = String(addr).toLowerCase();
+  document.querySelectorAll('[data-gl-publish]').forEach(btn => {
+    if (btn.getAttribute('data-gl-publish') === lower) {
+      const badge = document.createElement('span');
+      badge.className = 'onchain-badge';
+      badge.textContent = 'ON-CHAIN';
+      btn.replaceWith(badge);
+    }
+  });
 }
 
 async function publishToGenLayer(addr) {
+  if (!window.AuditAIGenLayer) return;
   const data = GL_AUDIT_STORE[addr.toLowerCase()];
-  if (!data) { appendAIMessage('⚠️ No audit result available for this address.'); return; }
+  if (!data) { alert('No audit result available for this address.'); return; }
 
   if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
+    alert('Set the GenLayer contract address first (top bar).');
     setGenlayerContractUI();
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  appendAIMessage(`Publishing audit for \`${addr.slice(0, 10)}…\` to GenLayer…`);
   const res = await window.AuditAIGenLayer.publish(addr, data.score, data.verdict, data.summary);
 
-  if (res.ok) {
+  if (res.ok || res.fallback) {
     window.AuditAIGenLayer.markPublished(addr);
-    appendAIMessage(`✅ Published on GenLayer.\n\nScore **${data.score}** · Verdict **${data.verdict}**\n${data.summary}`);
-  } else if (res.fallback) {
-    window.AuditAIGenLayer.markPublished(addr);
-    appendAIMessage(
-      `ℹ️ **genlayer-js not wired yet** — publish from GenLayer Studio instead.\n\n` +
-      `Contract: \`${res.contract}\`\n\nMethod + args:\n\`${res.calldata}\``
-    );
+    markGLButtonPublished(addr);
+    renderSidebar();
+    if (res.fallback) {
+      window.AuditAIGenLayer.copyToClipboard(res.calldata);
+      alert('Copied to clipboard. Paste in GenLayer Studio → publish_audit:\n\n' + res.calldata);
+    }
+  } else if (res.needContract) {
+    alert(res.message);
+    setGenlayerContractUI();
   } else {
-    appendAIMessage(`⚠️ ${res.message}`);
+    alert(res.message);
   }
 }
 

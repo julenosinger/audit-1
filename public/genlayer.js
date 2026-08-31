@@ -111,6 +111,26 @@
     }).catch(function () { return null; });
   }
 
+  function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) {}
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  }
+
   window.AuditAIGenLayer = {
     STORAGE_KEY: STORAGE_KEY,
     PUBLISHED_KEY: PUBLISHED_KEY,
@@ -122,6 +142,7 @@
     isPublished: isPublished,
     markPublished: markPublished,
     publish: publish,
-    getOnChain: getOnChain
+    getOnChain: getOnChain,
+    copyToClipboard: copyToClipboard
   };
 })();
