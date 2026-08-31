@@ -4,7 +4,8 @@
 // A technically honest static analyzer for EVM bytecode:
 //
 //   bytecode → EVM Disassembler → Control Flow Graph → Reachability
-//            → Stack/Selector analysis → Static Rules → Finding Engine → Risk Engine
+//            → Stack/Selector analysis → Data-Flow Analysis → Security Rules
+//            → Finding Engine → Risk Engine
 //
 // It NEVER claims a contract is "SAFE" merely because no rule fired, and NEVER
 // reports a vulnerability from a weak heuristic alone. Findings carry severity,
@@ -39,7 +40,7 @@
 })(function () {
   'use strict';
 
-  var VERSION = '3.0.0';
+  var VERSION = '4.0.0';
 
   // ── 1. EVM opcode table ────────────────────────────────────────────────────
   // name -> { byte, imm } where imm is the number of immediate data bytes.
@@ -294,20 +295,31 @@
       blocks[id].successors.forEach(function (s) { if (typeof s === 'number') work.push(s); });
     }
 
-    // Dead = unreachable AND not a JUMPDEST start (not a potential dynamic target) AND not entry.
+    // Reachability classification: REACHABLE / MAYBE_REACHABLE / UNREACHABLE.
+    // MAYBE_REACHABLE = a JUMPDEST-start block not statically reachable (a
+    // potential dynamic-jump target). UNREACHABLE = neither reachable nor a
+    // potential jump target.
     blocks.forEach(function (b) {
-      if (!b.reachable && b.id !== 0 && !jumpdests[b.startPc]) b.dead = true;
+      if (b.reachable) b.reach = 'REACHABLE';
+      else if (b.id === 0) b.reach = 'REACHABLE';
+      else if (jumpdests[b.startPc]) b.reach = 'MAYBE_REACHABLE';
+      else { b.reach = 'UNREACHABLE'; b.dead = true; }
     });
     instructions.forEach(function (ins) {
       if (ins.reachable !== true) ins.reachable = false;
+      ins.reach = blocks[ins.block] ? blocks[ins.block].reach : 'UNREACHABLE';
       ins.dead = blocks[ins.block] ? blocks[ins.block].dead : false;
     });
 
-    var staticJumps = 0, dynamicJumps = 0, reachableIns = 0, deadIns = 0;
+    var staticJumps = 0, dynamicJumps = 0, reachableIns = 0, maybeIns = 0, deadIns = 0;
     blocks.forEach(function (b) {
       if (b.terminator === 'JUMP' || b.terminator === 'JUMPI') { if (b.dynamicJump) dynamicJumps++; else staticJumps++; }
     });
-    instructions.forEach(function (ins) { if (ins.dead) deadIns++; else if (ins.reachable) reachableIns++; });
+    instructions.forEach(function (ins) {
+      if (ins.reach === 'REACHABLE') reachableIns++;
+      else if (ins.reach === 'MAYBE_REACHABLE') maybeIns++;
+      else deadIns++;
+    });
 
     return {
       blocks: blocks,
@@ -317,6 +329,7 @@
         blocks: blocks.length,
         edges: edges.length,
         reachableInstructions: reachableIns,
+        maybeReachableInstructions: maybeIns,
         deadInstructions: deadIns,
         staticJumps: staticJumps,
         dynamicJumps: dynamicJumps
@@ -368,6 +381,311 @@
     return map;
   }
 
+  // ── 2c. Data-Flow Analysis ──────────────────────────────────────────────────
+  var DF_LIMITS = {
+    MAX_BLOCKS: 4000,
+    MAX_PATHS: 256,
+    MAX_DEPTH: 64,
+    MAX_ITERATIONS: 200000,
+    MAX_STACK_DEPTH: 512
+  };
+
+  function dfDescribe(v) {
+    if (!v) return { known: false, value: null, source: 'UNKNOWN' };
+    if (v.k === 'const') return { known: true, value: '0x' + v.v.toString(16), source: v.source };
+    return { known: false, value: null, source: v.source || 'UNKNOWN' };
+  }
+
+  function dfDepsOf(v) { return (v && v.deps) ? v.deps : []; }
+
+  // Symbolic stack executor WITH provenance. Pops/pushes carry a `source` and
+  // dependency list. Unsupported opcodes propagate UNKNOWN (never guessed).
+  // When `ev` is provided, storage/comparison/call events are recorded there.
+  function execBlockStackDF(list, ev) {
+    var stack = [];
+    var vals = 0;
+    function push(v) { if (stack.length >= DF_LIMITS.MAX_STACK_DEPTH) { stack.pop(); } stack.push(v); vals++; }
+    function mkConst(v, source, pc) { return { k: 'const', v: toBig(v), source: source, deps: [pc] }; }
+    function mkUnk(source, pc) { return { k: 'unknown', v: null, source: source, deps: [pc] }; }
+    function derived(op, a, b, pc) {
+      if (a && b && a.k === 'const' && b.k === 'const') {
+        var r;
+        if (op === 'ADD') r = a.v + b.v; else if (op === 'MUL') r = a.v * b.v;
+        else if (op === 'SUB') r = b.v - a.v; else if (op === 'AND') r = a.v & b.v;
+        else if (op === 'OR') r = a.v | b.v; else if (op === 'XOR') r = a.v ^ b.v;
+        else if (op === 'SHL') r = b.v << a.v; else if (op === 'SHR') r = b.v >> a.v;
+        else if (op === 'DIV') r = (a.v === BigInt(0) ? BigInt(0) : b.v / a.v);
+        else if (op === 'MOD') r = (a.v === BigInt(0) ? BigInt(0) : b.v % a.v);
+        return { k: 'const', v: r, source: 'DERIVED', deps: dfDepsOf(a).concat(dfDepsOf(b), [pc]) };
+      }
+      return { k: 'unknown', v: null, source: 'DERIVED', deps: dfDepsOf(a).concat(dfDepsOf(b), [pc]) };
+    }
+
+    for (var i = 0; i < list.length; i++) {
+      var ins = list[i], op = ins.opcode, m;
+      if (op === 'PUSH0') { push(mkConst(0, 'PUSH', ins.pc)); continue; }
+      if ((m = /^PUSH(\d+)$/.exec(op))) {
+        var n = parseInt(m[1], 10);
+        if (ins.argument.length === 2 * n) push(mkConst('0x' + ins.argument, 'PUSH', ins.pc));
+        else push(mkUnk('PUSH', ins.pc));
+        continue;
+      }
+      if ((m = /^DUP(\d+)$/.exec(op))) { var dn = parseInt(m[1], 10); push(stack.length >= dn ? stack[stack.length - dn] : mkUnk('UNKNOWN', ins.pc)); continue; }
+      if ((m = /^SWAP(\d+)$/.exec(op))) {
+        var sn = parseInt(m[1], 10);
+        if (stack.length >= sn + 1) { var top = stack.pop(); var idx = stack.length - sn; var other = stack[idx]; stack[idx] = top; stack.push(other); }
+        else { for (var k2 = 0; k2 < stack.length; k2++) stack[k2] = mkUnk('UNKNOWN', ins.pc); }
+        continue;
+      }
+      if (op === 'POP') { stack.pop(); continue; }
+      if (op === 'CALLER') { push(mkUnk('CALLER', ins.pc)); continue; }
+      if (op === 'ORIGIN') { push(mkUnk('ORIGIN', ins.pc)); continue; }
+      if (op === 'CALLVALUE') { push(mkUnk('CALLVALUE', ins.pc)); continue; }
+      if (op === 'CALLDATASIZE') { push(mkUnk('CALLDATASIZE', ins.pc)); continue; }
+      if (op === 'ADDRESS') { push(mkUnk('ADDRESS', ins.pc)); continue; }
+      if (op === 'BALANCE') { stack.pop(); push(mkUnk('BALANCE', ins.pc)); continue; }
+      if (op === 'TIMESTAMP') { push(mkUnk('TIMESTAMP', ins.pc)); continue; }
+      if (op === 'NUMBER') { push(mkUnk('NUMBER', ins.pc)); continue; }
+      if (op === 'CHAINID') { push(mkUnk('CHAINID', ins.pc)); continue; }
+      if (op === 'GAS') { push(mkUnk('GAS', ins.pc)); continue; }
+      if (op === 'CALLDATALOAD') { stack.pop(); push(mkUnk('CALLDATALOAD', ins.pc)); continue; }
+      if (op === 'ADD' || op === 'MUL' || op === 'SUB' || op === 'AND' || op === 'OR' || op === 'XOR' || op === 'SHL' || op === 'SHR' || op === 'DIV' || op === 'MOD') {
+        var a = stack.pop(), b = stack.pop();
+        push(derived(op, a, b, ins.pc));
+        continue;
+      }
+      if (op === 'EQ' || op === 'LT' || op === 'GT') {
+        var e1 = stack.pop(), e2 = stack.pop();
+        var evRes = derived('EQ', e1, e2, ins.pc); // reuse const-folding for comparison value
+        if (op === 'LT' || op === 'GT') {
+          var lv = (e1 && e2 && e1.k === 'const' && e2.k === 'const') ? (op === 'LT' ? (e2.v < e1.v) : (e2.v > e1.v)) : null;
+          evRes = (lv === null) ? mkUnk('DERIVED', ins.pc) : mkConst(lv ? 1 : 0, 'DERIVED', ins.pc);
+          evRes.deps = dfDepsOf(e1).concat(dfDepsOf(e2), [ins.pc]);
+        }
+        push(evRes);
+        if (ev) {
+          ev.comparisons.push({ opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach, left: dfDescribe(e1), right: dfDescribe(e2) });
+          ev.events.push({ type: 'comparison', opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach });
+        }
+        continue;
+      }
+      if (op === 'SLOAD') {
+        var slotVal = stack.pop();
+        var d = dfDescribe(slotVal);
+        var slotKey = d.known ? d.value : null;
+        if (ev) {
+          ev.storageReads.push({ type: 'storage-read', pc: ins.pc, blockId: ins.block, reach: ins.reach, slot: d.known ? d.value : 'UNKNOWN', slotKey: slotKey, value: 'STORAGE', valueKnown: false, confidence: d.known ? 'HIGH' : 'LOW' });
+          ev.events.push({ type: 'storage-read', pc: ins.pc, blockId: ins.block, reach: ins.reach, slot: d.known ? d.value : 'UNKNOWN', slotKey: slotKey });
+        }
+        push(mkUnk('SLOAD', ins.pc));
+        continue;
+      }
+      if (op === 'SSTORE') {
+        var wv = stack.pop(); var ws = stack.pop();
+        var wd = dfDescribe(ws), vd = dfDescribe(wv);
+        var wkey = wd.known ? wd.value : null;
+        if (ev) {
+          ev.storageWrites.push({ type: 'storage-write', pc: ins.pc, blockId: ins.block, reach: ins.reach, slot: wd.known ? wd.value : 'UNKNOWN', slotKey: wkey, value: vd.known ? vd.value : 'UNKNOWN', valueKnown: vd.known, confidence: wd.known ? 'HIGH' : 'LOW' });
+          ev.events.push({ type: 'storage-write', pc: ins.pc, blockId: ins.block, reach: ins.reach, slot: wd.known ? wd.value : 'UNKNOWN', slotKey: wkey, value: vd.known ? vd.value : 'UNKNOWN', valueKnown: vd.known });
+        }
+        continue;
+      }
+      if (op === 'CALL' || op === 'CALLCODE') {
+        var n7 = 7, targetIdx = 6, valueIdx = 5;
+        var tgt = (stack.length >= targetIdx) ? dfDescribe(stack[stack.length - targetIdx]) : { known: false, value: null, source: 'UNKNOWN' };
+        var val = (stack.length >= valueIdx + 1) ? dfDescribe(stack[stack.length - (valueIdx + 1)]) : { known: false, value: null, source: 'UNKNOWN' };
+        for (var c7 = 0; c7 < n7 && stack.length; c7++) stack.pop();
+        if (ev) {
+          ev.externalCalls.push({ opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach, target: tgt.known ? tgt.value : 'UNKNOWN', targetKnown: tgt.known, value: val.known ? val.value : 'UNKNOWN', valueKnown: val.known, confidence: 'MEDIUM' });
+          ev.events.push({ type: 'external-call', opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach, slotKey: null });
+        }
+        continue;
+      }
+      if (op === 'DELEGATECALL' || op === 'STATICCALL') {
+        var n6 = 6, tidx6 = 5;
+        var tgt6 = (stack.length >= tidx6) ? dfDescribe(stack[stack.length - tidx6]) : { known: false, value: null, source: 'UNKNOWN' };
+        for (var c6 = 0; c6 < n6 && stack.length; c6++) stack.pop();
+        if (ev) {
+          ev.externalCalls.push({ opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach, target: tgt6.known ? tgt6.value : 'UNKNOWN', targetKnown: tgt6.known, value: 'UNKNOWN', valueKnown: false, confidence: 'MEDIUM' });
+          ev.events.push({ type: 'external-call', opcode: op, pc: ins.pc, blockId: ins.block, reach: ins.reach, slotKey: null });
+        }
+        continue;
+      }
+      // Any other opcode: unknown stack effect → invalidate (never guess).
+      for (var k3 = 0; k3 < stack.length; k3++) stack[k3] = mkUnk('UNKNOWN', ins.pc);
+    }
+    if (ev) ev.values = (ev.values || 0) + vals;
+    return stack;
+  }
+
+  function walkPaths(cfg, eventsByBlock, limits) {
+    var paths = [];
+    var iterations = 0;
+    function dfs(blockId, visited, path, depth) {
+      if (paths.length >= limits.MAX_PATHS || depth > limits.MAX_DEPTH || iterations > limits.MAX_ITERATIONS) return;
+      iterations++;
+      if (visited[blockId]) return; // loop back-edge: stop (avoid infinite)
+      var block = cfg.blocks[blockId];
+      if (!block) return;
+      var nv = {}; for (var k in visited) nv[k] = visited[k]; nv[blockId] = true;
+      var blkEvents = (eventsByBlock[blockId] && eventsByBlock[blockId].events) || [];
+      var newPath = path.concat(blkEvents);
+      var succ = block.successors.filter(function (s) { return typeof s === 'number'; });
+      if (!succ.length) { paths.push(newPath); return; }
+      for (var i = 0; i < succ.length; i++) dfs(succ[i], nv, newPath, depth + 1);
+    }
+    dfs(cfg.entryBlock, {}, [], 0);
+    return { paths: paths, iterations: iterations, hitLimit: paths.length >= limits.MAX_PATHS || iterations > limits.MAX_ITERATIONS };
+  }
+
+  function reentrancyRank(cls) { return cls === 'LIKELY' ? 2 : cls === 'POTENTIAL' ? 1 : 0; }
+  function maxReentrancy(a, b) { return reentrancyRank(a) >= reentrancyRank(b) ? a : b; }
+
+  function analyzeReentrancy(paths) {
+    var classification = 'NONE';
+    var patterns = [];
+    var guard = { detected: false, confidence: 'LOW', evidence: [] };
+    var cei = { effectsBeforeInteractions: 0, interactionsBeforeEffects: 0, unknown: 0 };
+
+    paths.forEach(function (path) {
+      var readSlots = {};   // slotKey -> read pc
+      var lockedSlot = null;
+      for (var i = 0; i < path.length; i++) {
+        var e = path[i];
+        if (e.type === 'storage-read' && e.slotKey) readSlots[e.slotKey] = e.pc;
+        if (e.type === 'storage-write' && e.slotKey && e.valueKnown && e.value === '0x1') lockedSlot = e.slotKey;
+        if (e.type === 'external-call' && (e.opcode === 'CALL' || e.opcode === 'DELEGATECALL')) {
+          var wroteAfter = false, wroteReadSlotAfter = false, unlockAfter = false;
+          for (var j = i + 1; j < path.length; j++) {
+            var w = path[j];
+            if (w.type === 'external-call') break;
+            if (w.type === 'storage-write') {
+              wroteAfter = true;
+              if (w.slotKey && readSlots[w.slotKey]) {
+                wroteReadSlotAfter = true;
+                classification = maxReentrancy(classification, 'LIKELY');
+                patterns.push({ kind: 'read-call-write', slot: w.slotKey, readPc: readSlots[w.slotKey], callPc: e.pc, writePc: w.pc });
+              }
+            }
+            if (lockedSlot && w.type === 'storage-write' && w.slotKey === lockedSlot && w.valueKnown && w.value === '0x0') unlockAfter = true;
+          }
+          if (wroteAfter && !wroteReadSlotAfter) {
+            classification = maxReentrancy(classification, 'POTENTIAL');
+            patterns.push({ kind: 'call-then-write', callPc: e.pc });
+          }
+          if (lockedSlot && unlockAfter) {
+            guard.detected = true; guard.confidence = 'MEDIUM';
+            guard.evidence.push({ slot: lockedSlot, callPc: e.pc });
+          }
+        }
+      }
+      // CEI ordering (per path, block-level): count write-before-call vs call-before-write.
+      var writesBeforeCall = 0, writesAfterCall = 0;
+      var seenCall = false;
+      path.forEach(function (e) {
+        if (e.type === 'storage-write') { if (seenCall) writesAfterCall++; else writesBeforeCall++; }
+        if (e.type === 'external-call') seenCall = true;
+      });
+      if (writesBeforeCall && !writesAfterCall) cei.effectsBeforeInteractions++;
+      else if (writesAfterCall && !writesBeforeCall) cei.interactionsBeforeEffects++;
+      else if (writesBeforeCall || writesAfterCall) cei.unknown++;
+    });
+
+    return { classification: classification, patterns: patterns, guard: guard, cei: cei };
+  }
+
+  function analyzeDataFlow(cfg) {
+    var blocks = cfg.blocks;
+    var limits = DF_LIMITS;
+    var res = {
+      completeness: 'COMPLETE',
+      storageReads: [], storageWrites: [], externalCalls: [], comparisons: [],
+      controlDependencies: [], accessControl: [], callOrdering: [],
+      reentrancy: { classification: 'NONE', patterns: [] },
+      reentrancyGuard: { detected: false, confidence: 'LOW', evidence: [] },
+      cei: { effectsBeforeInteractions: 0, interactionsBeforeEffects: 0, unknown: 0 },
+      values: 0,
+      limitsHit: false
+    };
+
+    if (blocks.length > limits.MAX_BLOCKS) { res.completeness = 'PARTIAL'; res.limitsHit = true; return res; }
+
+    var eventsByBlock = [];
+    for (var bi = 0; bi < blocks.length; bi++) {
+      var b = blocks[bi];
+      if (b.reach === 'UNREACHABLE') { eventsByBlock.push({ comparisons: [], storageReads: [], storageWrites: [], externalCalls: [], events: [], values: 0 }); continue; }
+      var ev = { comparisons: [], storageReads: [], storageWrites: [], externalCalls: [], events: [], values: 0 };
+      execBlockStackDF(b.instructions, ev);
+      eventsByBlock.push(ev);
+      ev.storageReads.forEach(function (e) { res.storageReads.push(e); });
+      ev.storageWrites.forEach(function (e) { res.storageWrites.push(e); });
+      ev.externalCalls.forEach(function (e) { res.externalCalls.push(e); });
+      ev.comparisons.forEach(function (e) { res.comparisons.push(e); });
+      res.values += ev.values;
+    }
+
+    // Access control: comparisons involving CALLER that gate a JUMPI.
+    var jumpiBlocks = {};
+    blocks.forEach(function (b) {
+      if (b.terminator === 'JUMPI') {
+        // find comparison in this block involving CALLER
+        var evB = eventsByBlock[b.id] || {};
+        (evB.comparisons || []).forEach(function (c) {
+          var srcs = [c.left.source, c.right.source];
+          if (srcs.indexOf('CALLER') !== -1) {
+            var other = (c.left.source === 'CALLER') ? c.right : c.left;
+            res.accessControl.push({
+              protectedBy: [{ source: 'CALLER', comparison: c.opcode, value: other.known ? other.value : 'UNKNOWN' }],
+              pc: c.pc, blockId: b.id, confidence: other.known ? 'MEDIUM' : 'LOW'
+            });
+          }
+        });
+      }
+    });
+
+    // Control dependencies: a block that is the jump-true target of a JUMPI
+    // block inherits that block's comparison as a control dependency.
+    blocks.forEach(function (b) {
+      b.successors.forEach(function (s) {
+        if (typeof s !== 'number') return;
+        var pred = blocks[b.id];
+        if (pred.terminator === 'JUMPI' && pred.jumpTargetPc !== null && blocks[s].startPc === pred.jumpTargetPc) {
+          var evP = eventsByBlock[b.id] || {};
+          (evP.comparisons || []).forEach(function (c) {
+            res.controlDependencies.push({
+              pc: blocks[s].startPc, blockId: s,
+              gatedBy: (c.left.source === 'CALLER' || c.right.source === 'CALLER')
+                ? ('CALLER ' + c.opcode + ' ' + ((c.left.source === 'CALLER') ? c.right.value : c.left.value))
+                : ('cond@' + c.pc)
+            });
+          });
+        }
+      });
+    });
+
+    // Path-based CEI + reentrancy.
+    var walk = walkPaths(cfg, eventsByBlock, limits);
+    var re = analyzeReentrancy(walk.paths);
+    res.reentrancy = { classification: re.classification, patterns: re.patterns };
+    res.reentrancyGuard = re.guard;
+    res.cei = re.cei;
+    res.callOrdering = res.storageReads.concat(res.storageWrites, res.externalCalls);
+    if (walk.hitLimit || blocks.length >= limits.MAX_BLOCKS) { res.completeness = 'PARTIAL'; res.limitsHit = true; }
+    else if (cfg.stats.dynamicJumps > 0) { res.completeness = 'PARTIAL'; }
+
+    res.stats = {
+      storageReads: res.storageReads.length,
+      storageWrites: res.storageWrites.length,
+      externalCalls: res.externalCalls.length,
+      comparisons: res.comparisons.length,
+      controlDependencies: res.controlDependencies.length,
+      accessControl: res.accessControl.length,
+      values: res.values,
+      paths: walk.paths.length
+    };
+    return res;
+  }
+
   // ── 3. Finding engine ──────────────────────────────────────────────────────
   var SEVERITY_WEIGHT = { CRITICAL: 60, HIGH: 25, MEDIUM: 12, LOW: 5, INFO: 0 };
   var CONFIDENCE_MULT = { HIGH: 1.0, MEDIUM: 0.7, LOW: 0.4 };
@@ -395,7 +713,9 @@
       evidence: cfg.evidence || [],
       recommendation: cfg.recommendation || '',
       scoreImpact: (cfg.scoreImpact === undefined) ? scoreImpact(sev, conf, cfg.exploitability) : cfg.scoreImpact,
-      source: cfg.source || 'OBSERVED'
+      source: cfg.source || 'OBSERVED',
+      dataFlowEvidence: cfg.dataFlowEvidence || [],
+      controlFlowEvidence: cfg.controlFlowEvidence || []
     };
   }
 
@@ -615,33 +935,32 @@
         evidence: calls.map(function (ins) { return opEvidence(ins); }),
         recommendation: 'If state changes follow external calls, review ordering (checks-effects-interactions) for reentrancy.'
       }));
-      if (c.SSTORE > 0 && (c.CALL.length || c.DELEGATECALL.length)) {
-        ctx.findings.push(createFinding({
-          id: 'reentrancy-potential', category: 'reentrancy', severity: 'LOW', confidence: 'LOW', exploitability: 0.4,
-          title: 'Potential external-call risk',
-          description: 'The contract both writes state (SSTORE) and makes external calls. Whether this is exploitable reentrancy depends on call ordering and data flow, which static analysis cannot prove.',
-          evidence: [
-            { kind: 'OBSERVED', text: 'SSTORE present (' + c.SSTORE + 'x)' },
-            { kind: 'OBSERVED', text: 'external CALL/DELEGATECALL present' },
-            { kind: 'UNKNOWN', text: 'call ordering relative to state updates' }
-          ],
-          recommendation: 'Review with a data-flow analyzer or audit the source. This is a potential, not confirmed, risk.'
-        }));
-      }
     }
   }
 
   function ruleSelfdestruct(ctx) {
-    var reachable = ctx.ops.SELFDESTRUCT;
+    var all = ctx.ops.SELFDESTRUCT;
+    var reachable = all.filter(function (ins) { return ins.reach === 'REACHABLE'; });
+    var maybe = all.filter(function (ins) { return ins.reach === 'MAYBE_REACHABLE'; });
     if (reachable.length) {
       var hasGate = ctx.privilegeCheck;
       ctx.findings.push(createFinding({
         id: 'selfdestruct-present', category: 'selfdestruct',
         severity: 'HIGH', confidence: hasGate ? 'HIGH' : 'MEDIUM', exploitability: 0.8,
         title: 'SELFDESTRUCT opcode used (reachable)',
-        description: 'SELFDESTRUCT is present in reachable code (' + reachable.length + 'x). The contract can destroy its own code and move its balance. Who can trigger it could not be fully determined by static analysis.',
+        description: 'SELFDESTRUCT is present in statically reachable code (' + reachable.length + 'x). The contract can destroy its own code and move its balance. Who can trigger it could not be fully determined by static analysis.',
         evidence: reachable.map(function (ins) { return opEvidence(ins); }),
         recommendation: 'Verify who can trigger selfdestruct and whether funds can be unexpectedly removed.'
+      }));
+    }
+    if (maybe.length) {
+      ctx.findings.push(createFinding({
+        id: 'selfdestruct-maybe', category: 'selfdestruct',
+        severity: 'MEDIUM', confidence: 'LOW', exploitability: 0.5,
+        title: 'SELFDESTRUCT opcode present (maybe-reachable)',
+        description: 'SELFDESTRUCT was found in a block that is only reachable via a dynamic jump (jump table) — it may or may not execute.',
+        evidence: maybe.map(function (ins) { return opEvidence(ins, 'maybe-reachable SELFDESTRUCT'); }),
+        recommendation: 'Confirm whether this code path is actually reachable at runtime.'
       }));
     }
   }
@@ -916,6 +1235,54 @@
     }
   }
 
+  function ruleDataFlow(ctx) {
+    var df = ctx.dataFlow;
+    if (!df) return;
+
+    if (df.reentrancy.classification === 'LIKELY') {
+      ctx.findings.push(createFinding({
+        id: 'reentrancy-pattern', category: 'reentrancy', severity: 'MEDIUM', confidence: 'MEDIUM', exploitability: 0.7,
+        title: 'Potential reentrancy pattern (read → call → write same slot)',
+        description: 'Data-flow found a storage slot read, followed by an external call, followed by a write to the same slot. This is a classic reentrancy shape, but is NOT confirmed (no semantic analysis of the value or of any guard).',
+        evidence: [{ kind: 'INFERRED', text: 'read → call → write (same slot)' }],
+        dataFlowEvidence: df.reentrancy.patterns.filter(function (p) { return p.kind === 'read-call-write'; }).map(function (p) { return 'SLOAD(' + p.slot + ') @' + p.readPc + ' → CALL @' + p.callPc + ' → SSTORE(' + p.slot + ') @' + p.writePc; }),
+        recommendation: 'Verify state is updated before the external call (checks-effects-interactions), or a reentrancy guard is present and correct.'
+      }));
+    } else if (df.reentrancy.classification === 'POTENTIAL') {
+      ctx.findings.push(createFinding({
+        id: 'reentrancy-pattern', category: 'reentrancy', severity: 'LOW', confidence: 'LOW', exploitability: 0.5,
+        title: 'External call followed by state write',
+        description: 'Data-flow found an external call followed by a state write (interactions-before-effects). No same-slot read→write dependency was confirmed, so this is a potential, not confirmed, risk.',
+        evidence: [{ kind: 'INFERRED', text: 'call then write' }],
+        dataFlowEvidence: df.reentrancy.patterns.filter(function (p) { return p.kind === 'call-then-write'; }).map(function (p) { return 'CALL @' + p.callPc + ' → SSTORE'; }),
+        recommendation: 'Review the ordering; prefer effects-before-interactions.'
+      }));
+    }
+
+    if (df.reentrancyGuard.detected) {
+      ctx.findings.push(createFinding({
+        id: 'reentrancy-guard', category: 'reentrancy', severity: 'INFO', confidence: 'MEDIUM', exploitability: 0,
+        title: 'Potential reentrancy guard detected',
+        description: 'A storage slot appears to be set to 1 before an external call and reset to 0 after — consistent with a nonReentrant/lock pattern. Its correctness is NOT verified.',
+        evidence: df.reentrancyGuard.evidence.map(function (e) { return { kind: 'INFERRED', text: 'slot ' + e.slot + ' locked around CALL @' + e.callPc }; }),
+        recommendation: 'Confirm the guard covers all external calls and cannot be bypassed.'
+      }));
+    }
+
+    if (df.accessControl.length) {
+      ctx.findings.push(createFinding({
+        id: 'access-control-gate', category: 'access-control', severity: 'INFO',
+        confidence: df.accessControl[0].confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW', exploitability: 0.3,
+        title: 'Privileged access-control gate detected',
+        description: 'A CALLER comparison feeds a conditional branch (potential authorization gate). This does not prove onlyOwner — only that a caller-check gate exists.',
+        evidence: df.accessControl.map(function (ac) {
+          return { kind: 'INFERRED', text: ac.protectedBy.map(function (p) { return p.source + ' ' + p.comparison + ' ' + p.value; }).join('; ') + ' @PC ' + ac.pc };
+        }),
+        recommendation: 'Verify the gate protects sensitive state changes (mint, fees, upgrade).'
+      }));
+    }
+  }
+
   // ── 7. Orchestrator ────────────────────────────────────────────────────────
   function analyze(bytecode, opts) {
     opts = opts || {};
@@ -975,6 +1342,10 @@
     var cfg = buildCfg(dis.instructions);
     result.cfg = cfg.stats;
 
+    // Data-flow analysis.
+    var dataFlow = analyzeDataFlow(cfg);
+    result.dataFlow = dataFlow;
+
     var truncated = false;
     dis.instructions.forEach(function (ins) { if (ins.truncated) truncated = true; });
 
@@ -983,6 +1354,12 @@
     else if (cfg.stats.dynamicJumps > 0) completeness = 'PARTIAL';
     else completeness = 'COMPLETE';
     result.analysis.completeness = completeness;
+    result.analysis.components = {
+      controlFlow: truncated ? 'LIMITED' : (cfg.stats.dynamicJumps > 0 ? 'PARTIAL' : 'COMPLETE'),
+      stack: 'PARTIAL',
+      dataFlow: dataFlow.completeness,
+      overall: completeness
+    };
 
     var executable = dis.instructions.filter(function (ins) { return !ins.dead; });
 
@@ -1042,7 +1419,8 @@
       unknown: result.unknown,
       privilegeCheck: privilegeCheck,
       originGate: originGate,
-      functionMap: functionMap
+      functionMap: functionMap,
+      dataFlow: dataFlow
     };
 
     // Observe (facts)
@@ -1063,6 +1441,7 @@
     ruleOwnership(ctx);
     ruleMintBurn(ctx);
     rulePauseBlacklistFees(ctx);
+    ruleDataFlow(ctx);
 
     // Unreachable/dead code note.
     if (cfg.stats.deadInstructions > 0) {
@@ -1174,6 +1553,8 @@
     disassemble: disassemble,
     buildCfg: buildCfg,
     execBlockStack: execBlockStack,
+    execBlockStackDF: execBlockStackDF,
+    analyzeDataFlow: analyzeDataFlow,
     resolveJumpTarget: resolveJumpTarget,
     analyze: analyze,
     auditContract: auditContract,
