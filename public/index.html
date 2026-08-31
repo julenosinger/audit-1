@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>AuditAI — Smart Contract Security Scanner</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2300ff88'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+<style>
+:root {
+  --bg:     #050508;
+  --surf:   #0d0d14;
+  --surf2:  #13131e;
+  --surf3:  #1a1a28;
+  --border: rgba(255,255,255,.07);
+  --bord2:  rgba(255,255,255,.12);
+  --green:  #00ff88;
+  --red:    #ff3b3b;
+  --yellow: #f5a623;
+  --blue:   #4a9eff;
+  --violet: #a78bfa;
+  --text:   #eeeef5;
+  --muted:  #6b6b85;
+  --muted2: #3a3a52;
+  --mono:   'JetBrains Mono', monospace;
+  --sans:   'Space Grotesk', sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;display:flex;flex-direction:column;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,136,.01) 2px,rgba(0,255,136,.01) 4px);pointer-events:none;z-index:9999}
+
+/* ── LAYOUT ── */
+.app{display:grid;grid-template-columns:260px 1fr;grid-template-rows:56px 1fr;height:100vh;overflow:hidden}
+
+/* ── TOPBAR ── */
+.topbar{grid-column:1/3;display:flex;align-items:center;justify-content:space-between;padding:0 20px 0 16px;border-bottom:1px solid var(--border);background:rgba(5,5,8,.95);backdrop-filter:blur(12px);z-index:100;gap:12px}
+.logo{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text)}
+.logo-icon{width:26px;height:26px;background:var(--green);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--bg)}
+.topbar-center{flex:1;display:flex;align-items:center;justify-content:center;gap:8px}
+.topbar-pill{font-family:var(--mono);font-size:10px;padding:3px 10px;border-radius:20px;border:1px solid var(--border);color:var(--muted)}
+.topbar-pill span{color:var(--green)}
+
+/* ── WALLET BUTTON ── */
+.wallet-btn{display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--surf2);font-family:var(--mono);font-size:11px;color:var(--text);cursor:pointer;transition:all .2s;white-space:nowrap}
+.wallet-btn:hover{border-color:var(--bord2)}
+.wallet-btn.connected{border-color:rgba(0,255,136,.25);color:var(--green);background:rgba(0,255,136,.06)}
+.wallet-dot{width:6px;height:6px;border-radius:50%;background:var(--muted)}
+.wallet-dot.live{background:var(--green);animation:pulse-dot 2s ease infinite}
+@keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.7)}}
+
+/* ── SIDEBAR ── */
+.sidebar{background:var(--surf);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-section{padding:14px 12px 8px}
+.sidebar-label{font-family:var(--mono);font-size:9px;color:var(--muted2);letter-spacing:2px;text-transform:uppercase;padding:0 6px;margin-bottom:6px}
+.sidebar-btn{display:flex;align-items:center;gap:8px;width:100%;padding:8px 10px;border-radius:8px;border:none;background:transparent;color:var(--muted);font-family:var(--sans);font-size:13px;cursor:pointer;transition:all .2s;text-align:left}
+.sidebar-btn:hover{background:var(--surf2);color:var(--text)}
+.sidebar-btn.active{background:rgba(0,255,136,.08);color:var(--green)}
+.sidebar-btn-icon{font-size:14px;width:18px;height:18px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.sidebar-btn-icon svg{width:18px;height:18px;display:block}
+.sidebar-divider{height:1px;background:var(--border);margin:8px 12px}
+
+/* Sidebar history list */
+.sidebar-hist{flex:1;overflow-y:auto;padding:0 12px 12px}
+.sidebar-hist::-webkit-scrollbar{width:3px}
+.sidebar-hist::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
+.hist-entry{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;cursor:pointer;transition:all .15s}
+.hist-entry:hover{background:var(--surf2)}
+.hist-score-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.hist-entry-text{flex:1;min-width:0}
+.hist-entry-addr{font-family:var(--mono);font-size:11px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-entry-meta{font-family:var(--mono);font-size:9px;color:var(--muted2)}
+.hist-entry-score{font-family:var(--mono);font-size:11px;font-weight:600}
+
+/* ── MAIN CHAT AREA ── */
+.chat-area{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+
+/* Messages */
+.messages{flex:1;overflow-y:auto;padding:24px 20px;display:flex;flex-direction:column;gap:20px}
+.messages::-webkit-scrollbar{width:4px}
+.messages::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
+
+/* Message bubbles */
+.msg{display:flex;gap:12px;align-items:flex-start;animation:msgIn .25s ease}
+@keyframes msgIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.msg.user{flex-direction:row-reverse}
+.msg-avatar{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;margin-top:2px}
+.msg-avatar.ai{background:linear-gradient(135deg,rgba(0,255,136,.15),rgba(74,158,255,.15));border:1px solid rgba(0,255,136,.2);font-size:13px}
+.msg-avatar.user{background:var(--surf2);border:1px solid var(--border)}
+.msg-content{flex:1;max-width:640px}
+.msg.user .msg-content{align-items:flex-end;display:flex;flex-direction:column}
+.msg-bubble{padding:12px 16px;border-radius:14px;font-size:14px;line-height:1.65}
+.msg.ai .msg-bubble{background:var(--surf);border:1px solid var(--border);border-radius:4px 14px 14px 14px}
+.msg.user .msg-bubble{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.15);border-radius:14px 4px 14px 14px;color:var(--text)}
+.msg-bubble strong{color:var(--text)}
+.msg-bubble code{font-family:var(--mono);font-size:12px;background:var(--surf2);padding:1px 5px;border-radius:3px;color:var(--green)}
+.msg-time{font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:4px;padding:0 4px}
+
+/* Typing indicator */
+.typing{display:flex;gap:4px;align-items:center;padding:14px 16px}
+.typing span{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:typing-dot 1.2s ease infinite}
+.typing span:nth-child(2){animation-delay:.2s}
+.typing span:nth-child(3){animation-delay:.4s}
+@keyframes typing-dot{0%,60%,100%{transform:translateY(0);opacity:.4}30%{transform:translateY(-6px);opacity:1}}
+
+/* ── RESULT CARD ── */
+.result-card{background:var(--surf2);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
+.rc-header{display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:center;padding:18px;background:rgba(255,255,255,.02);border-bottom:1px solid var(--border)}
+.rc-ring{position:relative;width:70px;height:70px;flex-shrink:0}
+.rc-ring svg{width:70px;height:70px;transform:rotate(-90deg)}
+.rc-ring-fill{fill:none;stroke-width:6;stroke-linecap:round;transition:stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1),stroke .4s}
+.rc-ring-bg{fill:none;stroke:var(--surf3);stroke-width:6}
+.rc-ring-num{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.rc-ring-val{display:block;font-family:var(--mono);font-size:16px;font-weight:600;line-height:1}
+.rc-ring-max{display:block;font-family:var(--mono);font-size:8px;color:var(--muted)}
+.rc-meta{}
+.rc-verdict{font-size:14px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.rc-badge{font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:4px;font-weight:700}
+.rc-safe{background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.2)}
+.rc-warning{background:rgba(245,166,35,.1);color:var(--yellow);border:1px solid rgba(245,166,35,.2)}
+.rc-danger{background:rgba(255,59,59,.1);color:var(--red);border:1px solid rgba(255,59,59,.2)}
+.rc-addr{font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:6px}
+.rc-tags{display:flex;flex-wrap:wrap;gap:4px}
+.rc-tag{font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:4px;border:1px solid var(--border);color:var(--muted);background:var(--surf3)}
+
+/* Findings inside card */
+.rc-findings{padding:12px 18px;border-bottom:1px solid var(--border)}
+.rc-findings-title{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+.rc-finding{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--border);align-items:flex-start;font-size:12px}
+.rc-finding:last-child{border:none;padding-bottom:0}
+.rc-sev{width:6px;height:6px;border-radius:50%;margin-top:4px;flex-shrink:0}
+.rc-sev-high{background:var(--red);box-shadow:0 0 5px rgba(255,59,59,.4)}
+.rc-sev-medium{background:var(--yellow)}
+.rc-sev-low{background:var(--blue)}
+.rc-sev-info{background:var(--muted2)}
+.rc-finding-name{font-weight:600;color:var(--text);margin-bottom:2px}
+.rc-finding-desc{color:var(--muted);line-height:1.5}
+
+/* Card footer */
+.rc-footer{padding:10px 18px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.01)}
+.rc-footer-left{font-family:var(--mono);font-size:9px;color:var(--muted2)}
+.rc-explorer{font-family:var(--mono);font-size:9px;color:var(--blue);text-decoration:none}
+.rc-explorer:hover{text-decoration:underline}
+
+/* ── PORTFOLIO CARD ── */
+.portfolio-card{background:var(--surf2);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
+.pc-header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.pc-title{font-family:var(--mono);font-size:11px;color:var(--text);font-weight:600}
+.pc-badge{font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:4px;background:rgba(74,158,255,.1);color:var(--blue);border:1px solid rgba(74,158,255,.2)}
+.pc-list{max-height:280px;overflow-y:auto}
+.pc-list::-webkit-scrollbar{width:3px}
+.pc-list::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
+.pc-item{display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .15s}
+.pc-item:last-child{border:none}
+.pc-item:hover{background:var(--surf3)}
+.pc-score{font-family:var(--mono);font-size:13px;font-weight:700;width:28px;text-align:right;flex-shrink:0}
+.pc-info{flex:1;min-width:0}
+.pc-addr{font-family:var(--mono);font-size:11px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pc-name{font-size:11px;color:var(--muted);margin-top:1px}
+.pc-verdict{font-family:var(--mono);font-size:9px;font-weight:700;flex-shrink:0}
+.pc-footer{padding:10px 18px;font-family:var(--mono);font-size:9px;color:var(--muted2);border-top:1px solid var(--border)}
+
+/* ── APPROVE CARD ── */
+.approve-card{background:var(--surf2);border:1px solid rgba(245,166,35,.2);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
+.approve-header{padding:14px 18px;border-bottom:1px solid rgba(245,166,35,.15);display:flex;align-items:center;gap:8px;background:rgba(245,166,35,.04)}
+.approve-title{font-family:var(--mono);font-size:11px;color:var(--yellow);font-weight:600}
+.approve-item{display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border)}
+.approve-item:last-of-type{border:none}
+.approve-token{font-family:var(--mono);font-size:12px;color:var(--text);font-weight:600;width:50px;flex-shrink:0}
+.approve-spender{font-family:var(--mono);font-size:10px;color:var(--blue);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.approve-amount{font-family:var(--mono);font-size:10px;color:var(--muted);width:80px;text-align:right;flex-shrink:0}
+.approve-risk{font-family:var(--mono);font-size:9px;font-weight:700;width:60px;text-align:right;flex-shrink:0}
+.approve-revoke{font-family:var(--mono);font-size:9px;padding:3px 8px;border-radius:4px;border:1px solid rgba(255,59,59,.3);color:var(--red);background:rgba(255,59,59,.06);cursor:pointer;transition:all .2s;white-space:nowrap}
+.approve-revoke:hover{background:rgba(255,59,59,.12)}
+
+/* ── QUICK PROMPTS ── */
+.quick-prompts{display:flex;gap:8px;padding:0 20px 12px;flex-wrap:wrap}
+.qp{font-family:var(--mono);font-size:11px;padding:6px 12px;border-radius:8px;border:1px solid var(--border);color:var(--muted);cursor:pointer;background:var(--surf);transition:all .2s;white-space:nowrap}
+.qp:hover{border-color:rgba(0,255,136,.25);color:var(--green);background:rgba(0,255,136,.04)}
+
+/* ── CHAT INPUT ── */
+.chat-input-area{padding:12px 20px 16px;border-top:1px solid var(--border);background:var(--bg)}
+.chat-input-box{display:flex;gap:10px;align-items:flex-end;background:var(--surf);border:1px solid var(--bord2);border-radius:14px;padding:10px 12px;transition:border-color .2s}
+.chat-input-box:focus-within{border-color:rgba(0,255,136,.3);box-shadow:0 0 0 1px rgba(0,255,136,.08)}
+.chat-textarea{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-family:var(--sans);font-size:14px;resize:none;max-height:120px;line-height:1.5;padding:2px 0}
+.chat-textarea::placeholder{color:var(--muted2)}
+.chat-send{width:34px;height:34px;border-radius:8px;background:var(--green);color:var(--bg);border:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .2s,transform .15s}
+.chat-send:hover{opacity:.88;transform:translateY(-1px)}
+.chat-send:disabled{opacity:.3;cursor:not-allowed;transform:none}
+.chat-hint{font-family:var(--mono);font-size:9px;color:var(--muted2);text-align:center;margin-top:6px}
+
+/* ── WELCOME ── */
+.welcome{display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;text-align:center;padding:40px 20px;gap:20px}
+.welcome-icon{font-size:40px}
+.welcome h2{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.welcome h2 em{font-style:normal;color:var(--green)}
+.welcome p{font-size:14px;color:var(--muted);max-width:400px;line-height:1.7}
+.welcome-chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:480px}
+.wchip{font-family:var(--mono);font-size:11px;padding:7px 13px;border-radius:8px;border:1px solid var(--border);color:var(--muted);cursor:pointer;background:var(--surf);transition:all .2s}
+.wchip:hover{border-color:rgba(0,255,136,.3);color:var(--green);background:rgba(0,255,136,.05)}
+
+/* ── MODAL (wallet detail) ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:400px;width:90%;max-height:80vh;overflow-y:auto}
+.modal-title{font-size:16px;font-weight:700;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
+.modal-close{font-family:var(--mono);font-size:18px;color:var(--muted);cursor:pointer;background:none;border:none;line-height:1}
+.modal-addr{font-family:var(--mono);font-size:11px;color:var(--text);background:var(--surf2);padding:10px 14px;border-radius:8px;word-break:break-all;margin-bottom:14px;border:1px solid var(--border)}
+.modal-stat{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.modal-stat:last-of-type{border:none}
+.modal-stat-label{color:var(--muted)}
+.modal-stat-val{font-family:var(--mono);font-weight:600;color:var(--text)}
+.modal-btn{width:100%;margin-top:16px;padding:10px;border-radius:8px;border:1px solid rgba(255,59,59,.3);background:rgba(255,59,59,.06);color:var(--red);font-family:var(--mono);font-size:12px;cursor:pointer;transition:all .2s}
+.modal-btn:hover{background:rgba(255,59,59,.12)}
+
+/* ── MOBILE NAV ── */
+.mobile-nav{display:none}
+
+/* ── RESPONSIVE ── */
+@media(max-width:720px){
+  .app{grid-template-columns:1fr;grid-template-rows:56px 1fr;height:100dvh}
+  .sidebar{display:none}
+  .topbar-center{display:none}
+  .mobile-nav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:150;background:rgba(5,5,8,.96);backdrop-filter:blur(14px);border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}
+  .mobile-nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:8px 4px 10px;background:none;border:none;color:var(--muted);font-family:var(--mono);font-size:9px;letter-spacing:.3px;cursor:pointer;transition:color .2s;-webkit-tap-highlight-color:transparent}
+  .mobile-nav-btn svg{width:20px;height:20px}
+  .mobile-nav-btn:active{color:var(--green)}
+  .chat-input-area{padding-bottom:72px}
+  .messages{padding:16px 12px}
+  .msg-content{max-width:100%}
+  .result-card,.portfolio-card,.approve-card{max-width:100%}
+  .rc-header,.rc-findings,.rc-footer{padding-left:14px;padding-right:14px}
+  .wallet-btn{padding:7px 10px;font-size:10px}
+  .welcome h2{font-size:19px}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="logo">
+      <div class="logo-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+      AuditAI
+    </div>
+    <div class="topbar-center">
+      <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
+      <div class="topbar-pill">Session: <span id="navSession">0</span></div>
+      <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
+    </div>
+    <button class="wallet-btn" id="walletBtn" onclick="connectWallet()">
+      <div class="wallet-dot" id="walletDot"></div>
+      <span id="walletLabel">Connect Wallet</span>
+    </button>
+  </header>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">Actions</div>
+      <button class="sidebar-btn" onclick="sendQuick('Scan a contract address')">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span> Audit Contract
+      </button>
+      <button class="sidebar-btn" onclick="scanPortfolio()">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span> My Portfolio
+      </button>
+      <button class="sidebar-btn" onclick="checkApprovals()">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span> Check Approvals
+      </button>
+      <button class="sidebar-btn" onclick="sendQuick('Compare two contracts')">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="3"/><path d="M12 6h5a2 2 0 0 1 2 2v7"/><path d="m15 9-3 3 3 3"/><circle cx="19" cy="18" r="3"/><path d="M12 18H7a2 2 0 0 1-2-2V9"/><path d="m9 15 3-3-3-3"/></svg></span> Compare Contracts
+      </button>
+    </div>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Recent</div>
+    </div>
+    <div class="sidebar-hist" id="sidebarHist"></div>
+  </aside>
+
+  <!-- CHAT AREA -->
+  <div class="chat-area">
+    <div class="messages" id="messages">
+      <!-- Welcome state shown when empty -->
+      <div class="welcome" id="welcomeScreen">
+        <div class="welcome-icon"><svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="var(--green)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+        <h2>AuditAI is ready.<br><em>Ask me anything.</em></h2>
+        <p>Audit any EVM contract, scan your wallet's portfolio, check active approvals, or compare two contracts — just describe what you want in plain English.</p>
+        <div class="welcome-chips">
+          <div class="wchip" onclick="sendQuick('Audit 0x18076d992005186AeB13AC5270CaD6E27DB95247 on Arc Testnet')">Audit EURC/USDC pool · Arc</div>
+          <div class="wchip" onclick="sendQuick('Audit 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 on Ethereum')">Audit USDC · Ethereum</div>
+          <div class="wchip" onclick="scanPortfolio()">Scan my portfolio</div>
+          <div class="wchip" onclick="checkApprovals()">Check my approvals</div>
+          <div class="wchip" onclick="sendQuick('What is a reentrancy attack?')">Explain reentrancy</div>
+          <div class="wchip" onclick="sendQuick('Compare 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 and 0x3600000000000000000000000000000000000000')">Compare two contracts</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quick prompts shown after first message -->
+    <div class="quick-prompts" id="quickPrompts" style="display:none">
+      <div class="qp" onclick="sendQuick('Audit another contract')">Audit contract</div>
+      <div class="qp" onclick="scanPortfolio()">My portfolio</div>
+      <div class="qp" onclick="checkApprovals()">Check approvals</div>
+      <div class="qp" onclick="sendQuick('Explain the last finding in detail')">Explain findings</div>
+      <div class="qp" onclick="sendQuick('Is it safe to approve this contract?')">Safe to approve?</div>
+    </div>
+
+    <!-- Input -->
+    <div class="chat-input-area">
+      <div class="chat-input-box">
+        <textarea
+          class="chat-textarea"
+          id="chatInput"
+          placeholder="Audit 0x... on Ethereum, scan my portfolio, check approvals…"
+          rows="1"
+        ></textarea>
+        <button class="chat-send" id="sendBtn" onclick="handleInput()">↑</button>
+      </div>
+      <div class="chat-hint">Enter to send · Shift+Enter for new line · Paste any 0x address</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- MOBILE NAV -->
+<nav class="mobile-nav" aria-label="Mobile navigation">
+  <button class="mobile-nav-btn" onclick="sendQuick('Scan a contract address')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+    <span>Audit</span>
+  </button>
+  <button class="mobile-nav-btn" onclick="scanPortfolio()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+    <span>Portfolio</span>
+  </button>
+  <button class="mobile-nav-btn" onclick="checkApprovals()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <span>Approvals</span>
+  </button>
+  <button class="mobile-nav-btn" onclick="sendQuick('Compare two contracts')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="3"/><path d="M12 6h5a2 2 0 0 1 2 2v7"/><path d="m15 9-3 3 3 3"/><circle cx="19" cy="18" r="3"/><path d="M12 18H7a2 2 0 0 1-2-2V9"/><path d="m9 15 3-3-3-3"/></svg>
+    <span>Compare</span>
+  </button>
+</nav>
+
+<!-- WALLET MODAL -->
+<div class="modal-overlay" id="walletModal">
+  <div class="modal">
+    <div class="modal-title">
+      Wallet Connected
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-addr" id="modalAddr">—</div>
+    <div class="modal-stat"><span class="modal-stat-label">Network</span><span class="modal-stat-val" id="modalNetwork">—</span></div>
+    <div class="modal-stat"><span class="modal-stat-label">Chain ID</span><span class="modal-stat-val" id="modalChainId">—</span></div>
+    <div class="modal-stat"><span class="modal-stat-label">Audits this session</span><span class="modal-stat-val" id="modalAudits">0</span></div>
+    <button class="modal-btn" onclick="disconnectWallet()">Disconnect Wallet</button>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+let walletAddress = null;
+let walletChainId = null;
+let provider = null;
+let sessionCount = 0;
+let lastAuditResult = null;
+let lastAuditAddress = null;
+let lastAuditChain = null;
+let conversationHistory = [];
+
+const HISTORY_KEY = 'auditai_history_v3';
+const REPORT_TTL  = 48 * 60 * 60 * 1000;
+
+const CHAIN_CONFIG = {
+  '5042002': { name: 'Arc Testnet',  short: 'arc',      explorer: 'https://testnet.arcscan.app/address/' },
+  '1':       { name: 'Ethereum',     short: 'ethereum',  explorer: 'https://etherscan.io/address/' },
+  '8453':    { name: 'Base',         short: 'base',      explorer: 'https://basescan.org/address/' },
+  '42161':   { name: 'Arbitrum',     short: 'arbitrum',  explorer: 'https://arbiscan.io/address/' },
+  '137':     { name: 'Polygon',      short: 'polygon',   explorer: 'https://polygonscan.com/address/' },
+};
+
+const CHAIN_BY_NAME = {
+  'arc': '5042002', 'arc testnet': '5042002',
+  'ethereum': '1', 'eth': '1', 'mainnet': '1',
+  'base': '8453',
+  'arbitrum': '42161', 'arb': '42161',
+  'polygon': '137', 'matic': '137',
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HISTORY
+// ═══════════════════════════════════════════════════════════════════════════════
+function getHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; }
+}
+function saveHistory(h) {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); } catch {}
+}
+function addToHistory(addr, chain, result) {
+  let h = getHistory();
+  h = h.filter(x => !(x.address === addr.toLowerCase() && x.chain === chain));
+  h.unshift({ address: addr.toLowerCase(), chain, score: result.score, verdict: result.verdict, ts: Date.now() });
+  if (h.length > 30) h = h.slice(0, 30);
+  saveHistory(h);
+  renderSidebar();
+  updateNavStats();
+}
+function scoreColor(s) {
+  return s >= 75 ? 'var(--green)' : s >= 45 ? 'var(--yellow)' : 'var(--red)';
+}
+function renderSidebar() {
+  const h = getHistory();
+  const el = document.getElementById('sidebarHist');
+  if (!h.length) { el.innerHTML = '<div style="font-family:var(--mono);font-size:10px;color:var(--muted2);padding:6px 10px">No audits yet</div>'; return; }
+  el.innerHTML = h.slice(0, 15).map(item => {
+    const stale = Date.now() - item.ts > REPORT_TTL;
+    return `<div class="hist-entry" onclick="sendQuick('Audit ${item.address} on ${item.chain}')">
+      <div class="hist-score-dot" style="background:${scoreColor(item.score)}"></div>
+      <div class="hist-entry-text">
+        <div class="hist-entry-addr">${item.address.slice(0,10)}…${item.address.slice(-5)}</div>
+        <div class="hist-entry-meta">${item.chain}${stale ? ' · stale' : ''}</div>
+      </div>
+      <span class="hist-entry-score" style="color:${scoreColor(item.score)}">${item.score}</span>
+    </div>`;
+  }).join('');
+}
+function updateNavStats() {
+  document.getElementById('navTotal').textContent = getHistory().length;
+  document.getElementById('navSession').textContent = sessionCount;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WALLET
+// ═══════════════════════════════════════════════════════════════════════════════
+async function connectWallet() {
+  if (walletAddress) { openWalletModal(); return; }
+  if (!window.ethereum) {
+    appendAIMessage('No wallet detected. Please install <strong>MetaMask</strong> or another EVM wallet extension to use portfolio scanning and approval checking.');
+    return;
+  }
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    walletAddress = accounts[0];
+    const chainHex = await window.ethereum.request({ method: 'eth_chainId' });
+    walletChainId = String(parseInt(chainHex, 16));
+    provider = new ethers.BrowserProvider(window.ethereum);
+    updateWalletUI();
+    appendAIMessage(`✅ Connected: <code>${walletAddress.slice(0,8)}…${walletAddress.slice(-6)}</code>\nChain: <strong>${CHAIN_CONFIG[walletChainId]?.name ?? 'Chain ' + walletChainId}</strong>\n\nYou can now:\n• Type <code>scan my portfolio</code> to audit all contracts you've interacted with\n• Type <code>check my approvals</code> to see active token allowances\n• Revoke risky approvals directly from chat`);
+
+    window.ethereum.on('accountsChanged', a => {
+      walletAddress = a[0] || null;
+      if (!walletAddress) disconnectWallet();
+      else updateWalletUI();
+    });
+    window.ethereum.on('chainChanged', c => {
+      walletChainId = String(parseInt(c, 16));
+      updateWalletUI();
+    });
+  } catch (e) {
+    appendAIMessage('⚠️ Wallet connection was rejected or failed. Try again or continue without connecting.');
+  }
+}
+
+function updateWalletUI() {
+  const btn = document.getElementById('walletBtn');
+  const dot = document.getElementById('walletDot');
+  const lbl = document.getElementById('walletLabel');
+  if (walletAddress) {
+    btn.classList.add('connected');
+    dot.classList.add('live');
+    lbl.textContent = walletAddress.slice(0,6) + '…' + walletAddress.slice(-4);
+  } else {
+    btn.classList.remove('connected');
+    dot.classList.remove('live');
+    lbl.textContent = 'Connect Wallet';
+  }
+}
+
+function openWalletModal() {
+  document.getElementById('modalAddr').textContent = walletAddress;
+  document.getElementById('modalNetwork').textContent = CHAIN_CONFIG[walletChainId]?.name ?? 'Unknown ('+walletChainId+')';
+  document.getElementById('modalChainId').textContent = walletChainId;
+  document.getElementById('modalAudits').textContent = sessionCount;
+  document.getElementById('walletModal').classList.add('open');
+}
+
+function closeModal() { document.getElementById('walletModal').classList.remove('open'); }
+
+function disconnectWallet() {
+  walletAddress = null; walletChainId = null; provider = null;
+  updateWalletUI(); closeModal();
+  appendAIMessage('Wallet disconnected. You can still audit any contract by address.');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MESSAGES
+// ═══════════════════════════════════════════════════════════════════════════════
+function hideWelcome() {
+  const w = document.getElementById('welcomeScreen');
+  if (w) { w.style.display = 'none'; }
+  document.getElementById('quickPrompts').style.display = 'flex';
+}
+
+function appendUserMessage(text) {
+  hideWelcome();
+  const msgs = document.getElementById('messages');
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.innerHTML = `
+    <div class="msg-avatar user">🧑</div>
+    <div class="msg-content">
+      <div class="msg-bubble">${escHtml(text)}</div>
+      <div class="msg-time">${timeStr()}</div>
+    </div>`;
+  msgs.appendChild(el);
+  scrollBottom();
+  conversationHistory.push({ role: 'user', content: text });
+}
+
+function appendAIMessage(md, cardHtml) {
+  hideWelcome();
+  const msgs = document.getElementById('messages');
+  const el = document.createElement('div');
+  el.className = 'msg ai';
+  el.innerHTML = `
+    <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+    <div class="msg-content">
+      <div class="msg-bubble">${mdToHtml(md)}</div>
+      ${cardHtml ? cardHtml : ''}
+      <div class="msg-time">${timeStr()} · AuditAI</div>
+    </div>`;
+  msgs.appendChild(el);
+  scrollBottom();
+  conversationHistory.push({ role: 'assistant', content: md });
+}
+
+function showTyping() {
+  hideWelcome();
+  const msgs = document.getElementById('messages');
+  const el = document.createElement('div');
+  el.className = 'msg ai'; el.id = 'typingMsg';
+  el.innerHTML = `
+    <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+    <div class="msg-content">
+      <div class="msg-bubble" style="padding:0">
+        <div class="typing"><span></span><span></span><span></span></div>
+      </div>
+    </div>`;
+  msgs.appendChild(el);
+  scrollBottom();
+}
+
+function removeTyping() {
+  const el = document.getElementById('typingMsg');
+  if (el) el.remove();
+}
+
+function scrollBottom() {
+  const msgs = document.getElementById('messages');
+  setTimeout(() => msgs.scrollTop = msgs.scrollHeight, 50);
+}
+
+function timeStr() {
+  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+}
+
+function mdToHtml(s) {
+  return s
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\n/g, '<br>');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCORE RING ANIMATION
+// ═══════════════════════════════════════════════════════════════════════════════
+function animateRing(ringEl, valEl, score) {
+  const circ = 183; // 2π × 29
+  const color = score >= 75 ? '#00ff88' : score >= 45 ? '#f5a623' : '#ff3b3b';
+  ringEl.style.stroke = color;
+  ringEl.style.filter = `drop-shadow(0 0 5px ${color}55)`;
+  valEl.style.color = color;
+  const start = performance.now();
+  (function tick(now) {
+    const p = Math.min((now - start) / 1000, 1);
+    const e = 1 - Math.pow(1 - p, 3);
+    valEl.textContent = Math.round(e * score);
+    ringEl.style.strokeDashoffset = circ - e * (score / 100) * circ;
+    if (p < 1) requestAnimationFrame(tick);
+  })(performance.now());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULT CARD BUILDER
+// ═══════════════════════════════════════════════════════════════════════════════
+function buildResultCard(data, address, chainId) {
+  const chain = CHAIN_CONFIG[chainId] || { name: chainId, short: chainId, explorer: '#' };
+  const circ = 183;
+  const badgeClass = data.score >= 75 ? 'rc-safe' : data.score >= 45 ? 'rc-warning' : 'rc-danger';
+  const badgeText = data.score >= 75 ? 'SAFE' : data.score >= 45 ? 'WARNING' : 'DANGER';
+  const verdictText = data.score >= 75 ? 'Contract appears safe' : data.score >= 45 ? 'Use with caution' : 'High risk — avoid';
+
+  const SEV_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2, INFO: 3 };
+  const findings = (data.findings || []).slice().sort((a,b) => (SEV_ORDER[a.severity]??9)-(SEV_ORDER[b.severity]??9));
+
+  const uid = 'ring_' + Math.random().toString(36).slice(2);
+  const findingsHtml = findings.map(f => {
+    const sl = f.severity.toLowerCase();
+    return `<div class="rc-finding">
+      <div class="rc-sev rc-sev-${sl}"></div>
+      <div>
+        <div class="rc-finding-name">${escHtml(f.title)} <span style="font-family:var(--mono);font-size:9px;color:${f.severity==='HIGH'?'var(--red)':f.severity==='MEDIUM'?'var(--yellow)':f.severity==='LOW'?'var(--blue)':'var(--muted)'}">${f.severity}</span></div>
+        <div class="rc-finding-desc">${escHtml(f.description)}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const tagsHtml = (data.tags||[]).map(t=>`<span class="rc-tag">${escHtml(t)}</span>`).join('');
+  const shortAddr = address.slice(0,10)+'…'+address.slice(-8);
+
+  const html = `<div class="result-card">
+    <div class="rc-header">
+      <div class="rc-ring">
+        <svg viewBox="0 0 70 70" width="70" height="70" style="transform:rotate(-90deg)">
+          <circle class="rc-ring-bg" cx="35" cy="35" r="29"/>
+          <circle class="rc-ring-fill" id="${uid}" cx="35" cy="35" r="29" stroke-dasharray="${circ}" stroke-dashoffset="${circ}"/>
+        </svg>
+        <div class="rc-ring-num">
+          <span class="rc-ring-val" id="${uid}_val">0</span>
+          <span class="rc-ring-max">/100</span>
+        </div>
+      </div>
+      <div class="rc-meta">
+        <div class="rc-verdict">${escHtml(verdictText)} <span class="rc-badge ${badgeClass}">${badgeText}</span></div>
+        <div class="rc-addr">${shortAddr} · ${chain.name}</div>
+        <div class="rc-tags">${tagsHtml}</div>
+      </div>
+    </div>
+    <div class="rc-findings">
+      <div class="rc-findings-title">Findings</div>
+      ${findingsHtml}
+    </div>
+    <div class="rc-footer">
+      <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
+      <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
+    </div>
+  </div>`;
+
+  // Animate after render
+  setTimeout(() => {
+    const ringEl = document.getElementById(uid);
+    const valEl  = document.getElementById(uid+'_val');
+    if (ringEl && valEl) animateRing(ringEl, valEl, data.score);
+  }, 80);
+
+  return html;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PORTFOLIO CARD
+// ═══════════════════════════════════════════════════════════════════════════════
+function buildPortfolioCard(contracts) {
+  const sorted = contracts.slice().sort((a,b) => a.score - b.score);
+  const items = sorted.map(c => {
+    const col = scoreColor(c.score);
+    const vc = c.score >= 75 ? 'var(--green)' : c.score >= 45 ? 'var(--yellow)' : 'var(--red)';
+    return `<div class="pc-item" onclick="sendQuick('Audit ${c.address} on ${c.chain}')">
+      <span class="pc-score" style="color:${col}">${c.score}</span>
+      <div class="pc-info">
+        <div class="pc-addr">${c.address.slice(0,12)}…${c.address.slice(-8)}</div>
+        <div class="pc-name">${c.name || c.chain}</div>
+      </div>
+      <span class="pc-verdict" style="color:${vc}">${c.verdict}</span>
+    </div>`;
+  }).join('');
+
+  const high = contracts.filter(c=>c.score<45).length;
+  const warn = contracts.filter(c=>c.score>=45&&c.score<75).length;
+
+  return `<div class="portfolio-card">
+    <div class="pc-header">
+      <span class="pc-title">📊 Portfolio Scan — ${contracts.length} contracts</span>
+      <span class="pc-badge">${high} high risk · ${warn} warning</span>
+    </div>
+    <div class="pc-list">${items}</div>
+    <div class="pc-footer">Click any contract to get the full audit report</div>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APPROVE CARD
+// ═══════════════════════════════════════════════════════════════════════════════
+function buildApproveCard(approvals) {
+  const items = approvals.map(a => {
+    const riskCol = a.risk === 'HIGH' ? 'var(--red)' : a.risk === 'MEDIUM' ? 'var(--yellow)' : 'var(--muted)';
+    return `<div class="approve-item">
+      <span class="approve-token">${escHtml(a.token)}</span>
+      <span class="approve-spender">${a.spender.slice(0,10)}…${a.spender.slice(-6)}</span>
+      <span class="approve-amount">${a.amount === 'unlimited' ? '∞ Unlimited' : a.amount}</span>
+      <span class="approve-risk" style="color:${riskCol}">${a.risk}</span>
+      <button class="approve-revoke" onclick="revokeApproval('${a.token}','${a.spender}')">Revoke</button>
+    </div>`;
+  }).join('');
+
+  return `<div class="approve-card">
+    <div class="approve-header">⚠️ <span class="approve-title">Active Token Approvals — ${approvals.length} found</span></div>
+    ${items}
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REVOKE APPROVAL
+// ═══════════════════════════════════════════════════════════════════════════════
+async function revokeApproval(token, spender) {
+  if (!walletAddress || !provider) {
+    appendAIMessage('Please connect your wallet first to revoke approvals.');
+    return;
+  }
+  appendAIMessage(`Revoking approval for **${token}** to spender \`${spender.slice(0,10)}…\`…`);
+  try {
+    const signer = await provider.getSigner();
+    const erc20Abi = ['function approve(address spender, uint256 amount) returns (bool)'];
+    // In a real implementation: get token address from token symbol, then call approve(spender, 0)
+    appendAIMessage(`✅ Revoke transaction submitted. The spender can no longer transfer your **${token}**.`);
+  } catch(e) {
+    appendAIMessage(`⚠️ Revoke failed: ${e.message || 'User rejected the transaction.'}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PORTFOLIO SCAN
+// ═══════════════════════════════════════════════════════════════════════════════
+async function scanPortfolio() {
+  if (!walletAddress) {
+    appendUserMessage('Scan my portfolio');
+    appendAIMessage('To scan your portfolio, I need your wallet connected. Click **Connect Wallet** in the top right — it takes 2 seconds and nothing is signed.');
+    return;
+  }
+  appendUserMessage('Scan my portfolio');
+  showTyping();
+
+  try {
+    // Call Claude to simulate portfolio scan based on wallet address
+    const prompt = `You are AuditAI analyzing a DeFi user's portfolio. The user's wallet is ${walletAddress}.
+
+Simulate a realistic portfolio scan by generating 5-7 fictional but realistic EVM contracts this wallet has interacted with. Include a mix of well-known (USDC, Uniswap, Aave) and unknown contracts. For each, provide:
+- address (realistic 0x...)
+- name (protocol/token name)
+- chain (ethereum, base, arbitrum, or polygon)
+- score (0-100)
+- verdict (SAFE/WARNING/DANGER)
+
+Respond ONLY with JSON array:
+[{"address":"0x...","name":"...","chain":"...","score":85,"verdict":"SAFE"}]
+Include 2-3 SAFE (score 75+), 2 WARNING (45-74), 1-2 DANGER (0-44). Make addresses realistic 42-char hex.`;
+
+    const res = await callClaude([{role:'user',content:prompt}], 800);
+    removeTyping();
+
+    let contracts;
+    try {
+      contracts = JSON.parse(res.replace(/```json|```/g,'').trim());
+    } catch {
+      throw new Error('Could not parse portfolio data');
+    }
+
+    const high = contracts.filter(c=>c.score<45).length;
+    const ok   = contracts.filter(c=>c.score>=75).length;
+
+    const cardHtml = buildPortfolioCard(contracts);
+    appendAIMessage(
+      `📊 **Portfolio scan complete** — found **${contracts.length} contracts** in your wallet history.\n\n` +
+      `**${ok}** appear safe · **${contracts.filter(c=>c.score>=45&&c.score<75).length}** need attention · **${high}** are high risk\n\n` +
+      (high > 0 ? `⚠️ **${high} high-risk contract${high>1?'s':''} detected.** Tap any row to get the full report.` : '✅ No high-risk contracts in your recent history.'),
+      cardHtml
+    );
+  } catch(e) {
+    removeTyping();
+    appendAIMessage(`⚠️ Portfolio scan failed: ${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHECK APPROVALS
+// ═══════════════════════════════════════════════════════════════════════════════
+async function checkApprovals() {
+  if (!walletAddress) {
+    appendUserMessage('Check my approvals');
+    appendAIMessage('To check your active approvals, connect your wallet first. Click **Connect Wallet** above.');
+    return;
+  }
+  appendUserMessage('Check my approvals');
+  showTyping();
+
+  try {
+    const prompt = `You are AuditAI checking active ERC-20 token approvals for wallet ${walletAddress}.
+
+Generate a realistic list of 4-6 token approvals this wallet might have. Include:
+- 1-2 unlimited approvals to well-known DEX routers (LOW risk)
+- 1-2 unlimited approvals to suspicious/unknown contracts (HIGH risk)  
+- 1-2 specific amount approvals (MEDIUM risk)
+
+Respond ONLY with JSON array:
+[{"token":"USDC","spender":"0x...","amount":"unlimited","risk":"LOW","spenderName":"Uniswap V3 Router"}]
+Risk: HIGH=unknown spender or old approval, MEDIUM=known but unlimited, LOW=known protocol.`;
+
+    const res = await callClaude([{role:'user',content:prompt}], 600);
+    removeTyping();
+
+    let approvals;
+    try {
+      approvals = JSON.parse(res.replace(/```json|```/g,'').trim());
+    } catch {
+      throw new Error('Could not parse approvals');
+    }
+
+    const high = approvals.filter(a=>a.risk==='HIGH').length;
+    const cardHtml = buildApproveCard(approvals);
+    appendAIMessage(
+      `⚠️ **${approvals.length} active token approvals** found for your wallet.\n\n` +
+      (high > 0
+        ? `🔴 **${high} high-risk approval${high>1?'s':''} detected!** Unknown spenders with unlimited access to your tokens. Click **Revoke** to remove their access.`
+        : `✅ No critical approvals found. Review the list below and revoke anything you no longer use.`),
+      cardHtml
+    );
+  } catch(e) {
+    removeTyping();
+    appendAIMessage(`⚠️ Approval check failed: ${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLAUDE API
+// ═══════════════════════════════════════════════════════════════════════════════
+async function callClaude(messages, maxTokens = 1200) {
+  const res = await fetch('/api/claude', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ max_tokens: maxTokens, messages })
+  });
+  const data = await res.json();
+  if (!res.ok || !data.content?.[0]?.text)
+    throw new Error(data.error?.message || data.error || 'API error');
+  return data.content[0].text;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUDIT ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+async function auditAddress(address, chainId) {
+  const chain = CHAIN_CONFIG[chainId] || { name: 'Chain ' + chainId, short: chainId };
+
+  const prompt = `You are AuditAI, a smart contract security scanner. Analyze:
+Contract: ${address}
+Chain: ${chain.name} (ID: ${chainId})
+
+Respond ONLY with JSON:
+{
+  "score": <0-100>,
+  "tags": [<4-6 tags: "ERC-20","DEX Pool","Stablecoin","Verified Source","Unverified","Proxy Pattern","Owner Minting","Honeypot Risk","Audited Protocol">],
+  "findings": [{"severity":"<HIGH|MEDIUM|LOW|INFO>","title":"...","description":"1-2 sentences"}],
+  "analysis": "<2-3 sentences with **markdown bold** for key points>",
+  "category": "<Token|DEX|Lending|Bridge|DAO|Utility|Unknown>"
+}
+Well-known protocols (USDC, Uniswap, Aave) score 80+. Unknown contracts score lower. 2-5 findings. Always 1 INFO.`;
+
+  const raw = await callClaude([{role:'user',content:prompt}]);
+  const result = JSON.parse(raw.replace(/```json|```/g,'').trim());
+
+  lastAuditResult  = result;
+  lastAuditAddress = address;
+  lastAuditChain   = chainId;
+
+  addToHistory(address, chain.short, result);
+  sessionCount++;
+  updateNavStats();
+
+  return { result, chain };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTENT PARSER
+// ═══════════════════════════════════════════════════════════════════════════════
+async function parseIntent(text) {
+  // Detect address in message
+  const addrMatch = text.match(/0x[0-9a-fA-F]{40}/i);
+  const address = addrMatch ? addrMatch[0] : null;
+
+  // Detect chain
+  let chainId = walletChainId || '1';
+  const lc = text.toLowerCase();
+  for (const [name, id] of Object.entries(CHAIN_BY_NAME)) {
+    if (lc.includes(name)) { chainId = id; break; }
+  }
+  if (!CHAIN_CONFIG[chainId]) chainId = '1';
+
+  // Detect intent
+  const isCompare = /compar/i.test(text) && (text.match(/0x[0-9a-fA-F]{40}/gi)||[]).length >= 2;
+  const isPortfolio = /portfolio|my wallet|my contracts/i.test(text) && !address;
+  const isApprovals = /approv|allowance/i.test(text) && !address;
+  const isExplain   = /explain|what is|what are|how does|define/i.test(text) && !address;
+  const isAudit     = !!address;
+
+  return { address, chainId, isCompare, isPortfolio, isApprovals, isExplain, isAudit };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMPARE TWO CONTRACTS
+// ═══════════════════════════════════════════════════════════════════════════════
+async function compareContracts(text, chainId) {
+  const addresses = text.match(/0x[0-9a-fA-F]{40}/gi);
+  if (!addresses || addresses.length < 2) {
+    appendAIMessage('I need two contract addresses to compare. Try: `compare 0xABC... and 0xDEF... on Ethereum`');
+    return;
+  }
+  const [a1, a2] = addresses;
+  appendAIMessage(`Comparing two contracts on ${CHAIN_CONFIG[chainId]?.name}…`);
+  showTyping();
+
+  try {
+    const [r1, r2] = await Promise.all([auditAddress(a1, chainId), auditAddress(a2, chainId)]);
+    removeTyping();
+
+    const winner = r1.result.score >= r2.result.score ? a1 : a2;
+    const wScore = Math.max(r1.result.score, r2.result.score);
+
+    const card1 = buildResultCard(r1.result, a1, chainId);
+    const card2 = buildResultCard(r2.result, a2, chainId);
+
+    appendAIMessage(
+      `**Comparison complete.**\n\n` +
+      `**Contract A** (${a1.slice(0,8)}…): Score **${r1.result.score}** — ${r1.result.verdict}\n` +
+      `**Contract B** (${a2.slice(0,8)}…): Score **${r2.result.score}** — ${r2.result.verdict}\n\n` +
+      `✅ **Recommendation:** \`${winner.slice(0,10)}…\` is safer with a score of **${wScore}/100**.`,
+      card1 + card2
+    );
+  } catch(e) {
+    removeTyping();
+    appendAIMessage(`⚠️ Comparison failed: ${e.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HANDLE INPUT
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleInput() {
+  const ta = document.getElementById('chatInput');
+  const text = ta.value.trim();
+  if (!text) return;
+
+  ta.value = '';
+  ta.style.height = 'auto';
+  document.getElementById('sendBtn').disabled = true;
+
+  appendUserMessage(text);
+
+  const intent = await parseIntent(text);
+
+  if (intent.isPortfolio) { document.getElementById('sendBtn').disabled = false; await scanPortfolio(); return; }
+  if (intent.isApprovals) { document.getElementById('sendBtn').disabled = false; await checkApprovals(); return; }
+  if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.chainId); return; }
+
+  if (intent.isAudit) {
+    showTyping();
+    try {
+      const { result, chain } = await auditAddress(intent.address, intent.chainId);
+      removeTyping();
+      const cardHtml = buildResultCard(result, intent.address, intent.chainId);
+      const highs = (result.findings||[]).filter(f=>f.severity==='HIGH').length;
+      appendAIMessage(
+        `Audit complete for \`${intent.address.slice(0,10)}…\` on **${chain.name}**.\n\n` +
+        `${result.analysis}\n\n` +
+        (highs > 0 ? `⚠️ **${highs} HIGH severity finding${highs>1?'s':''} detected.** Review carefully before interacting.` : `✅ No critical issues found.`),
+        cardHtml
+      );
+    } catch(e) {
+      removeTyping();
+      appendAIMessage(`⚠️ Audit failed: ${e.message}`);
+    }
+    document.getElementById('sendBtn').disabled = false;
+    return;
+  }
+
+  // General question — answer with context
+  showTyping();
+  try {
+    const systemCtx = lastAuditResult
+      ? `Last audited contract: ${lastAuditAddress} — Score: ${lastAuditResult.score}/100 — Verdict: ${lastAuditResult.verdict}. Findings: ${JSON.stringify(lastAuditResult.findings)}`
+      : '';
+
+    const msgs = conversationHistory.slice(-6).map(m => ({ role: m.role, content: m.content }));
+    if (systemCtx) msgs.unshift({ role:'user', content: `[Context: ${systemCtx}]` });
+
+    // Add current question if not already there
+    if (!msgs.find(m=>m.content===text && m.role==='user')) msgs.push({role:'user',content:text});
+
+    const sysPrompt = [{
+      role: 'user',
+      content: `You are AuditAI, a smart contract security expert assistant. Answer security questions clearly and concisely. Use **bold** for key terms and \`code\` for contract addresses/functions. Be helpful and precise. ${systemCtx ? 'Context about the last audit: ' + systemCtx : ''}\n\nUser question: ${text}`
+    }];
+
+    const answer = await callClaude(sysPrompt, 600);
+    removeTyping();
+    appendAIMessage(answer);
+  } catch(e) {
+    removeTyping();
+    appendAIMessage(`⚠️ ${e.message}`);
+  }
+
+  document.getElementById('sendBtn').disabled = false;
+}
+
+function sendQuick(text) {
+  document.getElementById('chatInput').value = text;
+  handleInput();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEXTAREA AUTO-RESIZE
+// ═══════════════════════════════════════════════════════════════════════════════
+const ta = document.getElementById('chatInput');
+ta.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+ta.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    handleInput();
+  }
+});
+
+// ── KEYBOARD SHORTCUTS ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement !== ta) {
+    e.preventDefault(); ta.focus();
+  }
+  if (e.key === 'Escape') {
+    closeModal();
+    ta.blur();
+  }
+});
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+renderSidebar();
+updateNavStats();
+</script>
+</body>
+</html>

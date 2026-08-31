@@ -1,0 +1,19 @@
+name = "auditai"
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "public"
+
+# Configure these in the Cloudflare dashboard under your Pages project:
+#   Settings -> Variables and Secrets
+#
+# Secrets (encrypted) — set ANTHROPIC_API_KEY as a Secret:
+#   ANTHROPIC_API_KEY   (required)
+#
+# Environment variables (optional, shown here as defaults):
+#   ANTHROPIC_MODEL     default: claude-sonnet-4-20250514
+#   ANTHROPIC_API_URL   default: https://api.anthropic.com/v1/messages
+#   ANTHROPIC_VERSION   default: 2023-06-01
+
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
