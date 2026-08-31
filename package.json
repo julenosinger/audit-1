@@ -1,0 +1,31 @@
+{
+  "name": "audit-genlayer",
+  "version": "1.0.0",
+  "description": "Smart-contract security scanner in a chat UI. Audit any EVM contract, scan a wallet's portfolio, check token approvals, or compare two contracts — then publish the result on-chain to **GenLayer**.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "build": "esbuild src/genlayer-sdk.js --bundle --format=iife --target=es2020 --outfile=public/genlayer-sdk.bundle.js",
+    "test": "node tests/audit-engine.test.js && node tests/audit-engine.cfg.test.js && node tests/audit-engine.dataflow.test.js && node tests/audit-engine.interprocedural.test.js && node tests/genlayer-auditor.test.js && node tests/genlayer-runtime.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/julenosinger/audit-1.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/julenosinger/audit-1/issues"
+  },
+  "homepage": "https://github.com/julenosinger/audit-1#readme",
+  "dependencies": {
+    "genlayer-js": "^1.1.8"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

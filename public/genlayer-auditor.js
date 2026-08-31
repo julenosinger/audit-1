@@ -155,9 +155,9 @@
     });
   }
 
-  function doRequest(client, payload) {
+  function doRequest(client, payload, opts) {
     if (!client) return Promise.resolve(null);
-    if (typeof client.analyzeEvidence === 'function') return Promise.resolve(client.analyzeEvidence(payload));
+    if (typeof client.analyzeEvidence === 'function') return Promise.resolve(client.analyzeEvidence(payload, opts));
     if (typeof client.write === 'function') return Promise.resolve(client.write(payload));
     return Promise.reject(new Error('client does not implement analyzeEvidence/write'));
   }
@@ -170,7 +170,7 @@
       return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null };
     }
     try {
-      var resp = await withTimeout(doRequest(client, payload), timeoutMs);
+      var resp = await withTimeout(doRequest(client, payload, opts), timeoutMs);
       if (resp === 'TIMEOUT') return { status: 'TIMEOUT', payload: payload, local: result, genlayer: null };
       if (resp === null) return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null };
       var v = validateResponse(resp, payload);

@@ -8,6 +8,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+<script src="genlayer-sdk.bundle.js"></script>
+<script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
 <script src="genlayer-auditor.js"></script>
 <script src="audit-engine.js"></script>
@@ -1339,12 +1341,12 @@ function setGLAnalysisStatus(addr, status) {
   const el = document.getElementById('gl-analysis-' + String(addr).toLowerCase());
   if (!el) return;
   const map = {
-    'PENDING':   { text: 'Analyzing…',        cls: 'gl-pending' },
-    'FINALIZED': { text: 'Finalized',         cls: 'gl-finalized' },
-    'FAILED':    { text: 'Unavailable',       cls: 'gl-fail' },
-    'TIMEOUT':   { text: 'Timed out',         cls: 'gl-fail' },
-    'INVALID':   { text: 'Invalid response',  cls: 'gl-fail' },
-    'NOT_REQUESTED': { text: 'Not requested', cls: '' }
+    'PENDING':   { text: 'Analyzing with GenLayer…', cls: 'gl-pending' },
+    'FINALIZED': { text: 'Complete',               cls: 'gl-finalized' },
+    'FAILED':    { text: 'Unavailable',            cls: 'gl-fail' },
+    'TIMEOUT':   { text: 'Timed out',              cls: 'gl-fail' },
+    'INVALID':   { text: 'Invalid response',       cls: 'gl-fail' },
+    'NOT_REQUESTED': { text: 'Not requested',      cls: '' }
   };
   const m = map[status] || { text: status, cls: '' };
   el.textContent = m.text;
@@ -1355,17 +1357,27 @@ async function requestGenLayerAnalysis(addr) {
   const lower = String(addr).toLowerCase();
   const data = GL_AUDIT_STORE[lower];
   if (!data || !data.payload) { alert('No local analysis available for this address.'); return; }
+
   if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
     alert('Set the GenLayer contract address first (top bar).');
     if (window.AuditAIGenLayer) setGenlayerContractUI();
     if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
+
   const auditor = window.AuditAIGenLayerAuditor;
   if (!auditor) { setGLAnalysisStatus(addr, 'FAILED'); return; }
 
-  setGLAnalysisStatus(addr, 'PENDING');
   const client = window.AuditAIGenLayer.getClient();
-  const res = await auditor.analyze(client, data.payload, { timeoutMs: 90000 });
+  if (!client) { setGLAnalysisStatus(addr, 'FAILED'); appendAIMessage('⚠️ GenLayer SDK not initialized.'); return; }
+
+  setGLAnalysisStatus(addr, 'PENDING');
+  const account = walletAddress || null; // must be connected to Bradbury (chainId 4221)
+
+  const res = await auditor.analyze(client, data.payload, {
+    timeoutMs: 180000,
+    contractAddress: window.AuditAIGenLayer.getContract(),
+    account: account
+  });
 
   if (res.status === 'FINALIZED') {
     setGLAnalysisStatus(addr, 'FINALIZED');
@@ -1378,7 +1390,14 @@ async function requestGenLayerAnalysis(addr) {
     appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
   } else {
     setGLAnalysisStatus(addr, 'FAILED');
-    appendAIMessage('⚠️ GenLayer analysis unavailable — local analysis remains valid.');
+    const err = res.error || 'unknown';
+    if (err === 'WALLET_REQUIRED') {
+      appendAIMessage('⚠️ GenLayer analysis needs a wallet connected to **Bradbury (chain 4221)** to sign the transaction. Connect your wallet and retry — local analysis remains valid.');
+    } else if (err === 'NO_CONTRACT' || err === 'CONTRACT_UNAVAILABLE') {
+      appendAIMessage('⚠️ GenLayer audit contract is not deployed/reachable on Bradbury. Deploy `contracts/audit_ai.py` and set its address in the top bar. Local analysis remains valid.');
+    } else {
+      appendAIMessage('⚠️ GenLayer analysis failed: ' + err + '. Local analysis remains valid.');
+    }
   }
 }
 

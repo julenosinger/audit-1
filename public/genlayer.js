@@ -69,12 +69,17 @@
     return Promise.reject(new Error('genlayer-js not available'));
   }
 
-  // Synchronous accessor for the GenLayer client (null if not wired).
-  // The client must expose an `analyzeEvidence(payload)` or `write(payload)`
-  // method (see public/genlayer-auditor.js). Bundling genlayer-js and assigning
-  // `window.genlayer` is the supported wiring path for this no-bundler SPA.
+  // Synchronous accessor for the GenLayer client adapter (null if not wired).
+  // Prefers the bundled adapter (public/genlayer-client.js → genlayer-sdk.bundle.js),
+  // which implements analyzeEvidence(payload, opts). Falls back to a manually
+  // injected window.genlayer for legacy/Studio testing.
   function getClient() {
     if (_client) return _client;
+    var adapterFactory = window.AuditAIGenLayerClient;
+    if (adapterFactory && typeof adapterFactory.createAdapter === 'function') {
+      try { _client = adapterFactory.createAdapter(); } catch (e) { _client = null; }
+      if (_client) return _client;
+    }
     if (window.genlayer) { _client = window.genlayer; return _client; }
     return null;
   }
