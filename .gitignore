@@ -3,3 +3,5 @@ node_modules/
 .dev.vars
 *.log
 contract-auditor*.html
+__pycache__/
+*.pyc

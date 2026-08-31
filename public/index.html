@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+<script src="genlayer.js"></script>
 <style>
 :root {
   --bg:     #050508;
@@ -42,6 +43,9 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .topbar-center{flex:1;display:flex;align-items:center;justify-content:center;gap:8px}
 .topbar-pill{font-family:var(--mono);font-size:10px;padding:3px 10px;border-radius:20px;border:1px solid var(--border);color:var(--muted)}
 .topbar-pill span{color:var(--green)}
+.topbar-pill.gl-pill{cursor:pointer;border-color:rgba(167,139,250,.3)}
+.topbar-pill.gl-pill:hover{border-color:rgba(167,139,250,.6);color:var(--text)}
+.topbar-pill.gl-pill span{color:var(--violet)}
 
 /* ── WALLET BUTTON ── */
 .wallet-btn{display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--surf2);font-family:var(--mono);font-size:11px;color:var(--text);cursor:pointer;transition:all .2s;white-space:nowrap}
@@ -143,6 +147,9 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .rc-footer-left{font-family:var(--mono);font-size:9px;color:var(--muted2)}
 .rc-explorer{font-family:var(--mono);font-size:9px;color:var(--blue);text-decoration:none}
 .rc-explorer:hover{text-decoration:underline}
+.publish-btn{font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:6px;border:1px solid rgba(167,139,250,.4);color:var(--violet);background:rgba(167,139,250,.06);cursor:pointer;transition:all .2s}
+.publish-btn:hover{background:rgba(167,139,250,.14)}
+.onchain-badge{font-family:var(--mono);font-size:8px;padding:1px 6px;border-radius:4px;background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.25)}
 
 /* ── PORTFOLIO CARD ── */
 .portfolio-card{background:var(--surf2);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
@@ -252,6 +259,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
       <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
+      <div class="topbar-pill gl-pill" id="glPill" onclick="setGenlayerContractUI()" title="Set GenLayer contract address">GenLayer contract: <span id="glStatus">not set</span></div>
     </div>
     <button class="wallet-btn" id="walletBtn" onclick="connectWallet()">
       <div class="wallet-dot" id="walletDot"></div>
@@ -378,6 +386,7 @@ let conversationHistory = [];
 
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
+const GL_AUDIT_STORE = {};
 
 const CHAIN_CONFIG = {
   '5042002': { name: 'Arc Testnet',  short: 'arc',      explorer: 'https://testnet.arcscan.app/address/' },
@@ -422,10 +431,11 @@ function renderSidebar() {
   if (!h.length) { el.innerHTML = '<div style="font-family:var(--mono);font-size:10px;color:var(--muted2);padding:6px 10px">No audits yet</div>'; return; }
   el.innerHTML = h.slice(0, 15).map(item => {
     const stale = Date.now() - item.ts > REPORT_TTL;
+    const onchain = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(item.address);
     return `<div class="hist-entry" onclick="sendQuick('Audit ${item.address} on ${item.chain}')">
       <div class="hist-score-dot" style="background:${scoreColor(item.score)}"></div>
       <div class="hist-entry-text">
-        <div class="hist-entry-addr">${item.address.slice(0,10)}…${item.address.slice(-5)}</div>
+        <div class="hist-entry-addr">${item.address.slice(0,10)}…${item.address.slice(-5)}${onchain ? ' <span class="onchain-badge">ON-CHAIN</span>' : ''}</div>
         <div class="hist-entry-meta">${item.chain}${stale ? ' · stale' : ''}</div>
       </div>
       <span class="hist-entry-score" style="color:${scoreColor(item.score)}">${item.score}</span>
@@ -612,6 +622,12 @@ function buildResultCard(data, address, chainId) {
   const badgeText = data.score >= 75 ? 'SAFE' : data.score >= 45 ? 'WARNING' : 'DANGER';
   const verdictText = data.score >= 75 ? 'Contract appears safe' : data.score >= 45 ? 'Use with caution' : 'High risk — avoid';
 
+  GL_AUDIT_STORE[address.toLowerCase()] = {
+    score: data.score,
+    verdict: badgeText,
+    summary: (data.analysis || '') + (data.findings || []).map(f => f.title).join('; ')
+  };
+
   const SEV_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2, INFO: 3 };
   const findings = (data.findings || []).slice().sort((a,b) => (SEV_ORDER[a.severity]??9)-(SEV_ORDER[b.severity]??9));
 
@@ -654,6 +670,7 @@ function buildResultCard(data, address, chainId) {
     </div>
     <div class="rc-footer">
       <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
+      <button class="publish-btn" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>
       <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
     </div>
   </div>`;
@@ -1053,9 +1070,58 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENLAYER
+// ═══════════════════════════════════════════════════════════════════════════════
+function updateGLStatus() {
+  const el = document.getElementById('glStatus');
+  if (el) el.textContent = window.AuditAIGenLayer.short(window.AuditAIGenLayer.getContract());
+}
+
+function setGenlayerContractUI() {
+  const cur = window.AuditAIGenLayer.getContract();
+  const input = prompt('GenLayer Intelligent Contract address (contracts/audit_ai.py):', cur || '0x');
+  if (input === null) return;
+  const addr = String(input).trim();
+  window.AuditAIGenLayer.setContract(addr);
+  updateGLStatus();
+  if (window.AuditAIGenLayer.isSet(addr)) {
+    appendAIMessage(`✅ GenLayer contract set: \`${addr}\`. Audit results can now be published on-chain.`);
+  } else {
+    appendAIMessage('⚠️ That does not look like a 0x address (42 hex chars). Saved anyway.');
+  }
+}
+
+async function publishToGenLayer(addr) {
+  const data = GL_AUDIT_STORE[addr.toLowerCase()];
+  if (!data) { appendAIMessage('⚠️ No audit result available for this address.'); return; }
+
+  if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
+    setGenlayerContractUI();
+    if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
+  }
+
+  appendAIMessage(`Publishing audit for \`${addr.slice(0, 10)}…\` to GenLayer…`);
+  const res = await window.AuditAIGenLayer.publish(addr, data.score, data.verdict, data.summary);
+
+  if (res.ok) {
+    window.AuditAIGenLayer.markPublished(addr);
+    appendAIMessage(`✅ Published on GenLayer.\n\nScore **${data.score}** · Verdict **${data.verdict}**\n${data.summary}`);
+  } else if (res.fallback) {
+    window.AuditAIGenLayer.markPublished(addr);
+    appendAIMessage(
+      `ℹ️ **genlayer-js not wired yet** — publish from GenLayer Studio instead.\n\n` +
+      `Contract: \`${res.contract}\`\n\nMethod + args:\n\`${res.calldata}\``
+    );
+  } else {
+    appendAIMessage(`⚠️ ${res.message}`);
+  }
+}
+
 // ── INIT ──────────────────────────────────────────────────────────────────────
 renderSidebar();
 updateNavStats();
+updateGLStatus();
 </script>
 </body>
 </html>

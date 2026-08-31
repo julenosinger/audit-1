@@ -1,0 +1,127 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// AuditAI — GenLayer bridge
+//
+// Thin client-side helper to publish an EVM audit result into the AuditAI
+// Intelligent Contract (contracts/audit_ai.py) deployed on GenLayer.
+//
+// It is intentionally defensive: it never throws, never depends on a hard CDN
+// that could break the ethers.js flow, and falls back to Studio instructions
+// (copy the method call) when `genlayer-js` is not available.
+// ═══════════════════════════════════════════════════════════════════════════════
+(function () {
+  'use strict';
+
+  var STORAGE_KEY = 'auditai.genlayer.contract';
+  var PUBLISHED_KEY = 'auditai.genlayer.published';
+
+  // ── GenLayer networks ──────────────────────────────────────────────────────
+  // TODO: fill real chainId + RPC from the current docs when you wire
+  // genlayer-js. Do NOT invent values — leave 0/"" and keep using Studio for
+  // the first deploy.
+  //   https://docs.genlayer.com/developers/intelligent-contracts/deploying
+  var NETWORKS = {
+    studio:   { name: 'Studio',   chainId: 0, rpc: '' },
+    asimov:   { name: 'Asimov',   chainId: 0, rpc: '' },
+    bradbury: { name: 'Bradbury', chainId: 0, rpc: '' }
+  };
+
+  function getContract() {
+    try { return localStorage.getItem(STORAGE_KEY) || ''; } catch (e) { return ''; }
+  }
+
+  function setContract(addr) {
+    try { localStorage.setItem(STORAGE_KEY, String(addr || '').trim()); } catch (e) {}
+  }
+
+  function short(addr) {
+    if (!addr) return 'not set';
+    return addr.slice(0, 10) + '\u2026' + addr.slice(-6);
+  }
+
+  function isSet(addr) {
+    return !!(addr && /^0x[0-9a-fA-F]{40}$/.test(addr));
+  }
+
+  function getPublished() {
+    try { return JSON.parse(localStorage.getItem(PUBLISHED_KEY) || '{}'); } catch (e) { return {}; }
+  }
+
+  function markPublished(contractAddr) {
+    try {
+      var p = getPublished();
+      p[String(contractAddr).toLowerCase()] = Date.now();
+      localStorage.setItem(PUBLISHED_KEY, JSON.stringify(p));
+    } catch (e) {}
+  }
+
+  function isPublished(contractAddr) {
+    return !!getPublished()[String(contractAddr).toLowerCase()];
+  }
+
+  // ── genlayer-js (optional) ─────────────────────────────────────────────────
+  // TODO: if/when genlayer-js is available via a confirmed CDN/bundle, load it
+  // here and implement the real write/view calls below.
+  //   npm: genlayer-js   →  import { GenLayerClient } from 'genlayer-js'
+  var _client = null;
+
+  function loadClient() {
+    if (_client) return Promise.resolve(_client);
+    if (window.genlayer) { _client = window.genlayer; return Promise.resolve(_client); }
+    // No confirmed CDN yet. Return a rejected promise so callers use the
+    // Studio fallback instead of crashing.
+    return Promise.reject(new Error('genlayer-js not available'));
+  }
+
+  // ── public API ─────────────────────────────────────────────────────────────
+  // publish(contractAddr, score, verdict, summary) -> Promise<{ok, message, calldata?}>
+  function publish(contractAddr, score, verdict, summary) {
+    var target = getContract();
+    if (!isSet(target)) {
+      return Promise.resolve({
+        ok: false,
+        needContract: true,
+        message: 'No GenLayer contract set. Click "Set GenLayer contract address" in the top bar first.'
+      });
+    }
+
+    return loadClient().then(function (client) {
+      // TODO: real write once the client is wired:
+      //   return client.write(target, 'publish_audit', [contractAddr, String(score), verdict, summary]);
+      throw new Error('genlayer-js publish not wired yet');
+    }).catch(function () {
+      return Promise.resolve({
+        ok: false,
+        fallback: true,
+        contract: target,
+        message: 'Open GenLayer Studio and call publish_audit on ' + short(target),
+        calldata: 'publish_audit(\n  "' + contractAddr + '",\n  "' + score + '",\n  "' + verdict + '",\n  "' + String(summary).replace(/"/g, '\\"') + '"\n)'
+      });
+    });
+  }
+
+  // getOnChain(contractAddr) -> Promise<string|null>  (format "{score}|{verdict}|{summary}")
+  function getOnChain(contractAddr) {
+    var target = getContract();
+    if (!isSet(target)) return Promise.resolve(null);
+
+    return loadClient().then(function (client) {
+      // TODO: real view once wired:
+      //   return client.view(target, 'get_audit', [contractAddr]);
+      return null;
+    }).catch(function () { return null; });
+  }
+
+  window.AuditAIGenLayer = {
+    STORAGE_KEY: STORAGE_KEY,
+    PUBLISHED_KEY: PUBLISHED_KEY,
+    NETWORKS: NETWORKS,
+    getContract: getContract,
+    setContract: setContract,
+    short: short,
+    isSet: isSet,
+    isPublished: isPublished,
+    markPublished: markPublished,
+    publish: publish,
+    getOnChain: getOnChain
+  };
+})();
