@@ -46,7 +46,8 @@ test('PUSH32 containing 0xf4 does NOT report DELEGATECALL', function () {
 test('real SELFDESTRUCT is reported', function () {
   var r = Engine.analyze('ff');
   assert.ok(hasFinding(r, 'selfdestruct-present'));
-  assert.equal(findById(r, 'selfdestruct-present').severity, 'MEDIUM');
+  // Phase 3: reachable SELFDESTRUCT is upgraded from MEDIUM to HIGH (control-flow aware).
+  assert.equal(findById(r, 'selfdestruct-present').severity, 'HIGH');
 });
 
 test('real DELEGATECALL is reported as potential proxy (LOW confidence)', function () {
