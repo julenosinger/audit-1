@@ -280,7 +280,14 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
       <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
-      <div class="topbar-pill gl-pill" id="glContractPill" onclick="setGenlayerContractUI()" title="Set GenLayer contract address">GenLayer: <span id="glStatus">not set</span></div>
+      <div class="topbar-pill gl-pill" id="glContractPill" title="GenLayer network and contract">
+        GenLayer:
+        <select id="glNetworkSelect" onchange="onGLNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:96px;">
+          <option value="studionet">Studionet</option>
+          <option value="bradbury">Bradbury</option>
+        </select>
+        <span id="glStatus">not set</span>
+      </div>
     </div>
     <button class="wallet-btn" id="walletBtn" onclick="connectWallet()">
       <div class="wallet-dot" id="walletDot"></div>
@@ -1219,22 +1226,38 @@ document.addEventListener('keydown', e => {
 // GENLAYER
 // ═══════════════════════════════════════════════════════════════════════════════
 function updateGLStatus() {
+  const sel = document.getElementById('glNetworkSelect');
   const el = document.getElementById('glStatus');
-  if (!el || !window.AuditAIGenLayer) return;
-  el.textContent = window.AuditAIGenLayer.short(window.AuditAIGenLayer.getContract());
+  if (!window.AuditAIGenLayer) return;
+  const net = window.AuditAIGenLayer.getNetwork();
+  const netId = window.AuditAIGenLayer.getNetworkId();
+  if (sel) sel.value = netId;
+  if (!el) return;
+  if (net && net.contract) {
+    el.textContent = window.AuditAIGenLayer.short(net.contract) + ' · ' + net.chainId;
+  } else if (net) {
+    el.textContent = 'not deployed · ' + net.chainId;
+  } else {
+    el.textContent = 'not set';
+  }
+}
+
+function onGLNetworkChange(id) {
+  if (!window.AuditAIGenLayer) return;
+  window.AuditAIGenLayer.setNetworkId(id);
+  updateGLStatus();
 }
 
 function setGenlayerContractUI() {
   if (!window.AuditAIGenLayer) return;
-  const cur = window.AuditAIGenLayer.getContract();
-  const input = prompt('GenLayer Intelligent Contract address (contracts/audit_ai.py):', cur || '0x');
+  const nets = window.AuditAIGenLayer.NETWORKS || {};
+  const ids = Object.keys(nets);
+  const cur = window.AuditAIGenLayer.getNetworkId();
+  const input = prompt('GenLayer network (' + ids.map(id => id + ' = ' + nets[id].name).join(', ') + '):', cur);
   if (input === null) return;
-  const addr = String(input).trim();
-  if (!window.AuditAIGenLayer.isSet(addr)) {
-    alert('Invalid address. Expected 0x followed by 40 hex characters.');
-    return;
-  }
-  window.AuditAIGenLayer.setContract(addr);
+  const id = String(input).trim().toLowerCase();
+  if (!nets[id]) { alert('Invalid network. Choose one of: ' + ids.join(', ')); return; }
+  window.AuditAIGenLayer.setNetworkId(id);
   updateGLStatus();
 }
 
@@ -1372,21 +1395,27 @@ function setGLAnalyzeBusy(addr, busy) {
 
 function showGenLayerError(err) {
   const base = String(err || '').split(':')[0];
+  const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  const netName = net ? net.name : 'the selected network';
+  const netChain = net ? net.chainId : '?';
   const map = {
-    'GENLAYER_AUDITOR_NOT_DEPLOYED': 'no AuditAI contract is deployed/configured on Bradbury. Deploy `contracts/audit_ai.py` and set the address.',
+    'GENLAYER_AUDITOR_NOT_DEPLOYED': 'no AuditAI contract is deployed on ' + netName + '. Deploy `contracts/audit_ai.py` or select another network.',
     'WALLET_REQUIRED': 'a connected wallet is required to sign the transaction.',
-    'WRONG_NETWORK': 'your wallet is on the wrong network. Switch to Bradbury (chain 4221).',
+    'WRONG_NETWORK': 'your wallet is on the wrong network. Switch to ' + netName + ' (chain ' + netChain + ').',
     'USER_REJECTED': 'the transaction was rejected in your wallet.',
     'INSUFFICIENT_BALANCE': 'your wallet has insufficient balance to pay for the transaction.',
     'TRANSACTION_FAILED': 'the GenLayer transaction failed/reverted.',
     'TRANSACTION_TIMEOUT': 'the GenLayer transaction timed out waiting for finalization.',
     'NO_RESULT': 'the contract has no stored analysis yet (the validator may still be executing, or none is running).',
     'INVALID_RESULT_JSON': 'GenLayer returned a result that could not be parsed.',
-    'GENLAYER_NETWORK_UNAVAILABLE': 'the GenLayer Bradbury network is unreachable.',
+    'GENLAYER_NETWORK_UNAVAILABLE': 'the ' + netName + ' GenLayer network is unreachable.',
     'SDK_UNAVAILABLE': 'the GenLayer SDK failed to initialize.',
     'METHOD_MISSING': 'the deployed contract does not expose analyze_evidence/get_analysis.',
     'NO_TX_HASH': 'the transaction was submitted but no hash was returned.',
-    'CONTRACT_UNAVAILABLE': 'the AuditAI contract is not reachable on Bradbury.'
+    'CONTRACT_UNAVAILABLE': 'the AuditAI contract is not reachable on ' + netName + '.',
+    'NETWORK_CONTRACT_MISMATCH': 'the configured contract does not match the selected network.',
+    'UNKNOWN_NETWORK': 'the selected GenLayer network is unknown.',
+    'SCHEMA_UNAVAILABLE': 'the contract schema could not be read.'
   };
   appendAIMessage('⚠️ **' + base + '** — ' + (map[base] || (err + '.')) + ' Local analysis remains valid.');
 }
@@ -1398,9 +1427,10 @@ async function requestGenLayerAnalysis(addr) {
 
   if (GL_INFLIGHT[lower]) { appendAIMessage('⏳ GenLayer analysis already in progress for this contract — please wait.'); return; }
 
-  if (!window.AuditAIGenLayer || !window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
-    appendAIMessage('⚠️ **GENLAYER_AUDITOR_NOT_DEPLOYED** — no AuditAI contract is configured on Bradbury. Deploy `contracts/audit_ai.py` and set the address. Local analysis remains valid.');
-    if (window.AuditAIGenLayer) setGenlayerContractUI();
+  if (!window.AuditAIGenLayer) { setGLAnalysisStatus(addr, 'FAILED'); return; }
+  const net = window.AuditAIGenLayer.getNetwork();
+  if (!net || !window.AuditAIGenLayer.isSet(net.contract)) {
+    appendAIMessage('⚠️ **GENLAYER_AUDITOR_NOT_DEPLOYED** — no AuditAI contract is deployed on ' + (net ? net.name : 'the selected network') + '. Select another network in the top bar, or deploy `contracts/audit_ai.py`. Local analysis remains valid.');
     return;
   }
 
@@ -1408,7 +1438,7 @@ async function requestGenLayerAnalysis(addr) {
   if (!auditor) { setGLAnalysisStatus(addr, 'FAILED'); return; }
 
   const client = window.AuditAIGenLayer.getClient();
-  if (!client) { setGLAnalysisStatus(addr, 'FAILED'); appendAIMessage('⚠️ GenLayer SDK not initialized.'); return; }
+  if (!client) { setGLAnalysisStatus(addr, 'FAILED'); appendAIMessage('⚠️ **SDK_UNAVAILABLE** — GenLayer SDK not initialized.'); return; }
 
   if (!walletAddress) {
     setGLAnalysisStatus(addr, 'NOT_REQUESTED');
@@ -1416,9 +1446,9 @@ async function requestGenLayerAnalysis(addr) {
     await connectWallet();
     return;
   }
-  if (String(walletChainId) !== '4221') {
+  if (String(walletChainId) !== String(net.chainId)) {
     setGLAnalysisStatus(addr, 'FAILED');
-    appendAIMessage('⚠️ **WRONG_NETWORK** — wallet is on chain ' + (walletChainId || 'unknown') + ' but GenLayer requires **Bradbury (chain 4221)**. Switch networks in your wallet, then retry. Local analysis remains valid.');
+    appendAIMessage('⚠️ **WRONG_NETWORK** — wallet is on chain ' + (walletChainId || 'unknown') + ' but the selected GenLayer network is **' + net.name + ' (chain ' + net.chainId + ')**. Switch networks in your wallet, then retry. Local analysis remains valid.');
     return;
   }
 
@@ -1426,11 +1456,20 @@ async function requestGenLayerAnalysis(addr) {
   setGLAnalysisStatus(addr, 'PREPARING');
   setGLAnalyzeBusy(addr, true);
   data.glTxHash = null;
+  data.glNetwork = net;
 
   try {
+    // Pre-flight capability check (no transaction): SDK / network / chainId /
+    // contract reachability / analyze_evidence + get_analysis availability.
+    const pf = await client.preflight();
+    if (!pf.ok) {
+      setGLAnalysisStatus(addr, 'FAILED');
+      showGenLayerError(pf.error);
+      return;
+    }
+
     const res = await auditor.analyze(client, data.payload, {
       timeoutMs: 180000,
-      contractAddress: window.AuditAIGenLayer.getContract(),
       account: walletAddress,
       onStatus: function (state, detail) {
         if (state === 'SUBMITTED') data.glTxHash = detail;
@@ -1463,7 +1502,9 @@ function showGenLayerResult(addr, res) {
   const data = GL_AUDIT_STORE[String(addr).toLowerCase()];
   let msg = '🧠 **GenLayer AI analysis finalized.**\n';
   if (data && data.glTxHash && window.AuditAIGenLayer) {
-    msg += 'Transaction: `' + data.glTxHash + '`\nNetwork: **Bradbury** · Contract: `' + window.AuditAIGenLayer.getContract() + '`\n';
+    const net = data.glNetwork || window.AuditAIGenLayer.getNetwork();
+    const contract = (net && net.contract) || window.AuditAIGenLayer.getContract();
+    msg += 'Transaction: `' + data.glTxHash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '** (chain ' + (net ? net.chainId : '?') + ') · Contract: `' + contract + '`\n';
   }
   if (gl) {
     msg += 'Verdict: **' + gl.verdict + '** (confidence ' + (gl.confidence || '?') + ')\n';

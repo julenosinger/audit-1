@@ -1,18 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// AuditAI — GenLayer client adapter (Phase 5B)
+// AuditAI — GenLayer client adapter (Phase 5B.3, multi-network)
 //
 // Thin adapter over the official genlayer-js SDK (bundled into
 // public/genlayer-sdk.bundle.js and exposed as window.GenLayerSDK).
 //
-// It exposes a small API so the rest of the app never touches SDK internals:
-//   initializeGenLayer / isGenLayerAvailable / getGenLayerNetwork
-//   getReadClient / getContractSchema / read / getAnalysis
-//   analyzeEvidence(payload, opts)  — full write → wait → read lifecycle
+// Multi-network: each GenLayer network is paired with its AuditAI contract in
+// the NETWORKS registry below (single source of truth). A network is only
+// usable when `deployed` is true AND `contract` is set. The selected network's
+// chain and contract are always used together — never cross-paired.
+//
+// API:
+//   createAdapter(SDK?, { networkId, networks })  → adapter instance
+//   adapter.preflight()      — capability check (no transaction)
+//   adapter.analyzeEvidence(payload, opts) — full write → wait → read lifecycle
 //
 // No private key, no secret, no external AI. Writes require a wallet account
-// (opts.account) provided by the caller; reads work without a wallet.
-//
-// Unit-testable: createAdapter(mockSDK) lets tests inject a fake transport.
+// (opts.account); reads work without a wallet.
 // ═══════════════════════════════════════════════════════════════════════════════
 (function (factory) {
   var api = factory();
@@ -21,16 +24,22 @@
 })(function () {
   'use strict';
 
-  var NETWORK = { name: 'Bradbury', chainId: 4221, rpc: 'https://rpc-bradbury.genlayer.com' };
-  var CONTRACT_KEY = 'auditai.genlayer.contract';
+  // ── Network registry (single source of truth) ──────────────────────────────
+  // Each entry pairs a network with its AuditAI contract. Studionet is the
+  // confirmed deployment; Bradbury is NOT yet deployed (contract must be set
+  // only after it has been verified on chain 4221).
+  var NETWORKS = {
+    studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B', deployed: true },
+    bradbury:  { id: 'bradbury',  name: 'Bradbury',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com', contract: '', deployed: false }
+  };
+  var DEFAULT_NETWORK_ID = 'studionet';
+  // SDK chain object key per network id (genlayer-js exposes studionet /
+  // testnetBradbury, etc).
+  var SDK_CHAIN_KEY = { studionet: 'studionet', bradbury: 'testnetBradbury' };
 
   function getSdk() {
     return (typeof window !== 'undefined' && window.GenLayerSDK) ||
       (typeof globalThis !== 'undefined' && globalThis.GenLayerSDK);
-  }
-
-  function getStoredContract() {
-    try { return localStorage.getItem(CONTRACT_KEY) || ''; } catch (e) { return ''; }
   }
 
   // Map a raw SDK/wallet error to a canonical, UI-facing error code. Kept at
@@ -49,24 +58,37 @@
     return 'GENLAYER_ERROR';
   }
 
-  function createAdapter(SDK) {
+  function createAdapter(SDK, opts) {
+    opts = opts || {};
     var sdk = SDK || getSdk();
+    var networks = opts.networks || NETWORKS;
+    var networkId = (opts.networkId && networks[opts.networkId]) ? opts.networkId : DEFAULT_NETWORK_ID;
     var readClient = null;
 
+    function network() { return networks[networkId] || null; }
+
+    function sdkChain() {
+      if (!sdk || !sdk.chains) return null;
+      var key = SDK_CHAIN_KEY[networkId];
+      return key ? (sdk.chains[key] || null) : null;
+    }
+
     function available() {
-      return !!(sdk && typeof sdk.createClient === 'function' && sdk.chains && sdk.chains.testnetBradbury);
+      return !!(sdk && typeof sdk.createClient === 'function' && sdkChain());
     }
 
     function ensureRead() {
       if (readClient) return readClient;
       if (!available()) return null;
-      try { readClient = sdk.createClient({ chain: sdk.chains.testnetBradbury }); }
+      try { readClient = sdk.createClient({ chain: sdkChain() }); }
       catch (e) { readClient = null; }
       return readClient;
     }
 
     function isAvailable() { return available(); }
-    function getNetwork() { return NETWORK; }
+    function getNetwork() { return network(); }
+    function getNetworkId() { return networkId; }
+    function getContract() { var n = network(); return n ? n.contract : ''; }
     function getReadClient() { return ensureRead(); }
 
     async function getContractSchema(address) {
@@ -85,6 +107,25 @@
       return read(auditorAddr, 'get_analysis', [contractAddr]);
     }
 
+    // Pre-flight capability check for the selected network. Performs a real
+    // schema read but submits NO transaction.
+    async function preflight(overrideContract) {
+      if (!available()) return { ok: false, error: 'SDK_UNAVAILABLE' };
+      var n = network();
+      if (!n) return { ok: false, error: 'UNKNOWN_NETWORK' };
+      var contract = overrideContract || n.contract;
+      if (!n.deployed || !contract) return { ok: false, error: 'GENLAYER_AUDITOR_NOT_DEPLOYED', network: n };
+      var c = ensureRead();
+      if (!c) return { ok: false, error: 'SDK_UNAVAILABLE', network: n };
+      var sch;
+      try { sch = await c.getContractSchema(contract); }
+      catch (e) { return { ok: false, error: 'CONTRACT_UNAVAILABLE', network: n }; }
+      if (!sch || !sch.methods) return { ok: false, error: 'SCHEMA_UNAVAILABLE', network: n };
+      if (!sch.methods['analyze_evidence']) return { ok: false, error: 'METHOD_MISSING: analyze_evidence', network: n };
+      if (!sch.methods['get_analysis']) return { ok: false, error: 'METHOD_MISSING: get_analysis', network: n };
+      return { ok: true, network: n, contract: contract, methods: Object.keys(sch.methods) };
+    }
+
     function emit(opts, state, detail) {
       if (opts && typeof opts.onStatus === 'function') {
         try { opts.onStatus(state, detail); } catch (e) {}
@@ -99,8 +140,15 @@
       opts = opts || {};
       emit(opts, 'PREPARING');
       if (!available()) throw new Error('SDK_UNAVAILABLE');
-      var auditorAddr = opts.contractAddress || getStoredContract();
+      var n = network();
+      if (!n) throw new Error('UNKNOWN_NETWORK');
+      if (!n.deployed) throw new Error('GENLAYER_AUDITOR_NOT_DEPLOYED');
+      var auditorAddr = opts.contractAddress || n.contract;
       if (!auditorAddr) throw new Error('GENLAYER_AUDITOR_NOT_DEPLOYED');
+      // Pairing guard: an explicit override must belong to the selected network.
+      if (opts.contractAddress && n.contract && String(opts.contractAddress).toLowerCase() !== String(n.contract).toLowerCase()) {
+        throw new Error('NETWORK_CONTRACT_MISMATCH');
+      }
 
       emit(opts, 'CONNECTING', { contract: auditorAddr });
       var c = ensureRead();
@@ -118,7 +166,7 @@
       if (!account) throw new Error('WALLET_REQUIRED');
 
       var wc;
-      try { wc = sdk.createClient({ chain: sdk.chains.testnetBradbury, account: account }); }
+      try { wc = sdk.createClient({ chain: sdkChain(), account: account }); }
       catch (e) { throw new Error(toErrorCode(e)); }
 
       var evidenceJson = JSON.stringify(payload);
@@ -173,16 +221,25 @@
     }
 
     return {
-      NETWORK: NETWORK,
       isAvailable: isAvailable,
       getNetwork: getNetwork,
+      getNetworkId: getNetworkId,
+      getContract: getContract,
       getReadClient: getReadClient,
       getContractSchema: getContractSchema,
       read: read,
       getAnalysis: getAnalysis,
+      preflight: preflight,
       analyzeEvidence: analyzeEvidence
     };
   }
 
-  return { createAdapter: createAdapter, getSdk: getSdk, toErrorCode: toErrorCode, NETWORK: NETWORK, CONTRACT_KEY: CONTRACT_KEY };
+  return {
+    createAdapter: createAdapter,
+    getSdk: getSdk,
+    toErrorCode: toErrorCode,
+    NETWORKS: NETWORKS,
+    DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
+    SDK_CHAIN_KEY: SDK_CHAIN_KEY
+  };
 });

@@ -11,31 +11,44 @@
 (function () {
   'use strict';
 
-  var STORAGE_KEY = 'auditai.genlayer.contract';
   var PUBLISHED_KEY = 'auditai.genlayer.published';
+  var NETWORK_KEY = 'auditai.genlayer.network';
+  var DEFAULT_NETWORK_ID = 'studionet';
 
-  // ── Production contract configuration (single authoritative source) ────────
-  // The real AuditAI Intelligent Contract address on Bradbury. Empty means the
-  // contract is not deployed yet (GENLAYER_AUDITOR_NOT_DEPLOYED). The UI keeps a
-  // localStorage override (STORAGE_KEY) as an advanced/debug escape hatch only.
-  var DEFAULT_CONTRACT_ADDRESS = '';
+  // ── GenLayer networks (single source of truth in genlayer-client.js) ───────
+  // Network + contract pairing lives in the adapter (window.AuditAIGenLayerClient.NETWORKS).
+  // The UI reads the selected network and its paired contract from there.
+  function networks() {
+    return (window.AuditAIGenLayerClient && window.AuditAIGenLayerClient.NETWORKS) || {};
+  }
 
-  // ── GenLayer networks ──────────────────────────────────────────────────────
-  // chainId + RPC from the official Networks docs:
-  //   https://docs.genlayer.com/developers/networks
-  var NETWORKS = {
-    studionet: { name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api' },
-    bradbury:  { name: 'Bradbury',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com' }
-  };
+  function getNetworkId() {
+    var n = '';
+    try { n = localStorage.getItem(NETWORK_KEY) || ''; } catch (e) { n = ''; }
+    var all = networks();
+    if (all[n]) return n;
+    return DEFAULT_NETWORK_ID;
+  }
+
+  function setNetworkId(id) {
+    if (!networks()[id]) return;
+    try { localStorage.setItem(NETWORK_KEY, String(id)); } catch (e) {}
+    _client = null;          // invalidate cached adapter (network changed)
+    _clientNetwork = null;
+  }
+
+  function getNetwork() {
+    return networks()[getNetworkId()] || null;
+  }
 
   function getContract() {
-    var stored = '';
-    try { stored = localStorage.getItem(STORAGE_KEY) || ''; } catch (e) { stored = ''; }
-    return stored || DEFAULT_CONTRACT_ADDRESS;
+    var net = getNetwork();
+    return net ? net.contract : '';
   }
 
   function setContract(addr) {
-    try { localStorage.setItem(STORAGE_KEY, String(addr || '').trim()); } catch (e) {}
+    // Legacy dev escape hatch (unused by the network-aware path).
+    try { localStorage.setItem('auditai.genlayer.contract', String(addr || '').trim()); } catch (e) {}
   }
 
   function short(addr) {
@@ -68,6 +81,7 @@
   // here and implement the real write/view calls below.
   //   npm: genlayer-js   →  import { GenLayerClient } from 'genlayer-js'
   var _client = null;
+  var _clientNetwork = null;
 
   function loadClient() {
     if (_client) return Promise.resolve(_client);
@@ -78,17 +92,19 @@
   }
 
   // Synchronous accessor for the GenLayer client adapter (null if not wired).
-  // Prefers the bundled adapter (public/genlayer-client.js → genlayer-sdk.bundle.js),
-  // which implements analyzeEvidence(payload, opts). Falls back to a manually
-  // injected window.genlayer for legacy/Studio testing.
+  // Creates the bundled adapter (public/genlayer-client.js) bound to the
+  // currently selected network, and caches it by network id so switching
+  // networks recreates a correctly-paired adapter.
   function getClient() {
-    if (_client) return _client;
+    var netId = getNetworkId();
+    if (_client && _clientNetwork === netId) return _client;
     var adapterFactory = window.AuditAIGenLayerClient;
     if (adapterFactory && typeof adapterFactory.createAdapter === 'function') {
-      try { _client = adapterFactory.createAdapter(); } catch (e) { _client = null; }
-      if (_client) return _client;
+      try { _client = adapterFactory.createAdapter(null, { networkId: netId }); } catch (e) { _client = null; }
+      if (_client) { _clientNetwork = netId; return _client; }
     }
-    if (window.genlayer) { _client = window.genlayer; return _client; }
+    if (window.genlayer) { _client = window.genlayer; _clientNetwork = netId; return _client; }
+    _clientNetwork = netId;
     return null;
   }
 
@@ -187,10 +203,13 @@
   }
 
   window.AuditAIGenLayer = {
-    STORAGE_KEY: STORAGE_KEY,
     PUBLISHED_KEY: PUBLISHED_KEY,
-    NETWORKS: NETWORKS,
-    DEFAULT_CONTRACT_ADDRESS: DEFAULT_CONTRACT_ADDRESS,
+    NETWORK_KEY: NETWORK_KEY,
+    DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
+    NETWORKS: networks(),
+    getNetworkId: getNetworkId,
+    setNetworkId: setNetworkId,
+    getNetwork: getNetwork,
     getContract: getContract,
     setContract: setContract,
     short: short,
