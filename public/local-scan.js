@@ -1,126 +1,58 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// AuditAI — local EVM scanner (zero LLM, ethers.js only)
+// AuditAI — local scan compatibility layer
 //
-// Deterministic heuristics over on-chain bytecode. No paid API, no LLM.
-// Output is stable and safe to publish on-chain via the GenLayer contract.
+// Thin wrapper over the Local Audit Engine (public/audit-engine.js). Keeps the
+// existing `window.AuditAILocalScan` surface used by index.html while delegating
+// the actual analysis to the engine.
 //
-// Entry: { address, provider?, bytecode? } → result
-//   { score, verdict, findings, summary, tags, category, analysis, context }
-//
-// IMPORTANT: opcode detection here is a HEURISTIC. Single-byte opcodes are
-// matched as hex substrings, which can also appear inside PUSH data. Findings
-// are therefore indicators, never proof.
+//   scan(...)          → AuditEngine.auditContract(...) mapped to the flat shape
+//   scanPortfolio(...) → deterministic curated-list scan via the engine
+//   checkApprovals(...)→ real ERC-20 allowance checks (ethers, unchanged)
+//   glossary(...)      → static glossary (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════════
 (function () {
   'use strict';
 
-  var SEV_WEIGHT = { HIGH: 25, MEDIUM: 12, LOW: 5, INFO: 0 };
-
-  function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
-
-  function verdictFor(score) {
-    return score >= 80 ? 'SAFE' : score >= 50 ? 'WARNING' : 'DANGER';
+  function engine() {
+    return window.AuditEngine || (typeof globalThis !== 'undefined' && globalThis.AuditEngine);
   }
 
-  function shortAddr(a) {
-    return a ? a.slice(0, 10) + '\u2026' + a.slice(-6) : '';
-  }
-
-  function analyzeCode(address, code) {
-    var findings = [];
+  function flatMap(address, result) {
+    var risk = result.risk || { score: 100, level: 'LIMITED ANALYSIS', confidence: 'LOW' };
     var tags = [];
-
-    var isEOA = !code || code === '0x' || code === '0x0';
-    if (isEOA) {
-      findings.push({
-        severity: 'INFO',
-        title: 'Not a contract (EOA)',
-        description: 'No runtime bytecode at this address — it is an externally-owned account (EOA), not a deployed smart contract.'
-      });
-      tags.push('EOA');
-      return { score: 50, findings: findings, tags: tags, category: 'EOA' };
+    if (result.contract && result.contract.type && result.contract.type !== 'Unknown') tags.push(result.contract.type);
+    if (result.capabilities) {
+      if (result.capabilities.proxy && result.capabilities.proxy.detected) tags.push('Proxy');
+      if (result.capabilities.ownership === 'Detected') tags.push('Ownable');
+      if (result.capabilities.mint && result.capabilities.mint.present) tags.push('Mintable');
+      if (result.capabilities.pause === 'Detected') tags.push('Pausable');
     }
+    tags.push('Local scan');
 
-    var body = (code.slice(0, 2) === '0x') ? code.slice(2).toLowerCase() : code.toLowerCase();
-    var byteLen = body.length / 2;
-
-    if (byteLen < 20) {
-      findings.push({ severity: 'MEDIUM', title: 'Minimal bytecode', description: 'Runtime code is extremely small (' + Math.round(byteLen) + ' bytes) — possibly a stub or minimal proxy.' });
-    } else if (byteLen < 200) {
-      findings.push({ severity: 'LOW', title: 'Small bytecode', description: 'Runtime code is small (' + Math.round(byteLen) + ' bytes).' });
-    } else {
-      tags.push('Contract');
-    }
-
-    // Heuristic opcode substrings (see header note).
-    if (body.indexOf('f2') !== -1) {
-      findings.push({ severity: 'HIGH', title: 'CALLCODE opcode present', description: 'Legacy CALLCODE (0xf2) detected — associated with older delegate-style calls.' });
-    }
-    if (body.indexOf('ff') !== -1) {
-      findings.push({ severity: 'MEDIUM', title: 'SELFDESTRUCT opcode present', description: 'SELFDESTRUCT (0xff) detected — the contract can destroy itself and move its balance.' });
-    }
-    if (body.indexOf('f4') !== -1) {
-      findings.push({ severity: 'LOW', title: 'DELEGATECALL opcode present', description: 'DELEGATECALL (0xf4) detected — common in proxies; verify the implementation address and upgrade controls.' });
-    }
-
-    if (findings.length === 0) {
-      findings.push({ severity: 'INFO', title: 'No obvious dangerous opcodes', description: 'A quick static scan found no CALLCODE / SELFDESTRUCT / DELEGATECALL patterns.' });
-    }
-
-    var score = 100;
-    findings.forEach(function (f) { score -= SEV_WEIGHT[f.severity] || 0; });
-    score = clamp(score, 0, 100);
-
-    return { score: score, findings: findings, tags: tags, category: 'Unknown' };
-  }
-
-  function summarize(address, score, verdict, findings) {
-    var high = findings.filter(function (f) { return f.severity === 'HIGH'; }).length;
-    var med = findings.filter(function (f) { return f.severity === 'MEDIUM'; }).length;
-    var low = findings.filter(function (f) { return f.severity === 'LOW'; }).length;
-
-    var s = 'Static local scan of ' + shortAddr(address) + ' scored ' + score + '/100 (' + verdict + ').';
-    if (high + med + low === 0) {
-      s += ' No high-risk bytecode patterns detected in a quick heuristic pass.';
-    } else {
-      s += ' Found ' + high + ' high, ' + med + ' medium, ' + low + ' low severity heuristic(s).';
-    }
-    s += ' This is a deterministic local result — no LLM involved.';
-    return s;
-  }
-
-  function buildContext(address, code, findings) {
-    var snippet = code ? (code.length > 8000 ? code.slice(0, 8000) : code) : '(no bytecode)';
-    var lines = findings.map(function (f) { return f.severity + ': ' + f.title; }).join('; ');
-    return 'Contract: ' + address + '\nBytecode (truncated): ' + snippet + '\nLocal findings: ' + (lines || 'none');
+    return {
+      score: risk.score,
+      verdict: risk.level,
+      level: risk.level,
+      confidence: risk.confidence,
+      findings: result.findings || [],
+      summary: result.summary || '',
+      analysis: result.summary || '',
+      tags: tags,
+      category: (result.contract && result.contract.type) || 'Unknown',
+      context: result.context || '',
+      risk: risk,
+      contract: result.contract,
+      capabilities: result.capabilities,
+      completeness: result.analysis && result.analysis.completeness
+    };
   }
 
   async function scan(opts) {
     opts = opts || {};
-    var address = opts.address;
-    var provider = opts.provider || null;
-    var code = opts.bytecode || null;
-
-    if (!code && provider) {
-      try { code = await provider.getCode(address); } catch (e) { code = null; }
-    }
-
-    var r = analyzeCode(address, code);
-    var score = r.score;
-    var verdict = verdictFor(score);
-    var summary = summarize(address, score, verdict, r.findings);
-    var context = buildContext(address, code, r.findings);
-
-    return {
-      score: score,
-      verdict: verdict,
-      findings: r.findings,
-      summary: summary,
-      analysis: summary,
-      tags: r.tags,
-      category: r.category,
-      context: context
-    };
+    var eng = engine();
+    if (!eng) throw new Error('Local Audit Engine not loaded');
+    var result = await eng.auditContract(opts);
+    return flatMap(opts.address, result);
   }
 
   // ── Portfolio: deterministic scan of a curated popular-contracts list ──────

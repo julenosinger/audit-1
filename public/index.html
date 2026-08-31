@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="genlayer.js"></script>
+<script src="audit-engine.js"></script>
 <script src="local-scan.js"></script>
 <style>
 :root {
@@ -142,6 +143,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .rc-sev-info{background:var(--muted2)}
 .rc-finding-name{font-weight:600;color:var(--text);margin-bottom:2px}
 .rc-finding-desc{color:var(--muted);line-height:1.5}
+.rc-sev-critical{background:var(--red);box-shadow:0 0 6px rgba(255,59,59,.6)}
+.rc-sev-label{font-family:var(--mono);font-size:9px;font-weight:700;margin-left:6px}
+.rc-conf-label{font-family:var(--mono);font-size:8px;color:var(--muted);margin-left:4px}
+.rc-conf-note{font-family:var(--mono);font-size:9px;color:var(--muted)}
+.rc-evidence{font-family:var(--mono);font-size:9px;color:var(--muted2);margin-top:4px;line-height:1.5}
+.rc-reco{font-size:11px;color:var(--blue);margin-top:4px;line-height:1.5}
 
 /* Card footer */
 .rc-footer{padding:10px 18px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,.01)}
@@ -411,6 +418,22 @@ function getReadProvider(chainId) {
   try { return new ethers.JsonRpcProvider(rpc); } catch { return null; }
 }
 
+// Risk-level presentation (no "SAFE" wording — see local audit engine).
+const RISK_LEVEL_META = {
+  'LOW RISK':       { cls: 'rc-safe',    color: 'var(--green)',  text: 'No high-risk issues detected by the static analyzer' },
+  'MODERATE RISK':  { cls: 'rc-warning', color: 'var(--yellow)', text: 'Moderate risk — review the findings below' },
+  'HIGH RISK':      { cls: 'rc-danger',  color: 'var(--red)',    text: 'High risk — concerning signals detected' },
+  'CRITICAL RISK':  { cls: 'rc-danger',  color: 'var(--red)',    text: 'Critical risk — strong evidence of dangerous patterns' },
+  'LIMITED ANALYSIS': { cls: 'rc-warning', color: 'var(--muted)', text: 'Limited analysis — insufficient data to judge' },
+};
+
+function localLevelFromScore(score) {
+  if (score >= 85) return 'LOW RISK';
+  if (score >= 70) return 'MODERATE RISK';
+  if (score >= 45) return 'HIGH RISK';
+  return 'CRITICAL RISK';
+}
+
 const CHAIN_CONFIG = {
   '5042002': { name: 'Arc Testnet',  short: 'arc',      explorer: 'https://testnet.arcscan.app/address/' },
   '1':       { name: 'Ethereum',     short: 'ethereum',  explorer: 'https://etherscan.io/address/' },
@@ -641,15 +664,20 @@ function animateRing(ringEl, valEl, score) {
 function buildResultCard(data, address, chainId) {
   const chain = CHAIN_CONFIG[chainId] || { name: chainId, short: chainId, explorer: '#' };
   const circ = 183;
-  const badgeClass = data.score >= 75 ? 'rc-safe' : data.score >= 45 ? 'rc-warning' : 'rc-danger';
-  const badgeText = data.score >= 75 ? 'SAFE' : data.score >= 45 ? 'WARNING' : 'DANGER';
-  const verdictText = data.score >= 75 ? 'Contract appears safe' : data.score >= 45 ? 'Use with caution' : 'High risk — avoid';
+  const score = typeof data.score === 'number' ? data.score : ((data.risk && data.risk.score) || 0);
+  const level = (data.risk && data.risk.level) || data.level || localLevelFromScore(score);
+  const LM = RISK_LEVEL_META[level] || RISK_LEVEL_META['LOW RISK'];
+  const badgeText = level;
+  const badgeClass = LM.cls;
+  const verdictText = LM.text;
+  const confidence = data.confidence || (data.risk && data.risk.confidence) || 'LOW';
 
   GL_AUDIT_STORE[address.toLowerCase()] = {
-    score: data.score,
-    verdict: badgeText,
-    summary: (data.analysis || data.summary || '') + (data.findings || []).map(f => f.title).join('; '),
-    context: data.context || data.analysis || data.summary || ''
+    score: score,
+    verdict: level,
+    confidence: confidence,
+    summary: (data.summary || data.analysis || ''),
+    context: data.context || data.summary || data.analysis || ''
   };
 
   const glPublished = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(address);
@@ -657,17 +685,25 @@ function buildResultCard(data, address, chainId) {
     ? '<span class="onchain-badge">ON-CHAIN</span>'
     : `<button type="button" class="publish-btn" data-gl-publish="${address.toLowerCase()}" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>`;
 
-  const SEV_ORDER = { HIGH: 0, MEDIUM: 1, LOW: 2, INFO: 3 };
+  const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 };
   const findings = (data.findings || []).slice().sort((a,b) => (SEV_ORDER[a.severity]??9)-(SEV_ORDER[b.severity]??9));
 
   const uid = 'ring_' + Math.random().toString(36).slice(2);
+  const sevColor = { CRITICAL:'var(--red)', HIGH:'var(--red)', MEDIUM:'var(--yellow)', LOW:'var(--blue)', INFO:'var(--muted)' };
+  const confColor = { HIGH:'var(--green)', MEDIUM:'var(--yellow)', LOW:'var(--muted)' };
   const findingsHtml = findings.map(f => {
-    const sl = f.severity.toLowerCase();
+    const sl = (f.severity||'INFO').toLowerCase();
+    const evidence = (f.evidence||[]).map(e => `<div class="rc-evidence">· ${escHtml(e.kind)}: ${escHtml(e.text)}</div>`).join('');
     return `<div class="rc-finding">
       <div class="rc-sev rc-sev-${sl}"></div>
       <div>
-        <div class="rc-finding-name">${escHtml(f.title)} <span style="font-family:var(--mono);font-size:9px;color:${f.severity==='HIGH'?'var(--red)':f.severity==='MEDIUM'?'var(--yellow)':f.severity==='LOW'?'var(--blue)':'var(--muted)'}">${f.severity}</span></div>
+        <div class="rc-finding-name">${escHtml(f.title)}
+          <span class="rc-sev-label" style="color:${sevColor[f.severity]||'var(--muted)'}">${escHtml(f.severity)}</span>
+          <span class="rc-conf-label" style="color:${confColor[f.confidence]||'var(--muted)'}">${escHtml(f.confidence)} confidence</span>
+        </div>
         <div class="rc-finding-desc">${escHtml(f.description)}</div>
+        ${evidence}
+        ${f.recommendation ? `<div class="rc-reco">→ ${escHtml(f.recommendation)}</div>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -688,7 +724,7 @@ function buildResultCard(data, address, chainId) {
         </div>
       </div>
       <div class="rc-meta">
-        <div class="rc-verdict">${escHtml(verdictText)} <span class="rc-badge ${badgeClass}">${badgeText}</span></div>
+        <div class="rc-verdict">${escHtml(verdictText)} <span class="rc-badge ${badgeClass}">${badgeText}</span> <span class="rc-conf-note">confidence: ${escHtml(confidence)}</span></div>
         <div class="rc-addr">${shortAddr} · ${chain.name}</div>
         <div class="rc-tags">${tagsHtml}</div>
       </div>
@@ -711,7 +747,7 @@ function buildResultCard(data, address, chainId) {
   setTimeout(() => {
     const ringEl = document.getElementById(uid);
     const valEl  = document.getElementById(uid+'_val');
-    if (ringEl && valEl) animateRing(ringEl, valEl, data.score);
+    if (ringEl && valEl) animateRing(ringEl, valEl, score);
   }, 80);
 
   return html;
@@ -1070,11 +1106,13 @@ async function handleInput() {
       const { result, chain } = await auditAddress(intent.address, intent.chainId);
       removeTyping();
       const cardHtml = buildResultCard(result, intent.address, intent.chainId);
-      const highs = (result.findings||[]).filter(f=>f.severity==='HIGH').length;
+      const risk = result.risk || {};
+      const notable = (result.findings||[]).filter(f=>f.severity==='HIGH'||f.severity==='CRITICAL'||f.severity==='MEDIUM').length;
       appendAIMessage(
         `Audit complete for \`${intent.address.slice(0,10)}…\` on **${chain.name}**.\n\n` +
-        `${result.analysis}\n\n` +
-        (highs > 0 ? `⚠️ **${highs} HIGH severity finding${highs>1?'s':''} detected.** Review carefully before interacting.` : `✅ No critical issues found.`),
+        `**Risk level:** ${risk.level || result.verdict || '—'} (score ${risk.score ?? result.score}/100, confidence ${risk.confidence || 'LOW'})\n\n` +
+        `${result.summary || result.analysis || ''}\n\n` +
+        (notable > 0 ? `⚠️ **${notable} notable finding${notable>1?'s':''}** — review the card for evidence and recommendations.` : `No known issues detected by the local static analyzer.`),
         cardHtml
       );
     } catch(e) {
@@ -1185,6 +1223,14 @@ function setGenlayerContractUI() {
   updateGLStatus();
 }
 
+// Map the honest risk level to the on-chain contract's coarse 3-tier enum
+// (the UI never shows "SAFE"; this is only the registry bucket on GenLayer).
+function contractVerdict(level) {
+  if (level === 'LOW RISK') return 'SAFE';
+  if (level === 'HIGH RISK' || level === 'CRITICAL RISK') return 'DANGER';
+  return 'WARNING'; // MODERATE RISK / LIMITED ANALYSIS
+}
+
 function markGLButtonPublished(addr) {
   const lower = String(addr).toLowerCase();
   document.querySelectorAll('[data-gl-publish]').forEach(btn => {
@@ -1208,7 +1254,7 @@ async function publishToGenLayer(addr) {
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  const res = await window.AuditAIGenLayer.publish(addr, data.score, data.verdict, data.summary);
+  const res = await window.AuditAIGenLayer.publish(addr, data.score, contractVerdict(data.verdict), data.summary);
 
   if (res.ok || res.fallback) {
     window.AuditAIGenLayer.markPublished(addr);
