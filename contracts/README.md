@@ -8,7 +8,7 @@ contract address and makes them queryable later.
 
 | Method | Kind | Description |
 | --- | --- | --- |
-| `publish_audit(contract_addr, score, verdict, findings)` | write | Deterministic, no LLM. Publishes an off-chain result. Use this for the first deploy. |
+| `publish_audit(contract_addr, score, verdict, findings)` | write | Deterministic, no LLM. Publishes an off-chain (local-scan) result. Use this for the first deploy. |
 | `analyze_and_publish(contract_addr, source_or_context)` | write | GenLayer-native: LLM adjudication via `gl.eq_principle.prompt_non_comparative`. |
 | `get_audit(contract_addr)` | view | `"{score}|{verdict}|{summary}"` or `"NO_AUDIT"`. |
 | `get_score(contract_addr)` | view | `"0".."100"`. |
@@ -19,8 +19,9 @@ contract address and makes them queryable later.
 ## Deploy in GenLayer Studio
 
 1. Finish the portal step **"Star the Boilerplate repo"** and click **Verify**.
-2. Add GenLayer networks (Studio / Asimov / Bradbury) to your wallet and get
-   **Testnet GEN** from the faucet.
+2. Add GenLayer networks (**Studionet** chainId `61999` RPC `https://studio.genlayer.com/api`,
+   **Bradbury** chainId `4221` RPC `https://rpc-bradbury.genlayer.com`) and get
+   **Testnet GEN** from <https://testnet-faucet.genlayer.foundation/>.
 3. Open <https://studio.genlayer.com/validators> and create **≥ 1 validator**
    (choose a provider + model, stake ≥ 1 GEN).
 4. Open <https://studio.genlayer.com/> → **Contracts** → **Add From File** →
@@ -31,8 +32,25 @@ contract address and makes them queryable later.
 7. Test in the Studio panel:
    - `publish_audit("0x<42 chars>", "87", "SAFE", "No critical issues")`
    - `get_audit("0x<same>")` → should return `87|SAFE|No critical issues`
-   - `analyze_and_publish("0x<42 chars>", "Some contract source/context")` → LLM run
+   - `analyze_and_publish("0x<42 chars>", "<context/bytecode recorte>")` → LLM run by validators
    - `has_audit("0x<same>")` → `true`
+
+## analyze_and_publish flow (LLM on-chain)
+
+The frontend's "Adjudicate with GenLayer LLM" button sends the **context** the
+local scanner produced (contract address + a truncated bytecode snippet + local
+findings) to `analyze_and_publish`. The leader validator runs the LLM
+(`prompt_non_comparative`), and the other validators judge the summary against
+the provided context and criteria — reaching consensus without requiring identical
+wording. The adjudicated `summary` (with `Score:` and `Verdict:`) is stored on-chain
+and read back via `get_audit`.
+
+Key docs:
+- Intelligent Contracts: <https://docs.genlayer.com/core-concepts/intelligent-contracts>
+- Calling LLMs: <https://docs.genlayer.com/developers/intelligent-contracts/features/calling-llms>
+- LlmHelloWorld (prompt_non_comparative): <https://docs.genlayer.com/developers/intelligent-contracts/examples/llm-hello-world>
+- Networks: <https://docs.genlayer.com/developers/networks>
+- Deploy: <https://docs.genlayer.com/developers/intelligent-contracts/deploying>
 
 ## Notes
 
@@ -40,5 +58,7 @@ contract address and makes them queryable later.
   first so your first Studio run always succeeds.
 - `analyze_and_publish` uses `prompt_non_comparative` so validators judge the
   summary against the provided context instead of requiring identical wording.
+- `publish_audit` validates the score is an integer 0–100 and the verdict is one
+  of `SAFE` / `WARNING` / `DANGER`.
 - Storage uses only GenLayer types (`TreeMap[str, str]`). No plain `dict`/`list`,
   no `requests`/`openai`/`anthropic`, no Solidity.

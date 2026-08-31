@@ -15,14 +15,11 @@
   var PUBLISHED_KEY = 'auditai.genlayer.published';
 
   // ── GenLayer networks ──────────────────────────────────────────────────────
-  // TODO: fill real chainId + RPC from the current docs when you wire
-  // genlayer-js. Do NOT invent values — leave 0/"" and keep using Studio for
-  // the first deploy.
-  //   https://docs.genlayer.com/developers/intelligent-contracts/deploying
+  // chainId + RPC from the official Networks docs:
+  //   https://docs.genlayer.com/developers/networks
   var NETWORKS = {
-    studio:   { name: 'Studio',   chainId: 0, rpc: '' },
-    asimov:   { name: 'Asimov',   chainId: 0, rpc: '' },
-    bradbury: { name: 'Bradbury', chainId: 0, rpc: '' }
+    studionet: { name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api' },
+    bradbury:  { name: 'Bradbury',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com' }
   };
 
   function getContract() {
@@ -111,6 +108,41 @@
     }).catch(function () { return null; });
   }
 
+  // analyzeAndPublish(contractAddr, context) -> Promise<{ok, fallback, calldata, message}>
+  // Calls the GenLayer-native LLM method analyze_and_publish. Falls back to
+  // Studio instructions (copy calldata) when genlayer-js is not wired.
+  function analyzeAndPublish(contractAddr, context) {
+    var target = getContract();
+    if (!isSet(target)) {
+      return Promise.resolve({
+        ok: false,
+        needContract: true,
+        message: 'No GenLayer contract set. Click the top-bar pill first.'
+      });
+    }
+
+    return loadClient().then(function (client) {
+      // TODO: real write once genlayer-js client is wired:
+      //   return client.write(target, 'analyze_and_publish', [contractAddr, String(context).slice(0, 8000)]);
+      throw new Error('genlayer-js analyze not wired yet');
+    }).catch(function () {
+      var snippet = String(context || '').slice(0, 8000)
+        .replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      return Promise.resolve({
+        ok: false,
+        fallback: true,
+        contract: target,
+        message: 'Open GenLayer Studio and call analyze_and_publish on ' + short(target),
+        calldata: 'analyze_and_publish(\n  "' + contractAddr + '",\n  "' + snippet + '"\n)'
+      });
+    });
+  }
+
+  // getAudit(contractAddr) -> Promise<string|null>  (alias of getOnChain)
+  function getAudit(contractAddr) {
+    return getOnChain(contractAddr);
+  }
+
   function copyToClipboard(text) {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -143,6 +175,8 @@
     markPublished: markPublished,
     publish: publish,
     getOnChain: getOnChain,
+    analyzeAndPublish: analyzeAndPublish,
+    getAudit: getAudit,
     copyToClipboard: copyToClipboard
   };
 })();

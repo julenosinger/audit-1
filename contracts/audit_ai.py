@@ -2,6 +2,7 @@
 
 from genlayer import *
 import typing
+import re
 
 VALID_VERDICTS = ("SAFE", "WARNING", "DANGER")
 
@@ -63,6 +64,13 @@ class AuditAI(gl.Contract):
             raise RuntimeError("verdict must be one of SAFE, WARNING, DANGER")
 
         s = str(score).strip()
+        try:
+            n = int(s)
+            if n < 0 or n > 100:
+                raise RuntimeError("score must be an integer between 0 and 100")
+        except ValueError:
+            raise RuntimeError("score must be an integer between 0 and 100")
+
         self.reports[contract_addr] = findings
         self.scores[contract_addr] = s
         self.verdicts[contract_addr] = v
@@ -104,7 +112,6 @@ class AuditAI(gl.Contract):
     @staticmethod
     def _parse_summary(text: str) -> typing.Tuple[str, str]:
         score = "0"
-        import re
         m = re.search(r"score\s*[:=]\s*(\d{1,3})", text, re.IGNORECASE)
         if not m:
             m = re.search(r"\b(\d{1,3})\b", text)

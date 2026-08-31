@@ -9,15 +9,29 @@ Live: <https://auditai-6di.pages.dev/>
 ## Architecture
 
 - **`public/index.html`** — single-page app (UI + `ethers.js` EVM scanner + chat).
-- **`functions/api/claude.js`** — Cloudflare Pages Function proxy to Anthropic
-  (`POST /api/claude`, secret `ANTHROPIC_API_KEY`).
+- **`public/local-scan.js`** — local EVM scanner (zero LLM): bytecode heuristics,
+  portfolio scan, ERC-20 approval checks, static glossary.
+- **`public/genlayer.js`** — GenLayer bridge: `publish_audit` / `analyze_and_publish`
+  with a Studio copy-call fallback.
 - **`contracts/audit_ai.py`** — GenLayer Intelligent Contract that records audit
   results as immutable on-chain state.
+- **`functions/api/claude.js`** — optional Anthropic proxy (kept for regression,
+  but **not required**; disabled by default via `USE_CLAUDE = false`).
 - **`wrangler.toml`** — Cloudflare Pages project `auditai`.
 
-The frontend does the EVM scanning and text analysis (Claude); the GenLayer
-contract is where a finished audit can be **published on-chain** and queried
-later.
+## LLM
+
+AuditAI now has three paths, and **zero of them require an API key**:
+
+1. **Local (default)** — `USE_CLAUDE = false`. All scanning is deterministic
+   `ethers.js` heuristics in `public/local-scan.js`. No LLM, no external calls.
+2. **GenLayer LLM** — the "Adjudicate with GenLayer LLM" button on a result card
+   calls `analyze_and_publish` on the deployed Intelligent Contract. The network's
+   validators run the LLM (see `contracts/README.md`). Requires a deployed contract
+   + testnet GEN; otherwise it falls back to copy-call for Studio.
+3. **Anthropic/Claude (flag off)** — set `USE_CLAUDE = true` and configure
+   `ANTHROPIC_API_KEY` as a Cloudflare Secret to re-enable the legacy proxy. Off by
+   default and never required.
 
 ## Builder Journey flow
 
@@ -27,7 +41,7 @@ later.
 4. Studio → **Contracts → Add From File** → `contracts/audit_ai.py`.
 5. **Run and Debug** → empty constructor → **Deploy**.
 6. Copy the address → paste in the portal step "Deploy your first contract".
-7. Test `publish_audit` and `get_audit` in the Studio panel.
+7. Test `publish_audit`, `analyze_and_publish`, and `get_audit` in the Studio panel.
 
 Full step-by-step: [`contracts/README.md`](contracts/README.md).
 
@@ -37,8 +51,9 @@ Full step-by-step: [`contracts/README.md`](contracts/README.md).
 npx wrangler pages dev public
 ```
 
-Set `ANTHROPIC_API_KEY` as a Secret in the Cloudflare dashboard (not in code).
+No secrets needed. `functions/api/claude.js` only activates if `USE_CLAUDE` is true
+and `ANTHROPIC_API_KEY` is set as a Cloudflare Secret.
 
 ## Security
 
-No API keys are committed. `ANTHROPIC_API_KEY` lives only as a Cloudflare Secret.
+No API keys are committed. The app works end-to-end with local scanning + GenLayer.

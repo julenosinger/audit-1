@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="genlayer.js"></script>
+<script src="local-scan.js"></script>
 <style>
 :root {
   --bg:     #050508;
@@ -150,6 +151,9 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .publish-btn{font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:6px;border:1px solid rgba(167,139,250,.4);color:var(--violet);background:rgba(167,139,250,.06);cursor:pointer;transition:all .2s}
 .publish-btn:hover{background:rgba(167,139,250,.14)}
 .onchain-badge{font-family:var(--mono);font-size:8px;padding:1px 6px;border-radius:4px;background:rgba(0,255,136,.1);color:var(--green);border:1px solid rgba(0,255,136,.25)}
+.rc-footer-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.llm-btn{color:var(--blue);border-color:rgba(74,158,255,.4);background:rgba(74,158,255,.06)}
+.llm-btn:hover{background:rgba(74,158,255,.14)}
 
 /* ── PORTFOLIO CARD ── */
 .portfolio-card{background:var(--surf2);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:10px;max-width:560px}
@@ -388,6 +392,25 @@ const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
 const GL_AUDIT_STORE = {};
 
+// LLM flag — default OFF. Local scan (zero LLM) is the primary path. GenLayer
+// LLM is only reachable via the explicit "Adjudicate" button on a result card.
+const USE_CLAUDE = false;
+
+// Public read-only RPCs for the EVM chains we can scan locally. Not used for
+// GenLayer (see public/genlayer.js NETWORKS). Arc Testnet has no public RPC here.
+const CHAIN_RPC = {
+  '1':     'https://ethereum-rpc.publicnode.com',
+  '8453':  'https://mainnet.base.org',
+  '42161': 'https://arb1.arbitrum.io/rpc',
+  '137':   'https://polygon-bor-rpc.publicnode.com',
+};
+
+function getReadProvider(chainId) {
+  const rpc = CHAIN_RPC[chainId];
+  if (!rpc) return null;
+  try { return new ethers.JsonRpcProvider(rpc); } catch { return null; }
+}
+
 const CHAIN_CONFIG = {
   '5042002': { name: 'Arc Testnet',  short: 'arc',      explorer: 'https://testnet.arcscan.app/address/' },
   '1':       { name: 'Ethereum',     short: 'ethereum',  explorer: 'https://etherscan.io/address/' },
@@ -625,7 +648,8 @@ function buildResultCard(data, address, chainId) {
   GL_AUDIT_STORE[address.toLowerCase()] = {
     score: data.score,
     verdict: badgeText,
-    summary: (data.analysis || '') + (data.findings || []).map(f => f.title).join('; ')
+    summary: (data.analysis || data.summary || '') + (data.findings || []).map(f => f.title).join('; '),
+    context: data.context || data.analysis || data.summary || ''
   };
 
   const glPublished = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(address);
@@ -651,7 +675,7 @@ function buildResultCard(data, address, chainId) {
   const tagsHtml = (data.tags||[]).map(t=>`<span class="rc-tag">${escHtml(t)}</span>`).join('');
   const shortAddr = address.slice(0,10)+'…'+address.slice(-8);
 
-  const html = `<div class="result-card">
+  const html = `<div class="result-card" data-card-addr="${address.toLowerCase()}">
     <div class="rc-header">
       <div class="rc-ring">
         <svg viewBox="0 0 70 70" width="70" height="70" style="transform:rotate(-90deg)">
@@ -675,7 +699,10 @@ function buildResultCard(data, address, chainId) {
     </div>
     <div class="rc-footer">
       <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
-      ${glActionHtml}
+      <div class="rc-footer-actions">
+        ${glActionHtml}
+        <button type="button" class="publish-btn llm-btn" data-gl-analyze="${address.toLowerCase()}" onclick="adjudicateGL('${address}')">Adjudicate with GenLayer LLM</button>
+      </div>
       <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
     </div>
   </div>`;
@@ -774,8 +801,10 @@ async function scanPortfolio() {
   showTyping();
 
   try {
-    // Call Claude to simulate portfolio scan based on wallet address
-    const prompt = `You are AuditAI analyzing a DeFi user's portfolio. The user's wallet is ${walletAddress}.
+    let contracts;
+    if (USE_CLAUDE) {
+      // Legacy: Claude-simulated portfolio (kept behind the flag).
+      const prompt = `You are AuditAI analyzing a DeFi user's portfolio. The user's wallet is ${walletAddress}.
 
 Simulate a realistic portfolio scan by generating 5-7 fictional but realistic EVM contracts this wallet has interacted with. Include a mix of well-known (USDC, Uniswap, Aave) and unknown contracts. For each, provide:
 - address (realistic 0x...)
@@ -788,24 +817,30 @@ Respond ONLY with JSON array:
 [{"address":"0x...","name":"...","chain":"...","score":85,"verdict":"SAFE"}]
 Include 2-3 SAFE (score 75+), 2 WARNING (45-74), 1-2 DANGER (0-44). Make addresses realistic 42-char hex.`;
 
-    const res = await callClaude([{role:'user',content:prompt}], 800);
-    removeTyping();
-
-    let contracts;
-    try {
-      contracts = JSON.parse(res.replace(/```json|```/g,'').trim());
-    } catch {
-      throw new Error('Could not parse portfolio data');
+      const res = await callClaude([{role:'user',content:prompt}], 800);
+      try {
+        contracts = JSON.parse(res.replace(/```json|```/g,'').trim());
+      } catch {
+        throw new Error('Could not parse portfolio data');
+      }
+    } else {
+      // Local: deterministic scan of a curated popular-contracts list.
+      const readProvider = getReadProvider(walletChainId) || getReadProvider('1');
+      contracts = await window.AuditAILocalScan.scanPortfolio({
+        provider: readProvider,
+        chainName: CHAIN_CONFIG[walletChainId]?.name || 'Ethereum'
+      });
     }
+    removeTyping();
 
     const high = contracts.filter(c=>c.score<45).length;
     const ok   = contracts.filter(c=>c.score>=75).length;
 
     const cardHtml = buildPortfolioCard(contracts);
     appendAIMessage(
-      `📊 **Portfolio scan complete** — found **${contracts.length} contracts** in your wallet history.\n\n` +
+      `📊 **Portfolio scan complete** — found **${contracts.length} contracts**.\n\n` +
       `**${ok}** appear safe · **${contracts.filter(c=>c.score>=45&&c.score<75).length}** need attention · **${high}** are high risk\n\n` +
-      (high > 0 ? `⚠️ **${high} high-risk contract${high>1?'s':''} detected.** Tap any row to get the full report.` : '✅ No high-risk contracts in your recent history.'),
+      (high > 0 ? `⚠️ **${high} high-risk contract${high>1?'s':''} detected.** Tap any row to get the full report.` : '✅ No high-risk contracts detected in this scan.'),
       cardHtml
     );
   } catch(e) {
@@ -827,7 +862,9 @@ async function checkApprovals() {
   showTyping();
 
   try {
-    const prompt = `You are AuditAI checking active ERC-20 token approvals for wallet ${walletAddress}.
+    let approvals;
+    if (USE_CLAUDE) {
+      const prompt = `You are AuditAI checking active ERC-20 token approvals for wallet ${walletAddress}.
 
 Generate a realistic list of 4-6 token approvals this wallet might have. Include:
 - 1-2 unlimited approvals to well-known DEX routers (LOW risk)
@@ -838,23 +875,29 @@ Respond ONLY with JSON array:
 [{"token":"USDC","spender":"0x...","amount":"unlimited","risk":"LOW","spenderName":"Uniswap V3 Router"}]
 Risk: HIGH=unknown spender or old approval, MEDIUM=known but unlimited, LOW=known protocol.`;
 
-    const res = await callClaude([{role:'user',content:prompt}], 600);
-    removeTyping();
-
-    let approvals;
-    try {
-      approvals = JSON.parse(res.replace(/```json|```/g,'').trim());
-    } catch {
-      throw new Error('Could not parse approvals');
+      const res = await callClaude([{role:'user',content:prompt}], 600);
+      try {
+        approvals = JSON.parse(res.replace(/```json|```/g,'').trim());
+      } catch {
+        throw new Error('Could not parse approvals');
+      }
+    } else {
+      // Local: real ERC-20 allowance checks against known spenders.
+      const readProvider = getReadProvider(walletChainId) || getReadProvider('1');
+      approvals = await window.AuditAILocalScan.checkApprovals({
+        provider: readProvider,
+        wallet: walletAddress
+      });
     }
+    removeTyping();
 
     const high = approvals.filter(a=>a.risk==='HIGH').length;
     const cardHtml = buildApproveCard(approvals);
     appendAIMessage(
-      `⚠️ **${approvals.length} active token approvals** found for your wallet.\n\n` +
+      `⚠️ **${approvals.length} token/spender pair${approvals.length===1?'':'s'} checked.**\n\n` +
       (high > 0
-        ? `🔴 **${high} high-risk approval${high>1?'s':''} detected!** Unknown spenders with unlimited access to your tokens. Click **Revoke** to remove their access.`
-        : `✅ No critical approvals found. Review the list below and revoke anything you no longer use.`),
+        ? `🔴 **${high} unlimited approval${high>1?'s':''} detected!** Click **Revoke** to remove access.`
+        : `✅ No unlimited approvals found on the checked pairs. Review the list below.`),
       cardHtml
     );
   } catch(e) {
@@ -879,11 +922,38 @@ async function callClaude(messages, maxTokens = 1200) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUDIT ENGINE
+// AUDIT ENGINE — local scan (default) with optional Claude fallback
 // ═══════════════════════════════════════════════════════════════════════════════
 async function auditAddress(address, chainId) {
   const chain = CHAIN_CONFIG[chainId] || { name: 'Chain ' + chainId, short: chainId };
 
+  if (USE_CLAUDE) {
+    try {
+      return await auditAddressClaude(address, chainId, chain);
+    } catch (e) {
+      // Claude unavailable — fall through to the local scanner.
+    }
+  }
+
+  return await auditAddressLocal(address, chainId, chain);
+}
+
+async function auditAddressLocal(address, chainId, chain) {
+  const scanProvider = (walletChainId === chainId && provider) ? provider : getReadProvider(chainId);
+  const result = await window.AuditAILocalScan.scan({ address, provider: scanProvider });
+
+  lastAuditResult  = result;
+  lastAuditAddress = address;
+  lastAuditChain   = chainId;
+
+  addToHistory(address, chain.short, result);
+  sessionCount++;
+  updateNavStats();
+
+  return { result, chain };
+}
+
+async function auditAddressClaude(address, chainId, chain) {
   const prompt = `You are AuditAI, a smart contract security scanner. Analyze:
 Contract: ${address}
 Chain: ${chain.name} (ID: ${chainId})
@@ -1015,7 +1085,24 @@ async function handleInput() {
     return;
   }
 
-  // General question — answer with context
+  // General question — local glossary (default) or Claude (flag)
+  if (!USE_CLAUDE) {
+    removeTyping();
+    const local = window.AuditAILocalScan && window.AuditAILocalScan.glossary(text);
+    if (local) {
+      appendAIMessage(local);
+    } else {
+      appendAIMessage(
+        'I work fully on-chain and locally now. Try:\n' +
+        '• Paste a **0x…** address to scan it\n' +
+        '• Type **scan my portfolio** or **check my approvals**\n' +
+        '• Click **Publish on GenLayer** or **Adjudicate with GenLayer LLM** on an audit card'
+      );
+    }
+    document.getElementById('sendBtn').disabled = false;
+    return;
+  }
+
   showTyping();
   try {
     const systemCtx = lastAuditResult
@@ -1137,6 +1224,56 @@ async function publishToGenLayer(addr) {
   } else {
     alert(res.message);
   }
+}
+
+async function adjudicateGL(addr) {
+  if (!window.AuditAIGenLayer) return;
+  const data = GL_AUDIT_STORE[addr.toLowerCase()];
+  if (!data) { alert('No audit result available for this address.'); return; }
+
+  if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
+    alert('Set the GenLayer contract address first (top bar).');
+    setGenlayerContractUI();
+    if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
+  }
+
+  const res = await window.AuditAIGenLayer.analyzeAndPublish(addr, data.context || data.summary);
+
+  if (res.ok || res.fallback) {
+    window.AuditAIGenLayer.markPublished(addr);
+    markGLButtonPublished(addr);
+    renderSidebar();
+    if (res.fallback) {
+      window.AuditAIGenLayer.copyToClipboard(res.calldata);
+      alert('Copied. Paste in GenLayer Studio → analyze_and_publish:\n\n' + res.calldata);
+    }
+    // Read back the adjudicated result (no-op until genlayer-js is wired).
+    const onchain = await window.AuditAIGenLayer.getAudit(addr);
+    if (onchain && onchain !== 'NO_AUDIT') applyOnChainResult(addr, onchain);
+  } else if (res.needContract) {
+    alert(res.message);
+    setGenlayerContractUI();
+  } else {
+    alert(res.message);
+  }
+}
+
+function applyOnChainResult(addr, raw) {
+  const parts = String(raw).split('|');
+  if (parts.length < 3) return;
+  const lower = String(addr).toLowerCase();
+  const data = GL_AUDIT_STORE[lower];
+  if (data) {
+    data.score = parseInt(parts[0], 10) || data.score;
+    data.verdict = parts[1];
+    data.summary = parts[2];
+    data.llm = true;
+  }
+  document.querySelectorAll(`[data-card-addr="${lower}"]`).forEach(card => {
+    const b = card.querySelector('.onchain-badge');
+    if (b && b.textContent.indexOf('LLM') === -1) b.textContent += ' · LLM';
+  });
+  appendAIMessage(`🧠 **GenLayer LLM adjudicated:**\nScore **${parts[0]}** · Verdict **${parts[1]}**\n\n${parts[2]}`);
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
