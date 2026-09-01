@@ -149,7 +149,7 @@ test('payload carries privilegedOperations + accessControlSummary + privilegeGra
   assert.ok(r.payload.analysis.privilegedOperations, 'privilegedOperations in payload');
   assert.ok(r.payload.analysis.accessControlSummary, 'accessControlSummary in payload');
   assert.ok(r.payload.analysis.privilegeGraph, 'privilegeGraph in payload');
-  assert.equal(r.payload.version, '6.0.0');
+  assert.equal(r.payload.version, '7.0.0');
 });
 
 // ── Determinism / version ────────────────────────────────────────────────────
@@ -159,7 +159,7 @@ test('identical bytecode + analyzer version => deterministic privilege evidence'
   var b = Engine.analyze(MINT_GATED);
   assert.equal(a.bytecodeHash, b.bytecodeHash);
   assert.deepEqual(a.accessControlSummary, b.accessControlSummary);
-  assert.equal(a.analysisVersion, '6.0.0');
+  assert.equal(a.analysisVersion, '7.0.0');
 });
 
 console.log('\nAll privilege tests completed.');

@@ -40,7 +40,16 @@
 })(function () {
   'use strict';
 
-  var VERSION = '5.0.0';
+  var VERSION = '7.0.0';
+  var ANALYSIS_VERSION = '7.0.0';
+
+  // Network registry (single source of truth) — used for the network-aware
+  // fetch path. Loaded from the UMD global in the browser, or required directly
+  // in Node tests. Absent in isolation, the legacy provider/bytecode path still
+  // works unchanged.
+  var Networks = (typeof module !== 'undefined' && module.exports)
+    ? require('./networks.js')
+    : ((typeof globalThis !== 'undefined' ? globalThis : window).AuditAINetworks || null);
 
   // ── 1. EVM opcode table ────────────────────────────────────────────────────
   // name -> { byte, imm } where imm is the number of immediate data bytes.
@@ -907,10 +916,18 @@
 
   function buildAuditPayload(result) {
     return {
-      version: '6.0.0',
+      version: ANALYSIS_VERSION,
+      analysisVersion: ANALYSIS_VERSION,
+      network: result.networkId || null,
+      networkName: result.networkName || null,
+      chainId: result.chainId !== undefined ? result.chainId : result.contract.chainId,
       contract: {
         address: result.contract.address,
-        chainId: result.contract.chainId,
+        chainId: result.chainId !== undefined ? result.chainId : result.contract.chainId,
+        network: result.networkId || null,
+        networkName: result.networkName || null,
+        contractType: result.contractType || result.contract.type,
+        bytecodeAvailable: result.bytecodeAvailable,
         bytecodeHash: result.bytecodeHash,
         bytecodeSize: result.contract.bytecodeSize
       },
@@ -1722,6 +1739,10 @@
     var address = opts.address || '';
     var chainId = opts.chainId || null;
     var abi = opts.abi || null;
+    var networkId = opts.networkId || null;
+    var networkName = opts.networkName || null;
+    var contractType = opts.contractType || null;
+    var bytecodeAvailable = (opts.bytecodeAvailable === undefined) ? null : !!opts.bytecodeAvailable;
 
     var cap = {
       ownership: 'Unknown',
@@ -1736,6 +1757,13 @@
     };
 
     var result = {
+      address: address,
+      networkId: networkId,
+      networkName: networkName,
+      chainId: chainId,
+      contractType: contractType,
+      bytecodeAvailable: bytecodeAvailable,
+      analysisCompleteness: 'LIMITED',
       contract: { address: address, chainId: chainId, type: 'Unknown', bytecodeSize: 0 },
       analysis: { completeness: 'LIMITED', analyzerVersion: VERSION, timestamp: Date.now() },
       risk: { score: 100, level: 'LIMITED ANALYSIS', confidence: 'LOW' },
@@ -1763,6 +1791,11 @@
 
     if (hex === '') {
       result.contract.type = 'EOA';
+      if (contractType === null) contractType = 'EOA';
+      result.contractType = contractType;
+      if (bytecodeAvailable === null) bytecodeAvailable = false;
+      result.bytecodeAvailable = bytecodeAvailable;
+      result.analysisCompleteness = 'LIMITED';
       result.risk = assessRisk(result.findings, 'LIMITED');
       return result;
     }
@@ -1771,7 +1804,11 @@
     var bodyLen = hex.length / 2;
     result.contract.bytecodeSize = bodyLen;
     result.bytecodeHash = bytecodeHash(hex);
-    result.analysisVersion = '6.0.0';
+    result.analysisVersion = ANALYSIS_VERSION;
+    if (contractType === null) contractType = 'CONTRACT';
+    result.contractType = contractType;
+    if (bytecodeAvailable === null) bytecodeAvailable = true;
+    result.bytecodeAvailable = bytecodeAvailable;
 
     // Control-flow analysis.
     var cfg = buildCfg(dis.instructions);
@@ -1789,6 +1826,7 @@
     else if (cfg.stats.dynamicJumps > 0) completeness = 'PARTIAL';
     else completeness = 'COMPLETE';
     result.analysis.completeness = completeness;
+    result.analysisCompleteness = completeness;
     result.analysis.components = {
       controlFlow: truncated ? 'LIMITED' : (cfg.stats.dynamicJumps > 0 ? 'PARTIAL' : 'COMPLETE'),
       stack: 'PARTIAL',
@@ -1981,24 +2019,142 @@
     return lines.join('\n').slice(0, 8000);
   }
 
-  // ── 8. Async entry (fetch bytecode via provider) ──────────────────────────
+  // ── 8. Async entry (fetch bytecode for the *selected* network) ────────────
+  // Accepts either the legacy ethers `provider`/`bytecode` inputs, or a
+  // network-aware `networkId`/`network`/`rpc` (with `chainId`). When a network
+  // is given, the engine verifies eth_chainId and fetches eth_getCode from that
+  // network's RPC — it NEVER falls back to Ethereum.
   async function auditContract(opts) {
     opts = opts || {};
     var address = opts.address || '';
     var provider = opts.provider || null;
     var code = opts.bytecode || null;
     var rpcUnavailable = false;
+    var networkId = opts.networkId || null;
+    var networkName = opts.networkName || null;
+    var chainId = opts.chainId || null;
+    var contractType = null;
+    var bytecodeAvailable = null;
+    var networkStatus = null;
+    var preflightError = null;
 
-    if (!code && provider) {
+    // Resolve a network object when the caller supplied a network id (or the
+    // registry can map the chainId).
+    var net = null;
+    if (Networks && networkId) net = Networks.getNetwork(networkId) || null;
+    if (!net && Networks && chainId !== null && chainId !== undefined) net = Networks.networkByChainId(chainId) || null;
+
+    if (net) {
+      networkId = net.id;
+      networkName = net.name;
+      chainId = net.chainId;
+    }
+
+    var useNetworkFetch = !!net || (!!opts.rpc && chainId !== null && chainId !== undefined);
+    var rpc = opts.rpc || (net ? net.rpc : null);
+
+    if (useNetworkFetch && rpc) {
+      // Network-aware path: validate → preflight → fetch → classify.
+      var norm = Networks ? Networks.normalizeAddress(address) : null;
+      if (!norm || !norm.valid) {
+        var inv = analyze('', {
+          address: address, chainId: chainId, networkId: networkId, networkName: networkName,
+          contractType: 'INVALID_ADDRESS', bytecodeAvailable: false, abi: opts.abi
+        });
+        inv.contract.type = 'INVALID_ADDRESS';
+        inv.contractType = 'INVALID_ADDRESS';
+        inv.bytecodeAvailable = false;
+        inv.analysisCompleteness = 'LIMITED';
+        inv.networkStatus = { rpc: 'not_checked', chainIdMatch: false, bytecode: 'not_checked' };
+        inv.error = 'INVALID_ADDRESS';
+        inv.code = '';
+        return inv;
+      }
+
+      // Preflight: verify eth_chainId.
+      var pf = await Networks.preflight(rpc, chainId);
+      if (!pf.ok) {
+        var mismatch = pf.error === 'NETWORK_CHAIN_ID_MISMATCH';
+        var pfRes = analyze('', {
+          address: address, chainId: chainId, networkId: networkId, networkName: networkName,
+          contractType: mismatch ? 'NETWORK_CHAIN_ID_MISMATCH' : 'RPC_ERROR', bytecodeAvailable: false, abi: opts.abi
+        });
+        pfRes.contract.type = mismatch ? 'NETWORK_CHAIN_ID_MISMATCH' : 'RPC_ERROR';
+        pfRes.contractType = pfRes.contract.type;
+        pfRes.bytecodeAvailable = false;
+        pfRes.analysisCompleteness = 'LIMITED';
+        pfRes.networkStatus = {
+          rpc: mismatch ? 'connected' : 'unavailable',
+          chainIdMatch: false,
+          bytecode: 'not_checked'
+        };
+        pfRes.actualChainId = pf.chainId;
+        pfRes.error = pf.error;
+        pfRes.code = '';
+        return pfRes;
+      }
+
+      // Fetch bytecode from the selected network's RPC.
+      var codeFetched = null;
+      try {
+        codeFetched = await Networks.getCode(rpc, norm.address, chainId, { useCache: opts.useCache });
+      } catch (e) {
+        codeFetched = null;
+        rpcUnavailable = true;
+      }
+
+      if (rpcUnavailable) {
+        var rpcRes = analyze('', {
+          address: address, chainId: chainId, networkId: networkId, networkName: networkName,
+          contractType: 'RPC_ERROR', bytecodeAvailable: false, abi: opts.abi
+        });
+        rpcRes.contract.type = 'RPC_ERROR';
+        rpcRes.contractType = 'RPC_ERROR';
+        rpcRes.bytecodeAvailable = false;
+        rpcRes.analysisCompleteness = 'LIMITED';
+        rpcRes.networkStatus = { rpc: 'unavailable', chainIdMatch: true, bytecode: 'not_checked' };
+        rpcRes.error = 'RPC_ERROR';
+        rpcRes.code = '';
+        return rpcRes;
+      }
+
+      code = codeFetched;
+      var hasCode = Networks.hexLength(code) > 0;
+      var accountActive = null;
+      if (!hasCode) {
+        var probe = await Networks.probeAccount(rpc, norm.address);
+        accountActive = probe.active;
+      }
+      contractType = Networks.classifyContract(code, { accountActive: accountActive });
+      bytecodeAvailable = contractType === 'CONTRACT';
+      networkStatus = {
+        rpc: 'connected',
+        chainIdMatch: true,
+        bytecode: bytecodeAvailable ? 'found' : 'not_found'
+      };
+    } else if (!code && provider) {
+      // Legacy ethers provider path (unchanged).
       try { code = await provider.getCode(address); }
       catch (e) { code = null; rpcUnavailable = true; }
     } else if (!code && !provider) {
       rpcUnavailable = true;
     }
 
-    var result = analyze(code, { address: address, chainId: opts.chainId, abi: opts.abi });
+    var result = analyze(code, {
+      address: address, chainId: chainId, networkId: networkId, networkName: networkName,
+      contractType: contractType, bytecodeAvailable: bytecodeAvailable, abi: opts.abi
+    });
     result.analysis.rpcUnavailable = rpcUnavailable;
     result.code = code || '';
+    if (networkStatus) result.networkStatus = networkStatus;
+    if (preflightError) result.preflightError = preflightError;
+    if (contractType) {
+      result.contractType = contractType;
+      // Only non-CONTRACT classifications overwrite the legacy token-type slot;
+      // a CONTRACT keeps its detected token type (ERC-20 / ERC-721 / Unknown).
+      if (contractType !== 'CONTRACT') result.contract.type = contractType;
+    }
+    if (bytecodeAvailable !== null) result.bytecodeAvailable = bytecodeAvailable;
     return result;
   }
 

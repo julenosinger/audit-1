@@ -19,7 +19,7 @@
 })(function () {
   'use strict';
 
-  var VERSION = '5.0.0';
+  var VERSION = '6.0.0';
 
   var VALID_SEVERITY = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
   var VALID_CONFIDENCE = ['HIGH', 'MEDIUM', 'LOW'];
@@ -49,6 +49,10 @@
     if (result && result.payload) return result.payload;
     return {
       version: VERSION,
+      analysisVersion: result && result.analysisVersion,
+      network: result ? result.networkId : null,
+      networkName: result ? result.networkName : null,
+      chainId: result ? result.chainId : null,
       contract: result ? result.contract : {},
       analysis: {},
       findings: result ? result.findings : []

@@ -50,7 +50,15 @@
       evidenceGraph: result.evidenceGraph || null,
       privilegedOperations: result.privilegedOperations || [],
       accessControlSummary: result.accessControlSummary || null,
-      privilegeGraph: result.privilegeGraph || null
+      privilegeGraph: result.privilegeGraph || null,
+      // Phase 6.5: network is part of the audit identity.
+      networkId: result.networkId,
+      networkName: result.networkName,
+      chainId: result.chainId,
+      contractType: result.contractType,
+      bytecodeAvailable: result.bytecodeAvailable,
+      analysisCompleteness: result.analysisCompleteness,
+      networkStatus: result.networkStatus || null
     };
   }
 

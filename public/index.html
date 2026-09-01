@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
+<script src="networks.js"></script>
 <script src="genlayer-sdk.bundle.js"></script>
 <script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
@@ -289,8 +290,16 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     <div class="topbar-center">
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
+      <div class="topbar-pill" title="Network of the contract being audited">
+        Audit Network:
+        <select id="auditNetworkSelect" onchange="onAuditNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:130px;">
+          <option value="ethereum">Ethereum</option>
+          <option value="genlayerStudionet">GenLayer Studionet</option>
+          <option value="genlayerBradbury">GenLayer Bradbury</option>
+        </select>
+      </div>
       <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
-      <div class="topbar-pill gl-pill" id="glContractPill" title="GenLayer network and contract">
+      <div class="topbar-pill gl-pill" id="glContractPill" title="GenLayer semantic-audit network and contract (separate from Audit Network)">
         GenLayer:
         <select id="glNetworkSelect" onchange="onGLNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:96px;">
           <option value="studionet">Studionet</option>
@@ -338,7 +347,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         <h2>AuditAI is ready.<br><em>Ask me anything.</em></h2>
         <p>Audit any EVM contract, scan your wallet's portfolio, check active approvals, or compare two contracts — just describe what you want in plain English.</p>
         <div class="welcome-chips">
-          <div class="wchip" onclick="sendQuick('Audit 0x18076d992005186AeB13AC5270CaD6E27DB95247 on Arc Testnet')">Audit EURC/USDC pool · Arc</div>
+          <div class="wchip" onclick="sendQuick('Audit 0xF2c549Bf2Dc106a28354B1444298DD460601856B on GenLayer Studionet')">Audit real contract · GenLayer Studionet</div>
           <div class="wchip" onclick="sendQuick('Audit 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 on Ethereum')">Audit USDC · Ethereum</div>
           <div class="wchip" onclick="scanPortfolio()">Scan my portfolio</div>
           <div class="wchip" onclick="checkApprovals()">Check my approvals</div>
@@ -425,6 +434,40 @@ let conversationHistory = [];
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
 const GL_AUDIT_STORE = {};
+const AUDIT_NETWORK_KEY = 'auditai.audit.network';
+
+// Phase 6.5: the network of the contract being audited is a first-class part
+// of the audit context. It is stored separately from the GenLayer execution
+// network (public/genlayer.js). Default is Ethereum.
+let auditNetworkId = (function () {
+  try { return localStorage.getItem(AUDIT_NETWORK_KEY) || 'ethereum'; } catch { return 'ethereum'; }
+})();
+
+function getAuditNetwork() {
+  if (!window.AuditAINetworks) return null;
+  return window.AuditAINetworks.getNetwork(auditNetworkId) || window.AuditAINetworks.getNetwork('ethereum');
+}
+
+function onAuditNetworkChange(id) {
+  if (!window.AuditAINetworks || !window.AuditAINetworks.getNetwork(id)) return;
+  auditNetworkId = id;
+  try { localStorage.setItem(AUDIT_NETWORK_KEY, String(id)); } catch {}
+  window.AuditAINetworks.clearCodeCache();
+  const sel = document.getElementById('auditNetworkSelect');
+  if (sel) sel.value = id;
+}
+
+// Find the most recently stored audit result for an address (the store is keyed
+// by chainId:address, so look up by address across network keys).
+function findGLStore(addr) {
+  const lower = String(addr).toLowerCase();
+  let found = null;
+  Object.keys(GL_AUDIT_STORE).forEach(function (k) {
+    const v = GL_AUDIT_STORE[k];
+    if (v && v.address === lower) found = v;
+  });
+  return found;
+}
 
 // LLM flag — default OFF. Local scan (zero LLM) is the primary path. GenLayer
 // LLM is only reachable via the explicit "Adjudicate" button on a result card.
@@ -688,30 +731,51 @@ function animateRing(ringEl, valEl, score) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // RESULT CARD BUILDER
 // ═══════════════════════════════════════════════════════════════════════════════
-function buildResultCard(data, address, chainId) {
-  const chain = CHAIN_CONFIG[chainId] || { name: chainId, short: chainId, explorer: '#' };
+function buildResultCard(data, address, networkId) {
+  const net = (window.AuditAINetworks && window.AuditAINetworks.getNetwork(networkId)) ||
+    { id: networkId || null, name: data.networkName || networkId || 'Unknown', chainId: data.chainId, explorer: null };
+  const chainId = (data.chainId !== undefined && data.chainId !== null) ? data.chainId : net.chainId;
+  const hasBytecode = data.bytecodeAvailable === true;
+  const contractType = data.contractType || (data.contract && data.contract.type) || 'Unknown';
+  const completeness = data.analysisCompleteness || data.completeness || (data.analysis && data.analysis.completeness) || null;
+
   const circ = 183;
   const score = typeof data.score === 'number' ? data.score : ((data.risk && data.risk.score) || 0);
   const level = (data.risk && data.risk.level) || data.level || localLevelFromScore(score);
   const LM = RISK_LEVEL_META[level] || RISK_LEVEL_META['LOW RISK'];
   const badgeText = level;
   const badgeClass = LM.cls;
-  const verdictText = LM.text;
   const confidence = data.confidence || (data.risk && data.risk.confidence) || 'LOW';
 
-  GL_AUDIT_STORE[address.toLowerCase()] = {
+  // Phase 6.5: an audit result without bytecode must NEVER look like a passing
+  // 100/100 security audit. Score and completeness are presented separately.
+  const limited = !hasBytecode || level === 'LIMITED ANALYSIS';
+  const verdictText = limited
+    ? 'No bytecode was available on the selected network. No security conclusion can be made.'
+    : LM.text;
+  const displayScore = limited ? null : score;
+  const ringLabel = limited ? '—' : '0';
+
+  // Network-aware store key (chainId:address) — prevents cross-network reuse.
+  const storeKey = (chainId !== undefined && chainId !== null) ? (chainId + ':' + address.toLowerCase()) : ('x:' + address.toLowerCase());
+  GL_AUDIT_STORE[storeKey] = {
+    address: address.toLowerCase(),
+    chainId: chainId,
+    networkId: net.id || networkId || null,
+    networkName: net.name || null,
     score: score,
     verdict: level,
     confidence: confidence,
     summary: (data.summary || data.analysis || ''),
     context: data.context || data.summary || data.analysis || '',
-    payload: data.payload || null
+    payload: data.payload || null,
+    hasBytecode: hasBytecode
   };
 
   const glPublished = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(address);
   const glActionHtml = glPublished
     ? '<span class="onchain-badge">ON-CHAIN</span>'
-    : `<button type="button" class="publish-btn" data-gl-publish="${address.toLowerCase()}" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>`;
+    : `<button type="button" class="publish-btn" data-gl-publish="${address.toLowerCase()}" data-gl-net="${net.id || ''}" onclick="publishToGenLayer('${address}')">Publish on GenLayer</button>`;
 
   const SEV_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 };
   const findings = (data.findings || []).slice().sort((a,b) => (SEV_ORDER[a.severity]??9)-(SEV_ORDER[b.severity]??9));
@@ -784,13 +848,14 @@ function buildResultCard(data, address, chainId) {
           <circle class="rc-ring-fill" id="${uid}" cx="35" cy="35" r="29" stroke-dasharray="${circ}" stroke-dashoffset="${circ}"/>
         </svg>
         <div class="rc-ring-num">
-          <span class="rc-ring-val" id="${uid}_val">0</span>
-          <span class="rc-ring-max">/100</span>
+          <span class="rc-ring-val" id="${uid}_val">${ringLabel}</span>
+          <span class="rc-ring-max">${limited ? '' : '/100'}</span>
         </div>
       </div>
       <div class="rc-meta">
         <div class="rc-verdict">${escHtml(verdictText)} <span class="rc-badge ${badgeClass}">${badgeText}</span> <span class="rc-conf-note">confidence: ${escHtml(confidence)}</span></div>
-        <div class="rc-addr">${shortAddr} · ${chain.name}</div>
+        <div class="rc-addr">${shortAddr}</div>
+        <div class="rc-addr">Network: ${escHtml(net.name || 'Unknown')} · Chain ID: ${chainId !== undefined && chainId !== null ? chainId : '—'} · Contract: ${escHtml(contractType === 'CONTRACT' ? 'Contract' : contractType)}</div>
         <div class="rc-tags">${tagsHtml}</div>
       </div>
     </div>
@@ -800,7 +865,11 @@ function buildResultCard(data, address, chainId) {
     </div>
     ${privHtml}
     <div class="rc-glstatus">
-      <span class="gl-status-item">Local Analysis <span class="gl-status-badge gl-ok">Complete</span></span>
+      <span class="gl-status-item">Network <span class="gl-status-badge gl-ok">${escHtml(net.name || 'Unknown')}</span></span>
+      <span class="gl-status-item">Chain ID <span class="gl-status-badge">${chainId !== undefined && chainId !== null ? chainId : '—'}</span></span>
+      <span class="gl-status-item">RPC <span class="gl-status-badge ${data.networkStatus && data.networkStatus.rpc === 'unavailable' ? 'gl-fail' : 'gl-ok'}">${(data.networkStatus && data.networkStatus.rpc === 'unavailable') ? 'Unavailable ✕' : 'Connected ✓'}</span></span>
+      <span class="gl-status-item">Bytecode <span class="gl-status-badge ${hasBytecode ? 'gl-ok' : 'gl-fail'}">${hasBytecode ? 'Found ✓' : ((data.networkStatus && data.networkStatus.bytecode === 'not_checked') ? 'Not checked' : 'Not found')}</span></span>
+      <span class="gl-status-item">Local Analysis <span class="gl-status-badge ${limited ? 'gl-fail' : 'gl-ok'}">${limited ? 'Limited' : 'Complete'}</span></span>
       <span class="gl-status-item">GenLayer Analysis <span class="gl-status-badge" id="gl-analysis-${address.toLowerCase()}">Not requested</span></span>
     </div>
     <div class="rc-footer">
@@ -809,7 +878,7 @@ function buildResultCard(data, address, chainId) {
         ${glActionHtml}
         <button type="button" class="publish-btn llm-btn" data-gl-analyze="${address.toLowerCase()}" onclick="requestGenLayerAnalysis('${address}')">Analyze with GenLayer AI</button>
       </div>
-      <a class="rc-explorer" href="${chain.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>
+      ${net.explorer ? `<a class="rc-explorer" href="${net.explorer}${address}" target="_blank" rel="noopener">Explorer ↗</a>` : ''}
     </div>
   </div>`;
 
@@ -817,7 +886,16 @@ function buildResultCard(data, address, chainId) {
   setTimeout(() => {
     const ringEl = document.getElementById(uid);
     const valEl  = document.getElementById(uid+'_val');
-    if (ringEl && valEl) animateRing(ringEl, valEl, score);
+    if (ringEl && valEl) {
+      if (displayScore === null) {
+        ringEl.style.stroke = 'var(--muted)';
+        valEl.style.color = 'var(--muted)';
+        ringEl.style.strokeDashoffset = circ;
+        valEl.textContent = '—';
+      } else {
+        animateRing(ringEl, valEl, displayScore);
+      }
+    }
   }, 80);
 
   return html;
@@ -1030,39 +1108,42 @@ async function callClaude(messages, maxTokens = 1200) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUDIT ENGINE — local scan (default) with optional Claude fallback
 // ═══════════════════════════════════════════════════════════════════════════════
-async function auditAddress(address, chainId) {
-  const chain = CHAIN_CONFIG[chainId] || { name: 'Chain ' + chainId, short: chainId };
+async function auditAddress(address, networkId) {
+  const net = (window.AuditAINetworks && window.AuditAINetworks.getNetwork(networkId)) || null;
 
   if (USE_CLAUDE) {
     try {
-      return await auditAddressClaude(address, chainId, chain);
+      return await auditAddressClaude(address, networkId, net);
     } catch (e) {
       // Claude unavailable — fall through to the local scanner.
     }
   }
 
-  return await auditAddressLocal(address, chainId, chain);
+  return await auditAddressLocal(address, networkId, net);
 }
 
-async function auditAddressLocal(address, chainId, chain) {
-  const scanProvider = (walletChainId === chainId && provider) ? provider : getReadProvider(chainId);
-  const result = await window.AuditAILocalScan.scan({ address, provider: scanProvider });
+async function auditAddressLocal(address, networkId, net) {
+  net = net || (window.AuditAINetworks && window.AuditAINetworks.getNetwork(networkId)) || null;
+  const result = await window.AuditAILocalScan.scan({ address, networkId });
 
   lastAuditResult  = result;
   lastAuditAddress = address;
-  lastAuditChain   = chainId;
+  lastAuditChain   = result.chainId || (net ? net.chainId : null);
 
-  addToHistory(address, chain.short, result);
+  const chainLabel = net ? net.name : (result.networkName || 'Unknown');
+  addToHistory(address, chainLabel, result);
   sessionCount++;
   updateNavStats();
 
-  return { result, chain };
+  return { result, net };
 }
 
-async function auditAddressClaude(address, chainId, chain) {
+async function auditAddressClaude(address, networkId, net) {
+  const chainName = net ? net.name : (networkId || 'Ethereum');
+  const chainId = net ? net.chainId : null;
   const prompt = `You are AuditAI, a smart contract security scanner. Analyze:
 Contract: ${address}
-Chain: ${chain.name} (ID: ${chainId})
+Chain: ${chainName} (ID: ${chainId})
 
 Respond ONLY with JSON:
 {
@@ -1081,11 +1162,11 @@ Well-known protocols (USDC, Uniswap, Aave) score 80+. Unknown contracts score lo
   lastAuditAddress = address;
   lastAuditChain   = chainId;
 
-  addToHistory(address, chain.short, result);
+  addToHistory(address, chainName, result);
   sessionCount++;
   updateNavStats();
 
-  return { result, chain };
+  return { result, net };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1096,13 +1177,14 @@ async function parseIntent(text) {
   const addrMatch = text.match(/0x[0-9a-fA-F]{40}/i);
   const address = addrMatch ? addrMatch[0] : null;
 
-  // Detect chain
-  let chainId = walletChainId || '1';
+  // Detect audit network. The selector is authoritative; free text may select
+  // a specific network by name. Unrecognized names fall back to the selector.
+  let networkId = auditNetworkId;
   const lc = text.toLowerCase();
-  for (const [name, id] of Object.entries(CHAIN_BY_NAME)) {
-    if (lc.includes(name)) { chainId = id; break; }
-  }
-  if (!CHAIN_CONFIG[chainId]) chainId = '1';
+  if (lc.includes('studionet')) networkId = 'genlayerStudionet';
+  else if (lc.includes('bradbury')) networkId = 'genlayerBradbury';
+  else if (lc.includes('ethereum') || lc.includes('mainnet') || lc.includes(' eth')) networkId = 'ethereum';
+  if (!window.AuditAINetworks || !window.AuditAINetworks.getNetwork(networkId)) networkId = 'ethereum';
 
   // Detect intent
   const isCompare = /compar/i.test(text) && (text.match(/0x[0-9a-fA-F]{40}/gi)||[]).length >= 2;
@@ -1111,31 +1193,33 @@ async function parseIntent(text) {
   const isExplain   = /explain|what is|what are|how does|define/i.test(text) && !address;
   const isAudit     = !!address;
 
-  return { address, chainId, isCompare, isPortfolio, isApprovals, isExplain, isAudit };
+  return { address, networkId, isCompare, isPortfolio, isApprovals, isExplain, isAudit };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // COMPARE TWO CONTRACTS
 // ═══════════════════════════════════════════════════════════════════════════════
-async function compareContracts(text, chainId) {
+async function compareContracts(text, networkId) {
   const addresses = text.match(/0x[0-9a-fA-F]{40}/gi);
   if (!addresses || addresses.length < 2) {
     appendAIMessage('I need two contract addresses to compare. Try: `compare 0xABC... and 0xDEF... on Ethereum`');
     return;
   }
   const [a1, a2] = addresses;
-  appendAIMessage(`Comparing two contracts on ${CHAIN_CONFIG[chainId]?.name}…`);
+  const net = (window.AuditAINetworks && window.AuditAINetworks.getNetwork(networkId)) || null;
+  const netName = net ? net.name : 'Unknown';
+  appendAIMessage(`Comparing two contracts on ${netName}…`);
   showTyping();
 
   try {
-    const [r1, r2] = await Promise.all([auditAddress(a1, chainId), auditAddress(a2, chainId)]);
+    const [r1, r2] = await Promise.all([auditAddress(a1, networkId), auditAddress(a2, networkId)]);
     removeTyping();
 
     const winner = r1.result.score >= r2.result.score ? a1 : a2;
     const wScore = Math.max(r1.result.score, r2.result.score);
 
-    const card1 = buildResultCard(r1.result, a1, chainId);
-    const card2 = buildResultCard(r2.result, a2, chainId);
+    const card1 = buildResultCard(r1.result, a1, networkId);
+    const card2 = buildResultCard(r2.result, a2, networkId);
 
     appendAIMessage(
       `**Comparison complete.**\n\n` +
@@ -1168,23 +1252,44 @@ async function handleInput() {
 
   if (intent.isPortfolio) { document.getElementById('sendBtn').disabled = false; await scanPortfolio(); return; }
   if (intent.isApprovals) { document.getElementById('sendBtn').disabled = false; await checkApprovals(); return; }
-  if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.chainId); return; }
+  if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.networkId); return; }
 
   if (intent.isAudit) {
     showTyping();
     try {
-      const { result, chain } = await auditAddress(intent.address, intent.chainId);
+      const { result, net } = await auditAddress(intent.address, intent.networkId);
       removeTyping();
-      const cardHtml = buildResultCard(result, intent.address, intent.chainId);
+      const cardHtml = buildResultCard(result, intent.address, intent.networkId);
       const risk = result.risk || {};
       const notable = (result.findings||[]).filter(f=>f.severity==='HIGH'||f.severity==='CRITICAL'||f.severity==='MEDIUM').length;
-      appendAIMessage(
-        `Audit complete for \`${intent.address.slice(0,10)}…\` on **${chain.name}**.\n\n` +
-        `**Risk level:** ${risk.level || result.verdict || '—'} (score ${risk.score ?? result.score}/100, confidence ${risk.confidence || 'LOW'})\n\n` +
-        `${result.summary || result.analysis || ''}\n\n` +
-        (notable > 0 ? `⚠️ **${notable} notable finding${notable>1?'s':''}** — review the card for evidence and recommendations.` : `No known issues detected by the local static analyzer.`),
-        cardHtml
-      );
+      const netName = (net && net.name) || result.networkName || 'Unknown';
+      const chainId = result.chainId || (net && net.chainId);
+      const hasBytecode = result.bytecodeAvailable === true;
+      const contractType = result.contractType || (result.contract && result.contract.type) || 'Unknown';
+
+      let header = `Audit complete for \`${intent.address.slice(0,10)}…\`\n\n` +
+        `**Network:** ${netName}\n` +
+        `**Chain ID:** ${chainId !== null && chainId !== undefined ? chainId : '—'}\n` +
+        `**Contract:** ${contractType === 'CONTRACT' ? 'Contract' : contractType}\n` +
+        `**Local analysis:** ${hasBytecode ? (result.analysisCompleteness || 'Complete') : 'Limited (no bytecode)'}`;
+
+      let body = `**Risk level:** ${risk.level || result.verdict || '—'}`;
+      if (hasBytecode) {
+        body += ` (score ${risk.score ?? result.score}/100, confidence ${risk.confidence || 'LOW'})`;
+      } else {
+        body += ` (confidence ${risk.confidence || 'LOW'})`;
+      }
+      body += `\n\n${result.summary || result.analysis || ''}\n\n`;
+
+      if (!hasBytecode) {
+        body += `⚠️ **No bytecode was available on the selected network.**\nNo security conclusion can be made.`;
+      } else if (notable > 0) {
+        body += `⚠️ **${notable} notable finding${notable>1?'s':''}** — review the card for evidence and recommendations.`;
+      } else {
+        body += `No known issues detected by the local static analyzer.`;
+      }
+
+      appendAIMessage(header + '\n\n' + body, cardHtml);
     } catch(e) {
       removeTyping();
       appendAIMessage(`⚠️ Audit failed: ${e.message}`);
@@ -1331,7 +1436,7 @@ function markGLButtonPublished(addr) {
 
 async function publishToGenLayer(addr) {
   if (!window.AuditAIGenLayer) return;
-  const data = GL_AUDIT_STORE[addr.toLowerCase()];
+  const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
 
   if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
@@ -1360,7 +1465,7 @@ async function publishToGenLayer(addr) {
 
 async function adjudicateGL(addr) {
   if (!window.AuditAIGenLayer) return;
-  const data = GL_AUDIT_STORE[addr.toLowerCase()];
+  const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
 
   if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
@@ -1394,7 +1499,7 @@ function applyOnChainResult(addr, raw) {
   const parts = String(raw).split('|');
   if (parts.length < 3) return;
   const lower = String(addr).toLowerCase();
-  const data = GL_AUDIT_STORE[lower];
+  const data = findGLStore(addr);
   if (data) {
     data.score = parseInt(parts[0], 10) || data.score;
     data.verdict = parts[1];
@@ -1470,7 +1575,7 @@ function showGenLayerError(err) {
 
 async function requestGenLayerAnalysis(addr) {
   const lower = String(addr).toLowerCase();
-  const data = GL_AUDIT_STORE[lower];
+  const data = findGLStore(addr);
   if (!data || !data.payload) { alert('No local analysis available for this address.'); return; }
 
   if (GL_INFLIGHT[lower]) { appendAIMessage('⏳ GenLayer analysis already in progress for this contract — please wait.'); return; }
@@ -1576,12 +1681,15 @@ async function requestGenLayerAnalysis(addr) {
 function showGenLayerResult(addr, res) {
   const gl = res.genlayer;
   const merged = res.merged && res.merged.final;
-  const data = GL_AUDIT_STORE[String(addr).toLowerCase()];
+  const data = findGLStore(addr);
   let msg = '🧠 **GenLayer AI analysis finalized.**\n';
   if (data && data.glTxHash && window.AuditAIGenLayer) {
     const net = data.glNetwork || window.AuditAIGenLayer.getNetwork();
     const contract = (net && net.contract) || window.AuditAIGenLayer.getContract();
-    msg += 'Transaction: `' + data.glTxHash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '** (chain ' + (net ? net.chainId : '?') + ') · Contract: `' + contract + '`\n';
+    msg += 'Transaction: `' + data.glTxHash + '`\nSemantic audit network: **' + (net ? net.name : 'GenLayer') + '** (chain ' + (net ? net.chainId : '?') + ') · Contract: `' + contract + '`\n';
+  }
+  if (data && (data.networkName || data.chainId !== undefined)) {
+    msg += 'Contract network: **' + (data.networkName || 'Unknown') + '** (chain ' + (data.chainId !== undefined ? data.chainId : '?') + ')\n';
   }
   if (gl) {
     msg += 'Verdict: **' + gl.verdict + '** (confidence ' + (gl.confidence || '?') + ')\n';
@@ -1598,6 +1706,10 @@ function showGenLayerResult(addr, res) {
 renderSidebar();
 updateNavStats();
 updateGLStatus();
+(function () {
+  const sel = document.getElementById('auditNetworkSelect');
+  if (sel && window.AuditAINetworks) sel.value = window.AuditAINetworks.getNetwork(auditNetworkId) ? auditNetworkId : 'ethereum';
+})();
 </script>
 </body>
 </html>
