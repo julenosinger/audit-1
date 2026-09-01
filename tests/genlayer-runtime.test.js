@@ -182,7 +182,7 @@ test('analyzeEvidence emits onStatus lifecycle and surfaces the real tx hash', a
     account: '0x' + '11'.repeat(20),
     onStatus: function (s, d) { states.push(s); if (s === 'SUBMITTED') txHash = d; }
   });
-  assert.deepEqual(states, ['PREPARING', 'CONNECTING', 'WAITING_WALLET', 'SUBMITTED', 'FINALIZING', 'RETRIEVING', 'COMPLETE']);
+  assert.deepEqual(states, ['PREPARING', 'CONNECTING', 'WAITING_WALLET', 'SUBMITTED', 'FINALIZING', 'RETRIEVING', 'RAW_RESULT', 'COMPLETE']);
   assert.equal(txHash, '0xabc123');
 });
 
@@ -277,6 +277,89 @@ test('auditor: no account surfaces WALLET_REQUIRED code via FAILED', async funct
 test('unavailable SDK => isAvailable false', function () {
   var a = GenLayerClient.createAdapter({}, { networkId: 'studionet', networks: TEST_NETWORKS });
   assert.equal(a.isAvailable(), false);
+});
+
+// ── result normalization / parsing ───────────────────────────────────────────
+
+test('normalize: object passthrough (JSON.parse never called on an object)', function () {
+  var obj = { verdict: 'NO_CONFIRMED_VULNERABILITY', confidence: 'HIGH', findings: [] };
+  var n = GenLayerClient.normalizeGenLayerResult(obj);
+  assert.equal(n.ok, true);
+  assert.equal(n.value, obj);
+  assert.equal(n.parsed, false);
+});
+
+test('normalize: serialized JSON string is parsed once', function () {
+  var n = GenLayerClient.normalizeGenLayerResult('{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}');
+  assert.equal(n.ok, true);
+  assert.equal(n.parsed, true);
+  assert.equal(n.value.verdict, 'NEEDS_REVIEW');
+});
+
+test('normalize: JSON with trailing commas is cleaned and parsed', function () {
+  var n = GenLayerClient.normalizeGenLayerResult('{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[],}');
+  assert.equal(n.ok, true);
+  assert.equal(n.value.verdict, 'NEEDS_REVIEW');
+});
+
+test('normalize: markdown-fenced JSON is parsed', function () {
+  var n = GenLayerClient.normalizeGenLayerResult('```json\n{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}\n```');
+  assert.equal(n.ok, true);
+  assert.equal(n.value.verdict, 'NEEDS_REVIEW');
+});
+
+test('normalize: JSON wrapped in prose is extracted', function () {
+  var n = GenLayerClient.normalizeGenLayerResult('Here is my assessment:\n{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}\nHope this helps.');
+  assert.equal(n.ok, true);
+  assert.equal(n.value.verdict, 'NEEDS_REVIEW');
+});
+
+test('normalize: SDK envelope {result: "..."} is unwrapped and parsed', function () {
+  var n = GenLayerClient.normalizeGenLayerResult({ result: '{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}' });
+  assert.equal(n.ok, true);
+  assert.equal(n.value.verdict, 'NEEDS_REVIEW');
+});
+
+test('normalize: NO_ANALYSIS / empty / null => NO_RESULT', function () {
+  assert.equal(GenLayerClient.normalizeGenLayerResult('NO_ANALYSIS').error, 'NO_RESULT');
+  assert.equal(GenLayerClient.normalizeGenLayerResult('').error, 'NO_RESULT');
+  assert.equal(GenLayerClient.normalizeGenLayerResult(null).error, 'NO_RESULT');
+  assert.equal(GenLayerClient.normalizeGenLayerResult(undefined).error, 'NO_RESULT');
+});
+
+test('normalize: invalid JSON / non-string => INVALID_RESULT_JSON', function () {
+  assert.equal(GenLayerClient.normalizeGenLayerResult('not json at all').error, 'INVALID_RESULT_JSON');
+  assert.equal(GenLayerClient.normalizeGenLayerResult(42).error, 'INVALID_RESULT_JSON');
+});
+
+test('analyzeEvidence: markdown-fenced result is normalized end-to-end', async function () {
+  var sdk = mockSdk();
+  sdk.createClient = function (config) {
+    var read = {
+      getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      readContract: async function () { return '```json\n{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}\n```'; }
+    };
+    var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
+    return config && config.account ? write : read;
+  };
+  var a = GenLayerClient.createAdapter(sdk, { networkId: 'studionet', networks: TEST_NETWORKS });
+  var payload = { version: '5.0.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
+  var resp = await a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
+  assert.equal(resp.verdict, 'NEEDS_REVIEW');
+});
+
+// ── auditor schema validation (actual contract output shape) ─────────────────
+
+test('auditor: contract-shaped result passes; optional fields may be missing', function () {
+  var v = Auditor.validateResponse({ verdict: 'NO_CONFIRMED_VULNERABILITY', confidence: 'HIGH', findings: [] }, {});
+  assert.equal(v.valid, true);
+  var v2 = Auditor.validateResponse({ verdict: 'NEEDS_REVIEW', confidence: 'LOW' }, {});
+  assert.equal(v2.valid, true);
+});
+
+test('auditor: missing required verdict/confidence => invalid', function () {
+  var v = Auditor.validateResponse({ findings: [] }, {});
+  assert.equal(v.valid, false);
 });
 
 console.log('\nAll genlayer-runtime tests completed.');

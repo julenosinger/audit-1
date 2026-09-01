@@ -188,7 +188,7 @@
     } catch (e) {
       var code = (e && e.message) || 'GENLAYER_ERROR';
       emit(opts, 'FAILED', code);
-      return { status: 'FAILED', error: code, payload: payload, local: result, genlayer: null };
+      return { status: 'FAILED', error: code, detail: (e && e.detail) || null, payload: payload, local: result, genlayer: null };
     }
   }
 

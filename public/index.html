@@ -1458,12 +1458,28 @@ async function requestGenLayerAnalysis(addr) {
   data.glTxHash = null;
   data.glNetwork = net;
 
+  // Development-only diagnostic (no secrets, no wallet data).
+  window.__GENLAYER_DEBUG__ = {
+    network: net.name,
+    chainId: net.chainId,
+    contract: net.contract,
+    status: 'PREPARING',
+    rawResultType: null,
+    rawPreview: null,
+    normalizedResultType: null,
+    parseStatus: null,
+    validationStatus: null,
+    errorCode: null,
+    errorDetail: null
+  };
+
   try {
     // Pre-flight capability check (no transaction): SDK / network / chainId /
     // contract reachability / analyze_evidence + get_analysis availability.
     const pf = await client.preflight();
     if (!pf.ok) {
       setGLAnalysisStatus(addr, 'FAILED');
+      if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.status = 'FAILED'; window.__GENLAYER_DEBUG__.errorCode = pf.error; }
       showGenLayerError(pf.error);
       return;
     }
@@ -1473,6 +1489,16 @@ async function requestGenLayerAnalysis(addr) {
       account: walletAddress,
       onStatus: function (state, detail) {
         if (state === 'SUBMITTED') data.glTxHash = detail;
+        if (window.__GENLAYER_DEBUG__) {
+          window.__GENLAYER_DEBUG__.status = state;
+          if (state === 'RAW_RESULT' && detail) {
+            window.__GENLAYER_DEBUG__.rawResultType = detail.type;
+            window.__GENLAYER_DEBUG__.rawPreview = detail.preview;
+          }
+          if (state === 'COMPLETE') { window.__GENLAYER_DEBUG__.normalizedResultType = typeof detail; window.__GENLAYER_DEBUG__.parseStatus = 'ok'; }
+          if (state === 'VALIDATING') window.__GENLAYER_DEBUG__.validationStatus = 'validating';
+          if (state === 'VALIDATED') window.__GENLAYER_DEBUG__.validationStatus = 'ok';
+        }
         setGLAnalysisStatus(addr, state);
       }
     });
@@ -1485,9 +1511,12 @@ async function requestGenLayerAnalysis(addr) {
       appendAIMessage('⚠️ GenLayer analysis timed out — local analysis remains valid.');
     } else if (res.status === 'INVALID') {
       setGLAnalysisStatus(addr, 'INVALID');
+      if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.validationStatus = 'invalid'; window.__GENLAYER_DEBUG__.errorCode = 'INVALID'; }
       appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
     } else {
       setGLAnalysisStatus(addr, 'FAILED');
+      if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.status = 'FAILED'; window.__GENLAYER_DEBUG__.errorCode = res.error; window.__GENLAYER_DEBUG__.errorDetail = res.detail || null; }
+      console.error('[GenLayer] error:', res.error, res.detail || '');
       showGenLayerError(res.error);
     }
   } finally {

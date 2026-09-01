@@ -58,6 +58,84 @@
     return 'GENLAYER_ERROR';
   }
 
+  // ── Result normalization ────────────────────────────────────────────────────
+  // The AuditAI contract stores the LLM's raw output as a `str` (see
+  // contracts/audit_ai.py → analyze_evidence → prompt_non_comparative). That
+  // string is *not* guaranteed to be clean JSON: LLMs frequently wrap it in
+  // markdown code fences or add surrounding prose. This single function turns
+  // whatever the SDK/contract actually returns into a parsed object — without
+  // ever calling JSON.parse on something that is already an object.
+
+  function stripMarkdownFences(text) {
+    var t = text.replace(/^\s*```[a-zA-Z0-9_-]*\s*\n?/, '').replace(/\n?\s*```\s*$/, '');
+    return t.trim();
+  }
+
+  // LLMs frequently emit JSON with trailing commas (per the official GenLayer
+  // docs "JSON Cleanup" pattern) — remove them before parsing.
+  function removeTrailingCommas(text) {
+    return text.replace(/,(\s*[}\]])/g, '$1');
+  }
+
+  function extractJsonObject(text) {
+    var start = text.indexOf('{');
+    var end = text.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) return null;
+    return text.slice(start, end + 1);
+  }
+
+  function looksLikeResult(obj) {
+    return obj !== null && typeof obj === 'object' &&
+      ('verdict' in obj || 'findings' in obj || 'riskLevel' in obj || 'risk_level' in obj || 'score' in obj);
+  }
+
+  // Unwrap a known SDK/contract envelope only when the object does NOT already
+  // look like a result.
+  function unwrapEnvelope(obj) {
+    var keys = ['result', 'output', 'value', 'data', 'returnData', 'return_data'];
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (k in obj && obj[k] !== undefined && obj[k] !== null) {
+        var v = obj[k];
+        if (typeof v === 'string' || (typeof v === 'object' && !Array.isArray(v))) return v;
+      }
+    }
+    return undefined;
+  }
+
+  // Returns { ok:true, value } or { ok:false, error, detail }.
+  function normalizeGenLayerResult(raw) {
+    if (raw === null || raw === undefined) {
+      return { ok: false, error: 'NO_RESULT', detail: 'result is null/undefined' };
+    }
+
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      if (looksLikeResult(raw)) return { ok: true, value: raw, parsed: false };
+      var unwrapped = unwrapEnvelope(raw);
+      if (unwrapped !== undefined) return normalizeGenLayerResult(unwrapped);
+      return { ok: true, value: raw, parsed: false };
+    }
+
+    if (typeof raw === 'string') {
+      var text = raw.trim();
+      if (!text || text === 'NO_ANALYSIS' || text === 'NO_RESULT' || text === 'NO_AUDIT') {
+        return { ok: false, error: 'NO_RESULT', detail: 'empty/stub result: "' + text + '"' };
+      }
+      var cleaned = removeTrailingCommas(stripMarkdownFences(text));
+      try { return { ok: true, value: JSON.parse(cleaned), parsed: true }; }
+      catch (e1) { /* fall through to embedded-JSON extraction */ }
+      var extracted = extractJsonObject(cleaned);
+      if (extracted !== null) {
+        try { return { ok: true, value: JSON.parse(removeTrailingCommas(extracted)), parsed: true }; }
+        catch (e2) { /* fall through to failure */ }
+      }
+      return { ok: false, error: 'INVALID_RESULT_JSON', detail: 'unparseable result (len ' + text.length + '): ' + text.slice(0, 200) };
+    }
+
+    return { ok: false, error: 'INVALID_RESULT_JSON', detail: 'unexpected result type: ' + typeof raw };
+  }
+
+
   function createAdapter(SDK, opts) {
     opts = opts || {};
     var sdk = SDK || getSdk();
@@ -208,16 +286,17 @@
       }
 
       emit(opts, 'RETRIEVING', hash);
+      emit(opts, 'RAW_RESULT', { type: typeof res, preview: (typeof res === 'string' ? res.slice(0, 200) : String(res).slice(0, 200)) });
 
-      var text = (typeof res === 'string') ? res : JSON.stringify(res);
-      if (!text || text === 'NO_ANALYSIS') throw new Error('NO_RESULT');
+      var norm = normalizeGenLayerResult(res);
+      if (!norm.ok) {
+        var normErr = new Error(norm.error);
+        normErr.detail = norm.detail;
+        throw normErr;
+      }
 
-      var parsed;
-      try { parsed = JSON.parse(text); }
-      catch (e) { throw new Error('INVALID_RESULT_JSON'); }
-
-      emit(opts, 'COMPLETE', parsed);
-      return parsed;
+      emit(opts, 'COMPLETE', norm.value);
+      return norm.value;
     }
 
     return {
@@ -238,6 +317,7 @@
     createAdapter: createAdapter,
     getSdk: getSdk,
     toErrorCode: toErrorCode,
+    normalizeGenLayerResult: normalizeGenLayerResult,
     NETWORKS: NETWORKS,
     DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
     SDK_CHAIN_KEY: SDK_CHAIN_KEY
