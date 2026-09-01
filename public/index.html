@@ -225,6 +225,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .chat-send{width:34px;height:34px;border-radius:8px;background:var(--green);color:var(--bg);border:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .2s,transform .15s}
 .chat-send:hover{opacity:.88;transform:translateY(-1px)}
 .chat-send:disabled{opacity:.3;cursor:not-allowed;transform:none}
+.chat-clear{width:34px;height:34px;border-radius:8px;background:var(--surf2);color:var(--muted);border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s}
+.chat-clear svg{width:16px;height:16px}
+.chat-clear:hover{color:var(--red);border-color:rgba(255,59,59,.3)}
+.chat-stop{width:34px;height:34px;border-radius:8px;background:rgba(255,59,59,.1);color:var(--red);border:1px solid rgba(255,59,59,.3);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s}
+.chat-stop svg{width:14px;height:14px}
+.chat-stop:hover{background:rgba(255,59,59,.2)}
 .chat-hint{font-family:var(--mono);font-size:9px;color:var(--muted2);text-align:center;margin-top:6px}
 
 /* ── WELCOME ── */
@@ -351,6 +357,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <aside class="sidebar">
     <div class="sidebar-section">
       <div class="sidebar-label">Actions</div>
+      <button class="sidebar-btn" onclick="newChat()">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg></span> New Chat
+      </button>
+      <button class="sidebar-btn" onclick="clearChat()">
+        <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></span> Clear Chat
+      </button>
       <button class="sidebar-btn" onclick="sendQuick('Scan a contract address')">
         <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span> Audit Contract
       </button>
@@ -409,6 +421,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
           placeholder="Audit 0x... on Ethereum, scan my portfolio, check approvals…"
           rows="1"
         ></textarea>
+        <button class="chat-clear" id="clearBtn" onclick="clearChat()" title="Clear conversation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+        </button>
+        <button class="chat-stop" id="stopBtn" onclick="stopTask()" title="Stop task" style="display:none">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
         <button class="chat-send" id="sendBtn" onclick="handleInput()">↑</button>
       </div>
       <div class="chat-hint">Enter to send · Shift+Enter for new line · Paste any 0x address</div>
@@ -513,6 +531,62 @@ const AUDIT_NETWORK_KEY = 'auditai.audit.network';
 // until the user explicitly clicks "Deploy Contract").
 let pendingBuild = null;
 const DEPLOY_BUSY = {};
+
+// Task lifecycle: a global flag + AbortController to let the user stop a
+// long-running operation (e.g. network discovery). No regressions — operations
+// simply observe an abort signal / flag.
+let taskRunning = false;
+let taskAbort = null;
+
+function startTask() {
+  taskRunning = true;
+  try { taskAbort = new AbortController(); } catch (e) { taskAbort = null; }
+  const stop = document.getElementById('stopBtn');
+  if (stop) stop.style.display = 'flex';
+  const send = document.getElementById('sendBtn');
+  if (send) send.disabled = true;
+}
+
+function endTask() {
+  taskRunning = false;
+  taskAbort = null;
+  const stop = document.getElementById('stopBtn');
+  if (stop) stop.style.display = 'none';
+  const send = document.getElementById('sendBtn');
+  if (send) send.disabled = false;
+}
+
+function stopTask() {
+  if (taskAbort) { try { taskAbort.abort(); } catch (e) {} }
+  taskRunning = false;
+  removeTyping();
+  endTask();
+  appendAIMessage('⏹ **Task stopped.**');
+}
+
+// New chat / clear conversation. Both reset the visible conversation and the
+// in-memory history and return to the welcome screen.
+function resetChat() {
+  if (taskRunning && taskAbort) { try { taskAbort.abort(); } catch (e) {} }
+  conversationHistory = [];
+  lastAuditResult = null;
+  lastAuditAddress = null;
+  lastAuditChain = null;
+  pendingBuild = null;
+  const msgs = document.getElementById('messages');
+  const welcome = document.getElementById('welcomeScreen');
+  if (msgs) {
+    while (msgs.firstChild) msgs.removeChild(msgs.firstChild);
+    if (welcome) { welcome.style.display = 'flex'; msgs.appendChild(welcome); }
+  }
+  const qp = document.getElementById('quickPrompts');
+  if (qp) qp.style.display = 'none';
+  endTask();
+}
+
+function newChat() { resetChat(); }
+
+function clearChat() { resetChat(); }
 
 // Phase 7.3: explicit separation of network concerns.
 //   auditNetwork     — read-only network for contract discovery/local audit
@@ -1284,14 +1358,18 @@ async function discoverAndAudit(address) {
     return;
   }
   showTyping();
+  startTask();
   let disc;
   try {
-    disc = await window.AuditAINetworks.discoverContract(address);
+    disc = await window.AuditAINetworks.discoverContract(address, { signal: taskAbort ? taskAbort.signal : undefined });
   } catch (e) {
+    endTask();
     removeTyping();
+    if (e && (e.name === 'AbortError' || /abort/i.test(e.message || ''))) { return; }
     appendAIMessage('⚠️ **RPC_ERROR** — network discovery failed: ' + (e && e.message ? e.message : e));
     return;
   }
+  endTask();
   removeTyping();
 
   if (disc.ok === false) {

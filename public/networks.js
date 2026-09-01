@@ -125,12 +125,14 @@
     return Promise.reject(new Error('fetch unavailable'));
   }
 
-  async function jsonRpc(rpc, method, params) {
-    var res = await doFetch(rpc, {
+  async function jsonRpc(rpc, method, params, signal) {
+    var init = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: method, params: params || [] })
-    });
+    };
+    if (signal) init.signal = signal;
+    var res = await doFetch(rpc, init);
     if (!res.ok) throw new Error('RPC_HTTP_' + res.status);
     var data = await res.json();
     if (data && data.error) throw new Error((data.error.message || 'RPC_ERROR'));
@@ -154,8 +156,8 @@
 
   // ── Preflight ───────────────────────────────────────────────────────────────
   // Verify the RPC's eth_chainId matches the selected network before auditing.
-  async function rpcChainId(rpc) {
-    var raw = await jsonRpc(rpc, 'eth_chainId', []);
+  async function rpcChainId(rpc, signal) {
+    var raw = await jsonRpc(rpc, 'eth_chainId', [], signal);
     return hexToInt(raw);
   }
 
@@ -186,8 +188,8 @@
 
   function clearCodeCache() { _codeCache = {}; }
 
-  function _getCodeUncached(rpc, address) {
-    return jsonRpc(rpc, 'eth_getCode', [address, 'latest']);
+  function _getCodeUncached(rpc, address, signal) {
+    return jsonRpc(rpc, 'eth_getCode', [address, 'latest'], signal);
   }
 
   async function getCode(rpc, address, chainId, opts) {
@@ -197,7 +199,7 @@
     if (useCache && _cacheEnabled && key && _codeCache[key] !== undefined) {
       return _codeCache[key].code;
     }
-    var code = await _getCodeUncached(rpc, address);
+    var code = await _getCodeUncached(rpc, address, opts.signal);
     if (useCache && _cacheEnabled && key) _codeCache[key] = { code: code };
     return code;
   }
@@ -365,10 +367,10 @@
               contractType: 'RPC_ERROR', bytecodeAvailable: false, code: null, error: null
             };
             try {
-              var code = await withTimeout(getCode(net.rpc, normalized, net.chainId, { useCache: true }), timeoutMs);
+              var code = await withTimeout(getCode(net.rpc, normalized, net.chainId, { useCache: true, signal: opts.signal }), timeoutMs);
               if (hexLength(code) > 0) {
                 if (verifyChainId) {
-                  var actual = await withTimeout(rpcChainId(net.rpc), timeoutMs);
+                  var actual = await withTimeout(rpcChainId(net.rpc, opts.signal), timeoutMs);
                   if (actual !== net.chainId) {
                     entry.contractType = 'NETWORK_CHAIN_ID_MISMATCH';
                     entry.error = 'chainId ' + actual + ' != ' + net.chainId;
@@ -383,6 +385,7 @@
                 entry.contractType = 'NOT_FOUND';
               }
             } catch (e) {
+              if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message || '')))) throw e;
               entry.contractType = 'RPC_ERROR';
               entry.error = String((e && e.message) || e);
             }
