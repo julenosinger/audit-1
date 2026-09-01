@@ -9,6 +9,9 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="networks.js"></script>
+<script src="contract-templates.js"></script>
+<script src="contract-security.js"></script>
+<script src="contract-studio.js"></script>
 <script src="contract-builder.js"></script>
 <script src="genlayer-sdk.bundle.js"></script>
 <script src="genlayer-client.js"></script>
@@ -1812,52 +1815,161 @@ updateGLStatus();
 })();
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SMART CONTRACT BUILDER (Phase 7)
+// SMART CONTRACT STUDIO 2.0 (Phase 7.2)
 // ═══════════════════════════════════════════════════════════════════════════════
-async function handleCreateContract(text) {
-  const builder = window.AuditAIContractBuilder;
-  if (!builder) { appendAIMessage('⚠️ Contract Builder not loaded.'); return; }
+function studioSpecFromText(type, text) {
+  const T = window.AuditAIContractTemplates;
+  const spec = T.defaultSpec(type);
+  const nm = String(text || '').match(/(?:called|named)\s+([A-Za-z][A-Za-z0-9_]*)/);
+  if (nm && nm[1]) spec.name = nm[1];
+  if (type === 'erc20') {
+    const cb = window.AuditAIContractBuilder;
+    if (cb) {
+      const p = cb.parseSpec(text);
+      if (p && p.name) spec.name = p.name;
+      if (p && p.symbol) spec.symbol = p.symbol;
+      if (p && p.supply) spec.supply = p.supply;
+    }
+    if (/\bmintable\b/i.test(text)) spec.supplyType = 'mintable';
+    if (/\bburnable\b/i.test(text)) spec.burn = true;
+    if (/\bpausable\b/i.test(text)) spec.pause = true;
+    if (/\baccess\s*control\b/i.test(text)) spec.accessControl = 'accesscontrol';
+    else if (/\bownable\b/i.test(text)) spec.accessControl = 'ownable';
+  }
+  if (type === 'erc721' || type === 'erc1155') {
+    if (/\bburnable\b/i.test(text)) spec.burn = true;
+    if (/\bownable\b/i.test(text)) spec.accessControl = 'ownable';
+  }
+  return spec;
+}
 
-  const spec = builder.parseSpec(text);
-  const source = builder.generateSolidity(spec);
-  const validation = builder.validateSolidity(source);
-  if (!validation.valid) {
-    appendAIMessage('⚠️ **INVALID_SOLIDITY** — generated source failed validation:\n' + validation.errors.map(e => '• ' + e).join('\n'));
+function showTypeMenu() {
+  const T = window.AuditAIContractTemplates;
+  const evm = T.EVM_TYPES.map(function (k) {
+    return '<button class="wchip" onclick="startStudioType(\'' + k + '\')">' + T.CONTRACT_TYPES[k].label + '</button>';
+  }).join(' ');
+  const gl = T.GENLAYER_TYPES.map(function (k) {
+    return '<button class="wchip" onclick="startStudioType(\'' + k + '\')">' + T.CONTRACT_TYPES[k].label + '</button>';
+  }).join(' ');
+  appendAIMessage('**Contract Studio 2.0** — choose a contract type:\n\n**EVM CONTRACTS**\n' + evm + '\n\n**GENLAYER CONTRACTS**\n' + gl);
+}
+
+function startStudioType(type) {
+  const Studio = window.AuditAIContractStudio;
+  const spec = window.AuditAIContractTemplates.defaultSpec(type);
+  const build = Studio.build(spec);
+  if (!build.ok) {
+    const errs = build.validation.errors.map(e => '• ' + e).join('\n');
+    const qs = Studio.guidedQuestions(type).map(q => '• ' + q.label).join('\n');
+    appendAIMessage('⚠️ To build a **' + type + '**, please provide:\n' + qs + (errs ? '\n\n' + errs : ''));
     return;
   }
-  const targetNet = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
-  const pv = builder.preview(spec, source, targetNet ? { id: targetNet.id, name: targetNet.name, chainId: targetNet.chainId } : null);
-  pendingBuild = { id: 'b' + Date.now().toString(36), spec: spec, source: source, network: targetNet };
+  const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  pendingBuild = { id: 'b' + Date.now().toString(36), spec: build.spec, source: build.source, build: build, network: net };
+  showStudioPreview(build, net);
+}
 
-  const argsHtml = (pv.constructorArgs || []).map(a => {
-    const shown = a.units ? (a.units + ' tokens') : (a.value || '—');
-    return `<div class="rc-finding-desc">• <code>${escHtml(a.name)}</code> (<b>${escHtml(a.type)}</b>) — ${escHtml(a.label)}${a.value !== undefined && a.value !== '' ? ' · ' + escHtml(shown) : ''}</div>`;
+async function handleCreateContract(text) {
+  const Studio = window.AuditAIContractStudio;
+  const T = window.AuditAIContractTemplates;
+  if (!Studio || !T) { appendAIMessage('⚠️ Contract Studio not loaded.'); return; }
+
+  const type = Studio.detectCreateType(text);
+  if (!type) { showTypeMenu(); return; }
+
+  const spec = studioSpecFromText(type, text);
+  const build = Studio.build(spec);
+  if (!build.ok) {
+    const errs = build.validation.errors.map(e => '• ' + e).join('\n');
+    const qs = Studio.guidedQuestions(type).map(q => '• ' + q.label).join('\n');
+    appendAIMessage('⚠️ I can build a **' + T.CONTRACT_TYPES[type].label + '**, but I need a few parameters first:\n' + qs + (errs ? '\n\n' + errs : '') + '\n\nOr reply with e.g. `create an erc20 called MyToken with symbol MTK and 1 million supply`.');
+    return;
+  }
+
+  const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  pendingBuild = { id: 'b' + Date.now().toString(36), spec: build.spec, source: build.source, build: build, network: net };
+  showStudioPreview(build, net);
+}
+
+function deployCapabilityFor(build) {
+  const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  return window.AuditAIContractStudio.capabilityFor(build, { id: net ? net.id : null, family: net ? 'GENLAYER' : null });
+}
+
+function showStudioPreview(build, net) {
+  const T = window.AuditAIContractTemplates;
+  const type = T.CONTRACT_TYPES[build.spec.type] || { label: build.spec.type, family: 'EVM' };
+  const cap = deployCapabilityFor(build);
+  const ctor = T.constructorArgs(build.spec);
+
+  const specLines = [];
+  specLines.push('Type: <b>' + escHtml(type.label) + '</b> · Family: <b>' + escHtml(type.family) + '</b> · Name: <b>' + escHtml(build.spec.name) + '</b>');
+  if (build.spec.symbol) specLines.push('Symbol: <b>' + escHtml(build.spec.symbol) + '</b>');
+  if (build.spec.supply !== undefined) specLines.push('Supply: <b>' + build.spec.supply + '</b> tokens (' + (build.spec.supplyType || 'fixed') + ')');
+  if (build.spec.accessControl) specLines.push('Access control: <b>' + escHtml(build.spec.accessControl) + '</b>');
+  const specHtml = specLines.map(s => '<div class="rc-finding-desc">' + s + '</div>').join('');
+
+  const argsHtml = (ctor || []).map(a =>
+    `<div class="rc-finding-desc">• <code>${escHtml(a.name)}</code> (<b>${escHtml(a.type)}</b>) — ${escHtml(a.label)}${a.value !== undefined && a.value !== '' ? ' · ' + escHtml(a.value) : ''}</div>`).join('');
+
+  // Security review categories (compact, status-colored).
+  const catOrder = ['supply', 'minting', 'burn', 'accessControl', 'upgradeability', 'externalCalls', 'reentrancy', 'tokenOperations', 'storage', 'structure'];
+  const catColor = { OBSERVED: 'var(--green)', INFERRED: 'var(--yellow)', UNKNOWN: 'var(--yellow)', POTENTIAL: 'var(--yellow)', NOT_APPLICABLE: 'var(--muted)' };
+  const reviewRows = catOrder.filter(k => build.review && build.review.categories[k]).map(function (k) {
+    const c = build.review.categories[k];
+    const icon = c.status === 'UNKNOWN' || c.status === 'POTENTIAL' || c.status === 'INFERRED' ? '🟡' : (c.status === 'NOT_APPLICABLE' ? '⚪' : '🟢');
+    return '<div class="rc-priv-item"><span class="rc-priv-op" style="min-width:120px">' + icon + ' ' + escHtml(k) + '</span><span class="rc-priv-fn">' + escHtml(c.text) + '</span></div>';
   }).join('');
-  const warningsHtml = (pv.warnings || []).map(w =>
-    `<div class="rc-finding-desc">${w.level === 'HIGH' ? '⚠️' : 'ℹ️'} ${escHtml(w.text)}</div>`).join('');
+  const warnHtml = (build.review && build.review.warnings || []).map(w =>
+    `<div class="rc-finding-desc">${w.level === 'HIGH' ? '⚠️' : (w.level === 'MEDIUM' ? '🟡' : 'ℹ️')} ${escHtml(w.text)}</div>`).join('');
+
+  const capClass = cap.supported ? 'rc-access-ok' : 'rc-access-unknown';
+  const deployBtn = cap.supported
+    ? '<button type="button" class="publish-btn llm-btn" onclick="deployBuiltContract()">Deploy Contract</button>'
+    : '';
+  const copyBtn = '<button type="button" class="publish-btn llm-btn" onclick="copyContractSource()">Copy</button>';
+
   const card = `<div class="result-card">
-    <div class="rc-findings"><div class="rc-findings-title">Contract Specification</div>
-      <div class="rc-acs">Type: <b>${escHtml(spec.type.toUpperCase())}</b> · Name: <b>${escHtml(spec.name)}</b>${spec.symbol ? ' · Symbol: <b>' + escHtml(spec.symbol) + '</b>' : ''}${spec.supply ? ' · Supply: <b>' + spec.supply + '</b> tokens' : ''}</div>
+    <div class="rc-findings"><div class="rc-findings-title">Contract Studio — Preview</div>
+      ${specHtml}
+    </div>
+    <div class="rc-findings"><div class="rc-findings-title">Deployment</div>
+      <div class="rc-finding-desc"><span class="rc-priv-access ${capClass}">${cap.supported ? 'SUPPORTED' : 'NOT_SUPPORTED'}</span> ${escHtml(cap.reason)}</div>
       ${argsHtml}
     </div>
-    <div class="rc-findings"><div class="rc-findings-title">Target Network</div>
-      <div class="rc-acs">${targetNet ? escHtml(targetNet.name) + ' (chain ' + targetNet.chainId + ')' : 'Not selected'}</div>
+    <div class="rc-findings"><div class="rc-findings-title">Security Review</div>
+      <div class="rc-acs">Status: <b>${escHtml(build.review.reviewStatus)}</b></div>
+      ${reviewRows}
+      ${warnHtml ? '<div style="margin-top:6px">' + warnHtml + '</div>' : ''}
     </div>
-    <div class="rc-findings"><div class="rc-findings-title">Solidity</div>
-      <pre style="font-family:var(--mono);font-size:10px;color:var(--muted);max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escHtml(source)}</pre>
+    <div class="rc-findings"><div class="rc-findings-title">Source (${escHtml(type.family === 'GENLAYER' ? 'Python' : 'Solidity')})</div>
+      <div class="rc-acs">builderVersion <b>${escHtml(build.hashes.builderVersion)}</b> · specHash <b>${escHtml(build.hashes.specHash)}</b> · sourceHash <b>${escHtml(build.hashes.sourceHash)}</b></div>
+      <pre style="font-family:var(--mono);font-size:10px;color:var(--muted);max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escHtml(build.source)}</pre>
     </div>
-    <div class="rc-findings"><div class="rc-findings-title">Security Review</div>${warningsHtml}</div>
     <div class="rc-footer"><span class="rc-footer-left">Deployment requires explicit approval</span>
-      <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="deployBuiltContract()">Deploy Contract</button></div>
+      <div class="rc-footer-actions">${copyBtn}${deployBtn}</div>
     </div>
   </div>`;
-  appendAIMessage('I can create that contract. Review the source below — **nothing has been deployed yet**. Deployment is a separate, explicit step.', card);
+  appendAIMessage('Here is your **' + type.label + '** contract. Review the source and security review below — **nothing has been deployed yet**.', card);
+}
+
+function copyContractSource() {
+  if (!pendingBuild || !pendingBuild.source) return;
+  const ok = window.AuditAIGenLayer && window.AuditAIGenLayer.copyToClipboard(pendingBuild.source);
+  appendAIMessage(ok ? '📋 Source copied to clipboard.' : '⚠️ Could not copy source (clipboard unavailable).');
 }
 
 async function deployBuiltContract() {
   if (!pendingBuild) { appendAIMessage('No pending contract to deploy.'); return; }
   const build = pendingBuild;
   if (DEPLOY_BUSY[build.id]) { appendAIMessage('⏳ Deployment already in progress — please wait.'); return; }
+
+  // Capability check FIRST — never simulate an unsupported deployment.
+  const cap = deployCapabilityFor(build.build);
+  if (!cap.supported) {
+    appendAIMessage('⚠️ **NOT_SUPPORTED** — ' + cap.reason + '\n\nYou can copy the source and deploy it with your own tooling.');
+    return;
+  }
 
   if (!window.AuditAIGenLayer) { appendAIMessage('⚠️ GenLayer bridge not loaded.'); return; }
   const net = window.AuditAIGenLayer.getNetwork();
@@ -1878,8 +1990,8 @@ async function deployBuiltContract() {
     return;
   }
 
-  const builder = window.AuditAIContractBuilder;
-  const ctor = builder ? builder.constructorArgs(build.spec) : [];
+  const T = window.AuditAIContractTemplates;
+  const ctor = T.constructorArgs(build.spec);
   const args = [];
   for (const a of ctor) {
     if (a.type === 'address') {
