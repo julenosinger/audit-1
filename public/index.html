@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>AuditAI — Smart Contract Security Scanner</title>
+<title>forgeContract — Smart Contract Security Scanner</title>
+<meta name="description" content="forgeContract — smart-contract security scanner for GenLayer. Audit any EVM contract, create GenLayer intelligent contracts, and publish results on-chain.">
+<meta property="og:title" content="forgeContract">
+<meta property="og:description" content="Smart-contract security scanner on GenLayer.">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2300ff88'%3E%3Cpolygon points='13 2 3 14 12 14 11 22 21 10 12 10 13 2'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -289,14 +292,15 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <header class="topbar">
     <div class="logo">
       <div class="logo-icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-      AuditAI
+      forgeContract
     </div>
     <div class="topbar-center">
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
-      <div class="topbar-pill" title="Optional audit network override — networks are auto-detected from the address">
+      <div class="topbar-pill" title="Read-only audit network — contracts are auto-discovered from the address">
         Audit Network:
         <select id="auditNetworkSelect" onchange="onAuditNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:130px;">
+          <option value="auto">Auto Discover</option>
           <option value="ethereum">Ethereum</option>
           <option value="bsc">BNB Chain</option>
           <option value="base">Base</option>
@@ -307,8 +311,8 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         </select>
       </div>
       <div class="topbar-pill" style="color:var(--muted)">Powered by <span>GenLayer</span></div>
-      <div class="topbar-pill gl-pill" id="glContractPill" title="GenLayer semantic-audit network and contract (separate from Audit Network)">
-        GenLayer:
+      <div class="topbar-pill gl-pill" id="glContractPill" title="Transaction / Deployment network — GenLayer is the only transaction environment">
+        Transaction / Deployment:
         <select id="glNetworkSelect" onchange="onGLNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:96px;">
           <option value="studionet">Studionet</option>
           <option value="bradbury">Bradbury</option>
@@ -352,7 +356,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <!-- Welcome state shown when empty -->
       <div class="welcome" id="welcomeScreen">
         <div class="welcome-icon"><svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="var(--green)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-        <h2>AuditAI is ready.<br><em>Ask me anything.</em></h2>
+        <h2>forgeContract is ready.<br><em>Ask me anything.</em></h2>
         <p>Audit any EVM contract, scan your wallet's portfolio, check active approvals, or compare two contracts — just describe what you want in plain English.</p>
         <div class="welcome-chips">
           <div class="wchip" onclick="sendQuick('Audit 0xF2c549Bf2Dc106a28354B1444298DD460601856B on GenLayer Studionet')">Audit real contract · GenLayer Studionet</div>
@@ -450,26 +454,49 @@ const AUDIT_NETWORK_KEY = 'auditai.audit.network';
 let pendingBuild = null;
 const DEPLOY_BUSY = {};
 
-// Phase 6.5: the network of the contract being audited is a first-class part
-// of the audit context. It is stored separately from the GenLayer execution
-// network (public/genlayer.js). Default is Ethereum.
+// Phase 7.3: explicit separation of network concerns.
+//   auditNetwork     — read-only network for contract discovery/local audit
+//   transactionNetwork / deploymentNetwork — GenLayer ONLY (Studionet default)
+// The audit network defaults to AUTO-DISCOVER; it is never the transaction
+// network. GenLayer Studionet is the ONLY transaction/deployment environment.
+
+// Read-only audit network (auto-discover by default). Any persisted value that
+// is not a valid audit network falls back to auto.
 let auditNetworkId = (function () {
-  try { return localStorage.getItem(AUDIT_NETWORK_KEY) || 'ethereum'; } catch { return 'ethereum'; }
+  try {
+    var v = localStorage.getItem(AUDIT_NETWORK_KEY);
+    if (v && v !== 'auto' && window.AuditAINetworks && window.AuditAINetworks.getNetwork(v)) return v;
+    return 'auto';
+  } catch (e) { return 'auto'; }
 })();
 
 function getAuditNetwork() {
+  if (auditNetworkId === 'auto') return null; // auto-discover
   if (!window.AuditAINetworks) return null;
-  return window.AuditAINetworks.getNetwork(auditNetworkId) || window.AuditAINetworks.getNetwork('ethereum');
+  return window.AuditAINetworks.getNetwork(auditNetworkId) || null;
 }
 
 function onAuditNetworkChange(id) {
-  if (!window.AuditAINetworks || !window.AuditAINetworks.getNetwork(id)) return;
+  if (id !== 'auto' && (!window.AuditAINetworks || !window.AuditAINetworks.getNetwork(id))) return;
   auditNetworkId = id;
   try { localStorage.setItem(AUDIT_NETWORK_KEY, String(id)); } catch {}
   window.AuditAINetworks.clearCodeCache();
   const sel = document.getElementById('auditNetworkSelect');
   if (sel) sel.value = id;
 }
+
+// Transaction / deployment network — GENLAYER ONLY. Studionet (61999) is the
+// default; Bradbury remains available but is never forced. No external EVM
+// network can ever resolve here.
+function getTransactionNetwork() {
+  if (!window.AuditAIGenLayer) return null;
+  var id = window.AuditAIGenLayer.getNetworkId();
+  if (!id || id === 'bradbury') id = 'studionet'; // Phase 7.3: pin default to Studionet
+  return window.AuditAIGenLayer.getNetwork && window.AuditAIGenLayer.NETWORKS
+    ? (window.AuditAIGenLayer.NETWORKS[id] || window.AuditAIGenLayer.NETWORKS.studionet || null)
+    : null;
+}
+function getDeploymentNetwork() { return getTransactionNetwork(); }
 
 // Find the most recently stored audit result for an address (the store is keyed
 // by chainId:address, so look up by address across network keys).
@@ -675,7 +702,7 @@ function appendAIMessage(md, cardHtml) {
     <div class="msg-content">
       <div class="msg-bubble">${mdToHtml(md)}</div>
       ${cardHtml ? cardHtml : ''}
-      <div class="msg-time">${timeStr()} · AuditAI</div>
+      <div class="msg-time">${timeStr()} · forgeContract</div>
     </div>`;
   msgs.appendChild(el);
   scrollBottom();
@@ -920,7 +947,7 @@ function buildResultCard(data, address, networkId) {
       <span class="gl-status-item">GenLayer Analysis <span class="gl-status-badge" id="gl-analysis-${address.toLowerCase()}">Not requested</span></span>
     </div>
     <div class="rc-footer">
-      <span class="rc-footer-left">⚡ GenLayer · AuditAI</span>
+      <span class="rc-footer-left">⚡ GenLayer · forgeContract</span>
       <div class="rc-footer-actions">
         ${glActionHtml}
         <button type="button" class="publish-btn llm-btn" data-gl-analyze="${address.toLowerCase()}" onclick="requestGenLayerAnalysis('${address}')">Analyze with GenLayer AI</button>
@@ -1035,7 +1062,7 @@ async function scanPortfolio() {
     let contracts;
     if (USE_CLAUDE) {
       // Legacy: Claude-simulated portfolio (kept behind the flag).
-      const prompt = `You are AuditAI analyzing a DeFi user's portfolio. The user's wallet is ${walletAddress}.
+      const prompt = `You are forgeContract analyzing a DeFi user's portfolio. The user's wallet is ${walletAddress}.
 
 Simulate a realistic portfolio scan by generating 5-7 fictional but realistic EVM contracts this wallet has interacted with. Include a mix of well-known (USDC, Uniswap, Aave) and unknown contracts. For each, provide:
 - address (realistic 0x...)
@@ -1095,7 +1122,7 @@ async function checkApprovals() {
   try {
     let approvals;
     if (USE_CLAUDE) {
-      const prompt = `You are AuditAI checking active ERC-20 token approvals for wallet ${walletAddress}.
+      const prompt = `You are forgeContract checking active ERC-20 token approvals for wallet ${walletAddress}.
 
 Generate a realistic list of 4-6 token approvals this wallet might have. Include:
 - 1-2 unlimited approvals to well-known DEX routers (LOW risk)
@@ -1279,7 +1306,7 @@ function renderAuditResult(address, networkId, result, net) {
 async function auditAddressClaude(address, networkId, net) {
   const chainName = net ? net.name : (networkId || 'Ethereum');
   const chainId = net ? net.chainId : null;
-  const prompt = `You are AuditAI, a smart contract security scanner. Analyze:
+  const prompt = `You are forgeContract, a smart contract security scanner. Analyze:
 Contract: ${address}
 Chain: ${chainName} (ID: ${chainId})
 
@@ -1433,7 +1460,7 @@ async function handleInput() {
 
     const sysPrompt = [{
       role: 'user',
-      content: `You are AuditAI, a smart contract security expert assistant. Answer security questions clearly and concisely. Use **bold** for key terms and \`code\` for contract addresses/functions. Be helpful and precise. ${systemCtx ? 'Context about the last audit: ' + systemCtx : ''}\n\nUser question: ${text}`
+      content: `You are forgeContract, a smart contract security expert assistant. Answer security questions clearly and concisely. Use **bold** for key terms and \`code\` for contract addresses/functions. Be helpful and precise. ${systemCtx ? 'Context about the last audit: ' + systemCtx : ''}\n\nUser question: ${text}`
     }];
 
     const answer = await callClaude(sysPrompt, 600);
@@ -1811,7 +1838,7 @@ updateNavStats();
 updateGLStatus();
 (function () {
   const sel = document.getElementById('auditNetworkSelect');
-  if (sel && window.AuditAINetworks) sel.value = window.AuditAINetworks.getNetwork(auditNetworkId) ? auditNetworkId : 'ethereum';
+  if (sel) sel.value = (auditNetworkId === 'auto' || (window.AuditAINetworks && window.AuditAINetworks.getNetwork(auditNetworkId))) ? auditNetworkId : 'auto';
 })();
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1892,7 +1919,7 @@ async function handleCreateContract(text) {
 }
 
 function deployCapabilityFor(build) {
-  const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  const net = getDeploymentNetwork();
   return window.AuditAIContractStudio.capabilityFor(build, { id: net ? net.id : null, family: net ? 'GENLAYER' : null });
 }
 
@@ -1934,7 +1961,7 @@ function showStudioPreview(build, net) {
       ${specHtml}
     </div>
     <div class="rc-findings"><div class="rc-findings-title">Deployment</div>
-      <div class="rc-finding-desc"><span class="rc-priv-access ${capClass}">${cap.supported ? 'SUPPORTED' : 'NOT_SUPPORTED'}</span> ${escHtml(cap.reason)}</div>
+      <div class="rc-finding-desc"><span class="rc-priv-access ${capClass}">${escHtml(cap.code || (cap.supported ? 'SUPPORTED' : 'NOT_SUPPORTED'))}</span> ${escHtml(cap.reason)}</div>
       ${argsHtml}
     </div>
     <div class="rc-findings"><div class="rc-findings-title">Security Review</div>
@@ -1967,7 +1994,7 @@ async function deployBuiltContract() {
   // Capability check FIRST — never simulate an unsupported deployment.
   const cap = deployCapabilityFor(build.build);
   if (!cap.supported) {
-    appendAIMessage('⚠️ **NOT_SUPPORTED** — ' + cap.reason + '\n\nYou can copy the source and deploy it with your own tooling.');
+    appendAIMessage('⚠️ **' + (cap.code || 'NOT_SUPPORTED') + '** — ' + cap.reason + '\n\nYou can copy the source and deploy it with your own tooling.');
     return;
   }
 

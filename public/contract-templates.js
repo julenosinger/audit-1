@@ -698,18 +698,15 @@
   function deploymentCapability(spec, networkFamily) {
     spec = spec || {};
     var type = CONTRACT_TYPES[spec.type];
-    if (!type) return { supported: false, reason: 'NOT_SUPPORTED: unknown contract type' };
+    if (!type) return { supported: false, code: 'NOT_SUPPORTED', reason: 'NOT_SUPPORTED: unknown contract type' };
     var isGenLayerNetwork = networkFamily === 'GENLAYER';
 
     if (type.family === 'GENLAYER') {
-      if (isGenLayerNetwork) return { supported: true, reason: 'GenLayer Intelligent Contract via the GenLayer SDK' };
-      return { supported: false, reason: 'NOT_SUPPORTED: GenLayer contracts only deploy on GenLayer networks (Studionet/Bradbury)' };
+      if (isGenLayerNetwork) return { supported: true, code: 'SUPPORTED', reason: 'GenLayer Intelligent Contract via the GenLayer SDK' };
+      return { supported: false, code: 'GENLAYER_ONLY_DEPLOYMENT', reason: 'Contract deployment is currently available only on GenLayer Testnet.' };
     }
-    // EVM family
-    if (isGenLayerNetwork) {
-      return { supported: false, reason: 'NOT_SUPPORTED: GenLayer deploys GenLayer (Python) intelligent contracts, not Solidity' };
-    }
-    return { supported: false, reason: 'NOT_SUPPORTED: no EVM/Solidity deployment transport is wired in this project (no compiler, no EVM deployer). Copy the Solidity and deploy via Remix/Hardhat/Foundry.' };
+    // EVM family — never deployable in Phase 7.3 (no EVM/Solidity deployment transport).
+    return { supported: false, code: 'GENLAYER_ONLY_DEPLOYMENT', reason: 'Contract deployment is currently available only on GenLayer Testnet.' };
   }
 
   return {

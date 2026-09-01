@@ -145,23 +145,29 @@ test('GenLayer templates are Python gl.Contract', function () {
 
 // ── Deployment capability (honest) ───────────────────────────────────────────
 
-test('deploymentCapability: EVM contract on EVM network => NOT_SUPPORTED (no transport)', function () {
+test('deploymentCapability: EVM contract on EVM network => GENLAYER_ONLY_DEPLOYMENT', function () {
   var c = Templates.deploymentCapability({ type: 'erc20' }, 'EVM');
   assert.equal(c.supported, false);
-  assert.ok(c.reason.indexOf('NOT_SUPPORTED') !== -1);
+  assert.equal(c.code, 'GENLAYER_ONLY_DEPLOYMENT');
+  assert.ok(c.reason.indexOf('GenLayer Testnet') !== -1);
 });
 
-test('deploymentCapability: EVM contract on GenLayer network => NOT_SUPPORTED', function () {
-  assert.equal(Templates.deploymentCapability({ type: 'erc20' }, 'GENLAYER').supported, false);
+test('deploymentCapability: EVM contract on GenLayer network => GENLAYER_ONLY_DEPLOYMENT', function () {
+  var c = Templates.deploymentCapability({ type: 'erc20' }, 'GENLAYER');
+  assert.equal(c.supported, false);
+  assert.equal(c.code, 'GENLAYER_ONLY_DEPLOYMENT');
 });
 
 test('deploymentCapability: GenLayer contract on GenLayer network => supported', function () {
   var c = Templates.deploymentCapability({ type: 'genlayer_intelligent' }, 'GENLAYER');
   assert.equal(c.supported, true);
+  assert.equal(c.code, 'SUPPORTED');
 });
 
-test('deploymentCapability: GenLayer contract on EVM network => NOT_SUPPORTED', function () {
-  assert.equal(Templates.deploymentCapability({ type: 'genlayer_intelligent' }, 'EVM').supported, false);
+test('deploymentCapability: GenLayer contract on EVM network => GENLAYER_ONLY_DEPLOYMENT', function () {
+  var c = Templates.deploymentCapability({ type: 'genlayer_intelligent' }, 'EVM');
+  assert.equal(c.supported, false);
+  assert.equal(c.code, 'GENLAYER_ONLY_DEPLOYMENT');
 });
 
 // ── Constructor arguments ────────────────────────────────────────────────────
