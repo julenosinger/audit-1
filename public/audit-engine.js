@@ -40,8 +40,8 @@
 })(function () {
   'use strict';
 
-  var VERSION = '8.0.0';
-  var ANALYSIS_VERSION = '8.0.0';
+  var VERSION = '8.1.0';
+  var ANALYSIS_VERSION = '8.1.0';
 
   // Network registry (single source of truth) — used for the network-aware
   // fetch path. Loaded from the UMD global in the browser, or required directly
@@ -1802,6 +1802,21 @@
     return { implementation: '0x' + addr, confidence: 'CONFIRMED', source: 'EIP-1167 embedded address' };
   }
 
+  // ── Plausible implementation-address helper (Phase 7.1) ───────────────────
+  // A syntactically valid address is NOT proof of an implementation. This
+  // rejects obvious sentinel/invalid candidates (zero address, all-FF, malformed)
+  // so a stray PUSH20 can never masquerade as an implementation contract.
+  function isPlausibleContractAddress(addr) {
+    if (typeof addr !== 'string') return false;
+    var a = String(addr).trim();
+    if (a.slice(0, 2) === '0x' || a.slice(0, 2) === '0X') a = a.slice(2);
+    if (!/^[0-9a-fA-F]{40}$/.test(a)) return false;
+    var lower = a.toLowerCase();
+    if (/^0{40}$/.test(lower)) return false;   // zero address
+    if (/^f{40}$/.test(lower)) return false;   // all-FF sentinel
+    return true;
+  }
+
   function analyzeProxyUpgradeability(ctx, cfg, dataFlow, functionMap, functionGraph, hex) {
     var dels = [];
     (ctx.instructions || []).forEach(function (ins) {
@@ -1834,7 +1849,10 @@
       return { pc: d.pc, block: d.block, reach: d.reach, context: context, classification: cls };
     });
 
-    // ── Implementation detection ─────────────────────────────────────────────
+    // ── Implementation detection (contextual — Phase 7.1) ────────────────────
+    // A PUSH20 becomes implementation evidence ONLY when correlated with a
+    // recognized proxy pattern or a reachable DELEGATECALL whose target is a
+    // hard-coded address. Sentinels (zero/0xFF) are always rejected.
     var implementation = { address: null, source: 'UNKNOWN', confidence: 'UNKNOWN' };
     if (minimal) {
       implementation = { address: minimal.implementation, source: minimal.source, confidence: 'CONFIRMED' };
@@ -1842,10 +1860,19 @@
       implementation = { address: null, source: 'EIP-1967 implementation slot (0x' + EIP1967_SLOTS.implementation.slice(0, 8) + '…)', confidence: 'INFERRED' };
     } else if (hasBeaconSlot) {
       implementation = { address: null, source: 'beacon slot (implementation resolved via beacon, address not resolved)', confidence: 'UNKNOWN' };
-    } else {
-      var implCandidate = (ctx.push20 || []).filter(function (a) { return /^[0-9a-f]{40}$/.test(a) && a !== '0'.repeat(40); });
-      if (implCandidate.length) {
-        implementation = { address: '0x' + implCandidate[0], source: 'hard-coded 20-byte address constant', confidence: 'LIKELY' };
+    } else if (hasDelegatecall) {
+      // Correlate a reachable DELEGATECALL with a hard-coded target (data-flow).
+      var delTarget = null;
+      (dataFlow.externalCalls || []).forEach(function (c) {
+        if (!delTarget && c.opcode === 'DELEGATECALL' && c.targetKnown && isPlausibleContractAddress(c.target)) delTarget = c.target;
+      });
+      if (delTarget) {
+        implementation = { address: delTarget, source: 'DELEGATECALL target (hard-coded, reachable)', confidence: 'LIKELY' };
+      } else {
+        var implCandidate = (ctx.push20 || []).filter(function (a) { return isPlausibleContractAddress('0x' + a); });
+        if (implCandidate.length) {
+          implementation = { address: '0x' + implCandidate[0], source: 'hard-coded 20-byte address constant (proxy context, correlation unproven)', confidence: 'INFERRED' };
+        }
       }
     }
 
@@ -1992,14 +2019,14 @@
     }
 
     var implNode = null;
-    if (proxy.implementation && proxy.implementation.source !== 'UNKNOWN') {
+    if (proxy.detected && proxy.implementation && proxy.implementation.source !== 'UNKNOWN') {
       implNode = 'impl_main';
       nodes.push({ id: implNode, type: 'IMPLEMENTATION', address: proxy.implementation.address, source: proxy.implementation.source, confidence: proxy.implementation.confidence });
       if (proxyNode) edges.push({ from: proxyNode, to: implNode, type: 'IMPLEMENTS' });
     }
 
     var adminNode = null;
-    if (proxy.admin && proxy.admin.source !== 'UNKNOWN') {
+    if (proxy.detected && proxy.admin && proxy.admin.source !== 'UNKNOWN') {
       adminNode = 'admin_main';
       nodes.push({ id: adminNode, type: 'ADMIN', address: proxy.admin.address, source: proxy.admin.source, confidence: proxy.admin.confidence });
       if (proxyNode) edges.push({ from: proxyNode, to: adminNode, type: 'CONTROLLED_BY' });
@@ -2296,7 +2323,7 @@
         }));
       }
     }
-    if (proxy.implementation && proxy.implementation.address) {
+    if (proxy.detected && proxy.implementation && proxy.implementation.address) {
       ctx.findings.push(createFinding({
         id: 'implementation-changeable', category: 'proxy', severity: 'INFO', confidence: proxy.implementation.confidence === 'CONFIRMED' ? 'HIGH' : 'MEDIUM', exploitability: 0.2,
         title: 'Implementation address detected',
@@ -2545,6 +2572,7 @@
     analyzeProxyUpgradeability: analyzeProxyUpgradeability,
     classifyUpgradeAuthorization: classifyUpgradeAuthorization,
     detectMinimalProxy: detectMinimalProxy,
+    isPlausibleContractAddress: isPlausibleContractAddress,
     bytecodeHash: bytecodeHash,
     analyze: analyze,
     auditContract: auditContract,

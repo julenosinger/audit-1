@@ -244,7 +244,7 @@ test('payload carries proxy/upgradeability evidence', function () {
   assert.ok(p.analysis.upgradeAuthorization);
   assert.ok(p.analysis.delegatecallEvidence);
   assert.ok(p.analysis.proxyStorageEvidence);
-  assert.equal(p.version, '8.0.0');
+  assert.equal(p.version, '8.1.0');
 });
 
 // ── Limits / honesty ─────────────────────────────────────────────────────────
@@ -260,6 +260,54 @@ test('benign bytecode => NONE proxy, no upgrade functions', function () {
   var p = proxyFor(r);
   assert.equal(p.proxyType, 'NONE');
   assert.equal(p.upgradeFunctions.length, 0);
+});
+
+// ── Phase 7.1: proxy false-positive fix ──────────────────────────────────────
+
+test('isPlausibleContractAddress rejects zero / all-FF / malformed', function () {
+  assert.equal(Engine.isPlausibleContractAddress('0x' + '0'.repeat(40)), false);
+  assert.equal(Engine.isPlausibleContractAddress('0x' + 'f'.repeat(40)), false);
+  assert.equal(Engine.isPlausibleContractAddress('0x123'), false);
+  assert.equal(Engine.isPlausibleContractAddress('0x' + 'ab'.repeat(20)), true);
+  assert.equal(Engine.isPlausibleContractAddress(null), false);
+});
+
+test('PUSH20 all-FF is NOT reported as an implementation address', function () {
+  var r = Engine.analyze('f4' + push20('f'.repeat(40)));
+  var p = proxyFor(r);
+  assert.equal(p.implementation.address, null, '0xffff…ffff must never be an implementation');
+  var f = r.findings.filter(function (x) { return x.id === 'implementation-changeable'; });
+  assert.equal(f.length, 0, 'no implementation finding for sentinel address');
+});
+
+test('PUSH20 zero address is NOT reported as an implementation address', function () {
+  var r = Engine.analyze('f4' + push20('0'.repeat(40)));
+  var p = proxyFor(r);
+  assert.equal(p.implementation.address, null);
+});
+
+test('random PUSH20 without DELEGATECALL is NOT implementation evidence', function () {
+  var r = Engine.analyze(push20('ab'.repeat(20)));
+  var p = proxyFor(r);
+  assert.equal(p.implementation.address, null, 'bare PUSH20 must not become implementation');
+  var f = r.findings.filter(function (x) { return x.id === 'implementation-changeable'; });
+  assert.equal(f.length, 0);
+});
+
+test('PUSH20 + DELEGATECALL => weak (INFERRED) implementation, not CONFIRMED', function () {
+  var r = Engine.analyze('f4' + push20('ab'.repeat(20)));
+  var p = proxyFor(r);
+  assert.equal(p.implementation.address, '0x' + 'ab'.repeat(20));
+  assert.equal(p.implementation.confidence, 'INFERRED');
+  assert.notEqual(p.implementation.confidence, 'CONFIRMED');
+});
+
+test('valid EIP-1967 / EIP-1167 still produce implementation evidence', function () {
+  var e1967 = Engine.analyze('f4' + push32(IMPL_SLOT));
+  assert.ok(proxyFor(e1967).implementation.source.indexOf('implementation slot') !== -1);
+
+  var e1167 = Engine.analyze(minimalProxy('cd'.repeat(20)));
+  assert.equal(proxyFor(e1167).implementation.confidence, 'CONFIRMED');
 });
 
 console.log('\nAll audit-proxy tests completed.');

@@ -291,10 +291,14 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     <div class="topbar-center">
       <div class="topbar-pill">Audits: <span id="navTotal">0</span></div>
       <div class="topbar-pill">Session: <span id="navSession">0</span></div>
-      <div class="topbar-pill" title="Network of the contract being audited">
+      <div class="topbar-pill" title="Optional audit network override — networks are auto-detected from the address">
         Audit Network:
         <select id="auditNetworkSelect" onchange="onAuditNetworkChange(this.value)" style="background:transparent;border:none;color:inherit;cursor:pointer;font:inherit;max-width:130px;">
           <option value="ethereum">Ethereum</option>
+          <option value="bsc">BNB Chain</option>
+          <option value="base">Base</option>
+          <option value="arbitrum">Arbitrum</option>
+          <option value="optimism">Optimism</option>
           <option value="genlayerStudionet">GenLayer Studionet</option>
           <option value="genlayerBradbury">GenLayer Bradbury</option>
         </select>
@@ -1178,6 +1182,97 @@ async function auditAddressLocal(address, networkId, net) {
   return { result, net };
 }
 
+// ── Automatic network discovery → audit (Phase 7.1) ─────────────────────────
+// Paste address → discover which supported network holds the bytecode → audit.
+// Never assumes Ethereum and never silently falls back to it.
+async function discoverAndAudit(address) {
+  if (!window.AuditAINetworks || typeof window.AuditAINetworks.discoverContract !== 'function') {
+    await auditDiscoveredAddress(address, auditNetworkId);
+    return;
+  }
+  showTyping();
+  let disc;
+  try {
+    disc = await window.AuditAINetworks.discoverContract(address);
+  } catch (e) {
+    removeTyping();
+    appendAIMessage('⚠️ **RPC_ERROR** — network discovery failed: ' + (e && e.message ? e.message : e));
+    return;
+  }
+  removeTyping();
+
+  if (disc.ok === false) {
+    appendAIMessage('⚠️ **INVALID_ADDRESS** — `' + address + '` is not a valid EVM address.');
+    return;
+  }
+
+  if (disc.matchCount === 0) {
+    const diag = disc.diagnostics.map(function (d) {
+      const status = d.contractType === 'RPC_ERROR' ? 'RPC error' : 'Not found';
+      return '• **' + d.networkName + '** (chain ' + d.chainId + ') — ' + status;
+    }).join('\n');
+    appendAIMessage('❌ **No contract bytecode was found on the supported networks.**\n\n' + diag + '\n\nNo security conclusion can be made.');
+    return;
+  }
+
+  if (disc.matchCount === 1) {
+    await auditDiscoveredAddress(address, disc.matches[0].networkId);
+    return;
+  }
+
+  const chips = disc.matches.map(function (m) {
+    return '<button class="wchip" onclick="auditDiscoveredAddress(\'' + address + '\', \'' + m.networkId + '\')">' + m.networkName + '</button>';
+  }).join(' ');
+  appendAIMessage('⚠️ **Contract found on multiple networks.**\n\nChoose which deployment to audit:\n\n' + chips);
+}
+
+async function auditDiscoveredAddress(address, networkId) {
+  const net = window.AuditAINetworks ? window.AuditAINetworks.getNetwork(networkId) : null;
+  showTyping();
+  try {
+    const { result, net: n } = await auditAddressLocal(address, networkId, net);
+    removeTyping();
+    renderAuditResult(address, networkId, result, n);
+  } catch (e) {
+    removeTyping();
+    appendAIMessage('⚠️ Audit failed: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function renderAuditResult(address, networkId, result, net) {
+  const cardHtml = buildResultCard(result, address, networkId);
+  const risk = result.risk || {};
+  const notable = (result.findings||[]).filter(f=>f.severity==='HIGH'||f.severity==='CRITICAL'||f.severity==='MEDIUM').length;
+  const netName = (net && net.name) || result.networkName || 'Unknown';
+  const chainId = result.chainId || (net && net.chainId);
+  const hasBytecode = result.bytecodeAvailable === true;
+  const contractType = result.contractType || (result.contract && result.contract.type) || 'Unknown';
+
+  let header = `Audit complete for \`${address.slice(0,10)}…\`\n\n` +
+    `**Network:** ${netName}\n` +
+    `**Chain ID:** ${chainId !== null && chainId !== undefined ? chainId : '—'}\n` +
+    `**Contract:** ${contractType === 'CONTRACT' ? 'Contract' : contractType}\n` +
+    `**Local analysis:** ${hasBytecode ? (result.analysisCompleteness || 'Complete') : 'Limited (no bytecode)'}`;
+
+  let body = `**Risk level:** ${risk.level || result.verdict || '—'}`;
+  if (hasBytecode) {
+    body += ` (score ${risk.score ?? result.score}/100, confidence ${risk.confidence || 'LOW'})`;
+  } else {
+    body += ` (confidence ${risk.confidence || 'LOW'})`;
+  }
+  body += `\n\n${result.summary || result.analysis || ''}\n\n`;
+
+  if (!hasBytecode) {
+    body += `⚠️ **No bytecode was available on the selected network.**\nNo security conclusion can be made.`;
+  } else if (notable > 0) {
+    body += `⚠️ **${notable} notable finding${notable>1?'s':''}** — review the card for evidence and recommendations.`;
+  } else {
+    body += `No known issues detected by the local static analyzer.`;
+  }
+
+  appendAIMessage(header + '\n\n' + body, cardHtml);
+}
+
 async function auditAddressClaude(address, networkId, net) {
   const chainName = net ? net.name : (networkId || 'Ethereum');
   const chainId = net ? net.chainId : null;
@@ -1298,46 +1393,8 @@ async function handleInput() {
   if (intent.isCreate)    { document.getElementById('sendBtn').disabled = false; await handleCreateContract(text); return; }
 
   if (intent.isAudit) {
-    showTyping();
-    try {
-      const { result, net } = await auditAddress(intent.address, intent.networkId);
-      removeTyping();
-      const cardHtml = buildResultCard(result, intent.address, intent.networkId);
-      const risk = result.risk || {};
-      const notable = (result.findings||[]).filter(f=>f.severity==='HIGH'||f.severity==='CRITICAL'||f.severity==='MEDIUM').length;
-      const netName = (net && net.name) || result.networkName || 'Unknown';
-      const chainId = result.chainId || (net && net.chainId);
-      const hasBytecode = result.bytecodeAvailable === true;
-      const contractType = result.contractType || (result.contract && result.contract.type) || 'Unknown';
-
-      let header = `Audit complete for \`${intent.address.slice(0,10)}…\`\n\n` +
-        `**Network:** ${netName}\n` +
-        `**Chain ID:** ${chainId !== null && chainId !== undefined ? chainId : '—'}\n` +
-        `**Contract:** ${contractType === 'CONTRACT' ? 'Contract' : contractType}\n` +
-        `**Local analysis:** ${hasBytecode ? (result.analysisCompleteness || 'Complete') : 'Limited (no bytecode)'}`;
-
-      let body = `**Risk level:** ${risk.level || result.verdict || '—'}`;
-      if (hasBytecode) {
-        body += ` (score ${risk.score ?? result.score}/100, confidence ${risk.confidence || 'LOW'})`;
-      } else {
-        body += ` (confidence ${risk.confidence || 'LOW'})`;
-      }
-      body += `\n\n${result.summary || result.analysis || ''}\n\n`;
-
-      if (!hasBytecode) {
-        body += `⚠️ **No bytecode was available on the selected network.**\nNo security conclusion can be made.`;
-      } else if (notable > 0) {
-        body += `⚠️ **${notable} notable finding${notable>1?'s':''}** — review the card for evidence and recommendations.`;
-      } else {
-        body += `No known issues detected by the local static analyzer.`;
-      }
-
-      appendAIMessage(header + '\n\n' + body, cardHtml);
-    } catch(e) {
-      removeTyping();
-      appendAIMessage(`⚠️ Audit failed: ${e.message}`);
-    }
     document.getElementById('sendBtn').disabled = false;
+    await discoverAndAudit(intent.address);
     return;
   }
 

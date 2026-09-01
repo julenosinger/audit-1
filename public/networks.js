@@ -27,36 +27,65 @@
 })(function () {
   'use strict';
 
-  // ── Authoritative network registry ─────────────────────────────────────────
-  // Ethereum + the GenLayer networks. RPC URLs are the ones already present in
-  // the project (Ethereum public RPC from index.html, GenLayer RPCs from
-  // genlayer-client.js). Nothing is invented here.
+  // ── Authoritative network registry (single source of truth) ───────────────
+  // Order matters: discovery probes in this order. RPC URLs are the official /
+  // public endpoints (existing project RPCs where available; BSC + Optimism use
+  // public endpoints). Nothing is invented.
   var NETWORKS = {
     ethereum: {
-      id: 'ethereum',
-      name: 'Ethereum',
-      chainId: 1,
+      id: 'ethereum', name: 'Ethereum', chainId: 1,
       rpc: 'https://ethereum-rpc.publicnode.com',
-      explorer: 'https://etherscan.io/address/'
+      explorer: 'https://etherscan.io/address/', explorerName: 'Etherscan',
+      type: 'mainnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: false, genLayerContract: '',
+      nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }
+    },
+    bsc: {
+      id: 'bsc', name: 'BNB Smart Chain', chainId: 56,
+      rpc: 'https://bsc-rpc.publicnode.com',
+      explorer: 'https://bscscan.com/address/', explorerName: 'BscScan',
+      type: 'mainnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: false, genLayerContract: '',
+      nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 }
+    },
+    base: {
+      id: 'base', name: 'Base', chainId: 8453,
+      rpc: 'https://mainnet.base.org',
+      explorer: 'https://basescan.org/address/', explorerName: 'BaseScan',
+      type: 'mainnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: false, genLayerContract: '',
+      nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }
+    },
+    arbitrum: {
+      id: 'arbitrum', name: 'Arbitrum One', chainId: 42161,
+      rpc: 'https://arb1.arbitrum.io/rpc',
+      explorer: 'https://arbiscan.io/address/', explorerName: 'Arbiscan',
+      type: 'mainnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: false, genLayerContract: '',
+      nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }
+    },
+    optimism: {
+      id: 'optimism', name: 'Optimism', chainId: 10,
+      rpc: 'https://mainnet.optimism.io',
+      explorer: 'https://optimistic.etherscan.io/address/', explorerName: 'Optimistic Etherscan',
+      type: 'mainnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: false, genLayerContract: '',
+      nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }
     },
     genlayerStudionet: {
-      id: 'genlayerStudionet',
-      name: 'GenLayer Studionet',
-      chainId: 61999,
+      id: 'genlayerStudionet', name: 'GenLayer Studionet', chainId: 61999,
       rpc: 'https://studio.genlayer.com/api',
-      explorer: null
+      explorer: null, explorerName: null,
+      type: 'testnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: true,
+      genLayerContract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B',
+      nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 }
     },
     genlayerBradbury: {
-      id: 'genlayerBradbury',
-      name: 'GenLayer Bradbury',
-      chainId: 4221,
+      id: 'genlayerBradbury', name: 'GenLayer Bradbury', chainId: 4221,
       rpc: 'https://rpc-bradbury.genlayer.com',
-      explorer: null
+      explorer: null, explorerName: null,
+      type: 'testnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: true, genLayerContract: '',
+      nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 }
     }
   };
 
   var DEFAULT_NETWORK_ID = 'ethereum';
-  var NETWORK_IDS = ['ethereum', 'genlayerStudionet', 'genlayerBradbury'];
+  var NETWORK_IDS = ['ethereum', 'bsc', 'base', 'arbitrum', 'optimism', 'genlayerStudionet', 'genlayerBradbury'];
 
   // GenLayer *audit* networks that map 1:1 onto a GenLayer execution network id.
   var GENLAYER_NETWORK_MAP = {
@@ -293,6 +322,93 @@
     };
   }
 
+  // ── Automatic contract-network discovery (Phase 7.1) ───────────────────────
+  // Address → probe enabled networks (parallel, bounded concurrency, per-network
+  // error isolation + timeout) → eth_getCode → classify. Never assumes Ethereum;
+  // never silently falls back. Bytecode cache is keyed by chainId:address.
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; reject(new Error('TIMEOUT')); } }, ms);
+      promise.then(function (v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+        function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+    });
+  }
+
+  async function discoverContract(address, opts) {
+    opts = opts || {};
+    var norm = normalizeAddress(address);
+    if (!norm.valid) {
+      return { ok: false, error: 'INVALID_ADDRESS', found: false, matchCount: 0, matches: [], diagnostics: [], address: String(address || '') };
+    }
+    var normalized = norm.address;
+    var timeoutMs = opts.timeoutMs || 8000;
+    var concurrency = opts.concurrency || 4;
+    var verifyChainId = (opts.verifyChainId === undefined) ? true : !!opts.verifyChainId;
+
+    var ids = NETWORK_IDS.filter(function (id) { return NETWORKS[id].enabled !== false; });
+
+    var results = [];
+    var cursor = 0;
+    var workers = [];
+    var workerCount = Math.max(1, Math.min(concurrency, ids.length));
+    for (var w = 0; w < workerCount; w++) {
+      workers.push((function () {
+        return (async function () {
+          while (true) {
+            var idx = cursor++;
+            if (idx >= ids.length) break;
+            var net = NETWORKS[ids[idx]];
+            var entry = {
+              networkId: net.id, networkName: net.name, chainId: net.chainId,
+              explorer: net.explorer || null, explorerName: net.explorerName || null,
+              contractType: 'RPC_ERROR', bytecodeAvailable: false, code: null, error: null
+            };
+            try {
+              var code = await withTimeout(getCode(net.rpc, normalized, net.chainId, { useCache: true }), timeoutMs);
+              if (hexLength(code) > 0) {
+                if (verifyChainId) {
+                  var actual = await withTimeout(rpcChainId(net.rpc), timeoutMs);
+                  if (actual !== net.chainId) {
+                    entry.contractType = 'NETWORK_CHAIN_ID_MISMATCH';
+                    entry.error = 'chainId ' + actual + ' != ' + net.chainId;
+                    results.push(entry);
+                    continue;
+                  }
+                }
+                entry.contractType = 'CONTRACT';
+                entry.bytecodeAvailable = true;
+                entry.code = code;
+              } else {
+                entry.contractType = 'NOT_FOUND';
+              }
+            } catch (e) {
+              entry.contractType = 'RPC_ERROR';
+              entry.error = String((e && e.message) || e);
+            }
+            results.push(entry);
+          }
+        })();
+      })());
+    }
+    await Promise.all(workers);
+
+    var byId = {};
+    results.forEach(function (r) { byId[r.networkId] = r; });
+    var ordered = ids.map(function (id) { return byId[id]; }).filter(Boolean);
+
+    var matches = ordered.filter(function (r) { return r.contractType === 'CONTRACT'; });
+
+    return {
+      ok: true,
+      found: matches.length > 0,
+      matchCount: matches.length,
+      matches: matches,
+      diagnostics: ordered,
+      address: normalized
+    };
+  }
+
   return {
     NETWORKS: NETWORKS,
     DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
@@ -313,6 +429,8 @@
     clearCodeCache: clearCodeCache,
     probeAccount: probeAccount,
     classifyContract: classifyContract,
-    auditContext: auditContext
+    auditContext: auditContext,
+    discoverContract: discoverContract,
+    withTimeout: withTimeout
   };
 });
