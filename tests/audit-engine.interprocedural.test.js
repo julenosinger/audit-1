@@ -21,7 +21,7 @@ test('bytecodeHash is deterministic and content-sensitive', function () {
 
 test('analyze produces versioned payload with evidence graph', function () {
   var r = Engine.analyze('600054f16000600155', { address: '0x' + 'ab'.repeat(20) });
-  assert.equal(r.analysisVersion, '5.0.0');
+  assert.equal(r.analysisVersion, '6.0.0');
   assert.ok(r.bytecodeHash);
   assert.ok(r.payload);
   assert.equal(r.payload.contract.bytecodeHash, r.bytecodeHash);

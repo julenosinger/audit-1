@@ -40,7 +40,7 @@
 })(function () {
   'use strict';
 
-  var VERSION = '4.0.0';
+  var VERSION = '5.0.0';
 
   // ── 1. EVM opcode table ────────────────────────────────────────────────────
   // name -> { byte, imm } where imm is the number of immediate data bytes.
@@ -907,7 +907,7 @@
 
   function buildAuditPayload(result) {
     return {
-      version: '5.0.0',
+      version: '6.0.0',
       contract: {
         address: result.contract.address,
         chainId: result.contract.chainId,
@@ -927,6 +927,9 @@
           reentrancy: result.dataFlow.reentrancy,
           reentrancyGuard: result.dataFlow.reentrancyGuard
         },
+        privilegedOperations: result.privilegedOperations,
+        accessControlSummary: result.accessControlSummary,
+        privilegeGraph: result.privilegeGraph,
         evidenceGraph: result.evidenceGraph
       },
       findings: result.findings
@@ -1087,6 +1090,30 @@
     beacon: 'a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50'
   };
 
+  // ── Privileged operation catalog (extensible) ───────────────────────────────
+  // Each entry describes WHAT may be a privileged capability — never a security
+  // conclusion. `selectors` are well-known 4-byte signatures; `abiPattern`
+  // provides ABI-name evidence when a source ABI is supplied. Authorization is
+  // always computed separately (see analyzePrivilegedOperations).
+  var PRIVILEGED_CATALOG = [
+    { operation: 'MINT', category: 'supply', selectors: { 'mint(address,uint256)': '40c10f19', 'mint(uint256)': 'a0712d68', 'mintTo(address,uint256)': '449a52f8' }, abiPattern: /^mint|mint$|_mint|mintTo|increaseSupply/i },
+    { operation: 'BURN', category: 'supply', selectors: { 'burn(uint256)': '42966c68', 'burnFrom(address,uint256)': '79cc6790' }, abiPattern: /^burn|burn$|_burn|burnFrom|decreaseSupply/i },
+    { operation: 'PAUSE', category: 'lifecycle', selectors: { 'pause()': '8456cb59' }, abiPattern: /^pause$/i },
+    { operation: 'UNPAUSE', category: 'lifecycle', selectors: { 'unpause()': '3f4ba83a' }, abiPattern: /^unpause$/i },
+    { operation: 'BLACKLIST', category: 'restriction', selectors: {}, abiPattern: /blacklist|unblacklist|isBlacklisted|setBlacklist/i },
+    { operation: 'WHITELIST', category: 'restriction', selectors: {}, abiPattern: /whitelist|setWhitelist|isWhitelisted/i },
+    { operation: 'SET_FEE', category: 'economics', selectors: {}, abiPattern: /setFee|setFees|setTax|setBuyTax|setSellTax|setTradingFee|setTransferFee/i },
+    { operation: 'SET_LIMIT', category: 'economics', selectors: {}, abiPattern: /setMaxTx|setMaxWallet|setTransactionLimit|setWalletLimit|maxTxAmount/i },
+    { operation: 'SET_TRADING', category: 'lifecycle', selectors: {}, abiPattern: /setTrading|enableTrading|setTradingEnabled/i },
+    { operation: 'TRANSFER_OWNERSHIP', category: 'ownership', selectors: { 'transferOwnership(address)': 'f2fde38b' }, abiPattern: /^transferOwnership$/i },
+    { operation: 'RENOUNCE_OWNERSHIP', category: 'ownership', selectors: { 'renounceOwnership()': '715018a6' }, abiPattern: /^renounceOwnership$/i },
+    { operation: 'GRANT_ROLE', category: 'roles', selectors: { 'grantRole(bytes32,address)': '2f2ff15d' }, abiPattern: /^grantRole$/i },
+    { operation: 'REVOKE_ROLE', category: 'roles', selectors: { 'revokeRole(bytes32,address)': 'd547741f' }, abiPattern: /^revokeRole$/i },
+    { operation: 'RENOUNCE_ROLE', category: 'roles', selectors: { 'renounceRole(bytes32,address)': '36568abe' }, abiPattern: /^renounceRole$/i },
+    { operation: 'UPGRADE_IMPLEMENTATION', category: 'proxy', selectors: { 'upgradeTo(address)': '3659cfe6', 'upgradeToAndCall(address,bytes)': '4f1ef286' }, abiPattern: /upgradeTo|upgradeImplementation|setImplementation|^upgrade$/i },
+    { operation: 'CHANGE_PROXY_ADMIN', category: 'proxy', selectors: { 'changeAdmin(address)': '8f283970' }, abiPattern: /^changeAdmin$/i }
+  ];
+
   // ── 6. Rules ───────────────────────────────────────────────────────────────
 
   function collectSelectors(instructions) {
@@ -1127,6 +1154,165 @@
   function hasAbiFn(abi, pattern) {
     var names = abiFnNames(abi);
     return Object.keys(names).some(function (n) { return pattern.test(n); });
+  }
+
+  // ── Privileged Operations & Access Control Analyzer (Phase 6) ──────────────
+  // Answers "WHO can perform the privileged actions?" by correlating each
+  // detected privileged function with the strongest available evidence
+  // (function map + CFG reachability + data-flow control dependencies).
+  // It NEVER fabricates an owner/role/admin and keeps UNKNOWN honest.
+
+  function analyzePrivilegedOperations(ctx, functionGraph, functionMap, dataFlow) {
+    var operations = [];
+    var gatedByCaller = {};       // blockId -> true (jump-true target gated by a CALLER comparison)
+    var blocksWithCallerCmp = {}; // blockId -> true (block contains a CALLER comparison)
+    var writesByBlock = {};       // blockId -> true (block contains a storage write)
+
+    (dataFlow.controlDependencies || []).forEach(function (cd) {
+      if (typeof cd.gatedBy === 'string' && cd.gatedBy.indexOf('CALLER') === 0) gatedByCaller[cd.blockId] = true;
+    });
+    (dataFlow.comparisons || []).forEach(function (c) {
+      if ((c.left && c.left.source === 'CALLER') || (c.right && c.right.source === 'CALLER')) blocksWithCallerCmp[c.blockId] = true;
+    });
+    (dataFlow.storageWrites || []).forEach(function (w) { writesByBlock[w.blockId] = true; });
+
+    var blockFn = functionGraph.blockFn || {};
+    var entryToId = functionGraph.entryToId || {};
+
+    var hasOwnershipSignal = !!ctx.selectors[OWNABLE_SELECTORS.owner] || !!ctx.selectors[OWNABLE_SELECTORS.transferOwnership];
+    var hasRoleSignal = countHits(ctx.selectors, ACCESS_CONTROL_SELECTORS) >= 1;
+
+    function ownedBlockIds(fnId) {
+      var ids = [];
+      Object.keys(blockFn).forEach(function (bid) { if (blockFn[bid] === fnId) ids.push(parseInt(bid, 10)); });
+      return ids;
+    }
+
+    function classify(fnId) {
+      var owned = fnId ? ownedBlockIds(fnId) : [];
+      var stateWriteGated = false, anyGated = false, callerCmp = false;
+      owned.forEach(function (bid) {
+        if (gatedByCaller[bid]) { anyGated = true; if (writesByBlock[bid]) stateWriteGated = true; }
+        if (blocksWithCallerCmp[bid]) callerCmp = true;
+      });
+      if (stateWriteGated) return { status: 'CONFIRMED_RESTRICTED', confidence: 'HIGH' };
+      if (anyGated) return { status: 'LIKELY_RESTRICTED', confidence: 'MEDIUM' };
+      if (callerCmp) return { status: 'INFERRED_RESTRICTED', confidence: 'LOW' };
+      // No positive gate evidence => UNKNOWN. We NEVER auto-assert POSSIBLY_UNRESTRICTED:
+      // a static bytecode analyzer cannot prove the *absence* of an authorization
+      // gate (e.g. a shared internal modifier, a storage-based role lookup, or a
+      // jump-table path it cannot trace). Honest UNKNOWN is the correct default.
+      return { status: 'UNKNOWN', confidence: 'LOW' };
+    }
+
+    PRIVILEGED_CATALOG.forEach(function (entry) {
+      var seen = {};
+
+      Object.keys(entry.selectors).forEach(function (name) {
+        var sel = entry.selectors[name];
+        if (!ctx.selectors[sel]) return;
+        var fm = functionMap[sel];
+        var fnId = null, entryPc = null, resolved = false;
+        if (fm && fm.entryPc !== null && fm.entryPc !== undefined) {
+          entryPc = fm.entryPc;
+          fnId = entryToId[entryPc] || null;
+          resolved = !!fnId;
+        }
+        var auth = classify(fnId);
+        var owned = fnId ? ownedBlockIds(fnId) : [];
+        var nodeId = 'privop_' + entry.operation + '_' + sel;
+        operations.push({
+          nodeId: nodeId,
+          operation: entry.operation,
+          category: entry.category,
+          function: name,
+          selector: '0x' + sel,
+          functionId: fnId,
+          reachability: resolved ? 'REACHABLE' : 'UNRESOLVED',
+          authorization: { status: auth.status, confidence: auth.confidence, evidence: [] },
+          accessControl: auth.status,
+          storageWrites: fnId ? owned.filter(function (bid) { return writesByBlock[bid]; }).length : 0,
+          externalCalls: 0,
+          controlDependencies: owned.filter(function (bid) { return gatedByCaller[bid]; }),
+          confidence: auth.confidence,
+          source: 'SELECTOR',
+          evidence: resolved
+            ? [{ kind: 'OBSERVED', text: 'selector ' + name + ' (0x' + sel + ') resolved to a function entry' }]
+            : [{ kind: 'OBSERVED', text: 'selector ' + name + ' (0x' + sel + ') present (entry unresolved)' }]
+        });
+        seen[name] = true;
+      });
+
+      if (entry.abiPattern && ctx.abi) {
+        Object.keys(abiFnNames(ctx.abi)).forEach(function (n) {
+          if (!entry.abiPattern.test(n) || seen[n]) return;
+          operations.push({
+            nodeId: 'privop_' + entry.operation + '_' + n.replace(/[^a-zA-Z0-9]/g, '_'),
+            operation: entry.operation,
+            category: entry.category,
+            function: n,
+            selector: null,
+            functionId: null,
+            reachability: 'ABI',
+            authorization: { status: 'UNKNOWN', confidence: 'LOW', evidence: [] },
+            accessControl: 'UNKNOWN',
+            storageWrites: 0,
+            externalCalls: 0,
+            controlDependencies: [],
+            confidence: 'LOW',
+            source: 'ABI',
+            evidence: [{ kind: 'OBSERVED', text: 'function ' + n + ' declared in ABI' }]
+          });
+          seen[n] = true;
+        });
+      }
+    });
+
+    var statuses = { CONFIRMED_RESTRICTED: 0, LIKELY_RESTRICTED: 0, INFERRED_RESTRICTED: 0, UNKNOWN: 0, POSSIBLY_UNRESTRICTED: 0 };
+    operations.forEach(function (o) { statuses[o.accessControl] = (statuses[o.accessControl] || 0) + 1; });
+
+    var summary = {
+      ownership: hasOwnershipSignal ? 'Detected' : 'Unknown',
+      roleBased: hasRoleSignal ? 'Detected' : 'Unknown',
+      privilegedFunctions: operations.length,
+      confirmedRestricted: statuses.CONFIRMED_RESTRICTED,
+      likelyRestricted: statuses.LIKELY_RESTRICTED,
+      inferredRestricted: statuses.INFERRED_RESTRICTED,
+      restricted: statuses.CONFIRMED_RESTRICTED + statuses.LIKELY_RESTRICTED + statuses.INFERRED_RESTRICTED,
+      unknown: statuses.UNKNOWN,
+      potentiallyUnrestricted: statuses.POSSIBLY_UNRESTRICTED
+    };
+
+    // Privilege graph: AUTHORITY/ROLE → AUTHORIZATION_GATE → PRIVILEGED_OPERATION.
+    var nodes = [], edges = [];
+    var authorityNode = null, gateNode = null;
+    if (hasRoleSignal) { authorityNode = 'priv_authority_roles'; nodes.push({ id: authorityNode, type: 'ROLE', label: 'AccessControl-like roles (specific roles UNKNOWN)' }); }
+    else if (hasOwnershipSignal) { authorityNode = 'priv_authority_owner'; nodes.push({ id: authorityNode, type: 'ROLE', label: 'Ownable owner (address UNKNOWN)' }); }
+    if ((dataFlow.accessControl || []).length) { gateNode = 'priv_gate'; nodes.push({ id: gateNode, type: 'AUTHORIZATION_GATE', label: 'CALLER comparison gate(s)' }); }
+
+    operations.forEach(function (o) {
+      nodes.push({ id: o.nodeId, type: 'PRIVILEGED_OPERATION', operation: o.operation, function: o.function, accessControl: o.accessControl });
+      if (authorityNode) edges.push({ from: authorityNode, to: o.nodeId, type: 'MAY_CONTROL' });
+      if (gateNode && (o.accessControl === 'CONFIRMED_RESTRICTED' || o.accessControl === 'LIKELY_RESTRICTED' || o.accessControl === 'INFERRED_RESTRICTED')) {
+        edges.push({ from: gateNode, to: o.nodeId, type: 'CONTROLS' });
+      }
+    });
+
+    return { operations: operations, summary: summary, graph: { nodes: nodes, edges: edges } };
+  }
+
+  function extendEvidenceGraphWithPrivileges(evidenceGraph, priv) {
+    if (!evidenceGraph || !priv) return evidenceGraph;
+    var nodes = (evidenceGraph.nodes || []).slice();
+    var edges = (evidenceGraph.edges || []).slice();
+    (priv.graph.nodes || []).forEach(function (n) {
+      nodes.push({ id: n.id, type: n.type, operation: n.operation, function: n.function, accessControl: n.accessControl, label: n.label });
+    });
+    (priv.graph.edges || []).forEach(function (e) { edges.push({ from: e.from, to: e.to, type: e.type }); });
+    priv.operations.forEach(function (o) {
+      if (o.functionId) edges.push({ from: o.nodeId, to: o.functionId, type: 'TARGETS' });
+    });
+    return { nodes: nodes, edges: edges };
   }
 
   function ruleBytecodeSize(ctx) {
@@ -1585,7 +1771,7 @@
     var bodyLen = hex.length / 2;
     result.contract.bytecodeSize = bodyLen;
     result.bytecodeHash = bytecodeHash(hex);
-    result.analysisVersion = '5.0.0';
+    result.analysisVersion = '6.0.0';
 
     // Control-flow analysis.
     var cfg = buildCfg(dis.instructions);
@@ -1698,6 +1884,26 @@
     rulePauseBlacklistFees(ctx);
     ruleDataFlow(ctx);
 
+    // Privileged Operations & Access Control Analyzer (Phase 6).
+    var priv = analyzePrivilegedOperations(ctx, functionGraph, functionMap, dataFlow);
+    result.privilegedOperations = priv.operations;
+    result.accessControlSummary = priv.summary;
+    result.privilegeGraph = priv.graph;
+    if (priv.operations.length) {
+      ctx.findings.push(createFinding({
+        id: 'privileged-operations-summary', category: 'privileged-operations', severity: 'INFO', confidence: 'MEDIUM', exploitability: 0,
+        title: priv.summary.privilegedFunctions + ' privileged capabilities detected',
+        description: 'The contract exposes ' + priv.summary.privilegedFunctions + ' privileged functions. ' +
+          'Restricted: ' + priv.summary.restricted + ' (confirmed ' + priv.summary.confirmedRestricted + ', likely ' + priv.summary.likelyRestricted + ', inferred ' + priv.summary.inferredRestricted + '). ' +
+          'Unknown authorization: ' + priv.summary.unknown + '. Potentially unrestricted: ' + priv.summary.potentiallyUnrestricted + '. ' +
+          'A capability is not a vulnerability — see the Privileged Operations view for per-function access-control classification.',
+        evidence: priv.operations.slice(0, 6).map(function (o) {
+          return { kind: 'OBSERVED', text: o.operation + ' via ' + o.function + ' — access ' + o.accessControl };
+        }),
+        recommendation: 'Review the authorization for each privileged function; UNKNOWN means it could not be determined, not that it is safe.'
+      }));
+    }
+
     // Unreachable/dead code note.
     if (cfg.stats.deadInstructions > 0) {
       var deadInteresting = [];
@@ -1721,6 +1927,7 @@
     });
 
     result.evidenceGraph = buildEvidenceGraph(cfg, functionMap, dataFlow, result.findings, functionGraph);
+    result.evidenceGraph = extendEvidenceGraphWithPrivileges(result.evidenceGraph, priv);
     result.evidenceIds = collectEvidenceIds(result.evidenceGraph);
 
     result.risk = assessRisk(result.findings, completeness);
@@ -1749,6 +1956,10 @@
     } else {
       var top = significant.slice(0, 3).map(function (f) { return f.title; }).join('; ');
       s += ' Top signals: ' + top + '.';
+    }
+    var acs = result.accessControlSummary;
+    if (acs && acs.privilegedFunctions > 0) {
+      s += ' Privileged capabilities: ' + acs.privilegedFunctions + ' (restricted ' + acs.restricted + ', unknown ' + acs.unknown + ', potentially unrestricted ' + acs.potentiallyUnrestricted + ').';
     }
     if (risk.level === 'LIMITED ANALYSIS') {
       s += ' Analysis is limited (no or invalid bytecode) — no conclusion about safety is made.';

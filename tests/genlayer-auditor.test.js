@@ -41,7 +41,7 @@ function validResponse() {
 test('buildPayload uses engine payload when present', function () {
   var r = Engine.analyze('600054f16000600155');
   var p = Auditor.buildPayload(r);
-  assert.equal(p.version, '5.0.0');
+  assert.equal(p.version, '6.0.0');
   assert.ok(p.analysis.evidenceGraph);
 });
 

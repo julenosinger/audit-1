@@ -259,10 +259,20 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   .messages{padding:16px 12px}
   .msg-content{max-width:100%}
   .result-card,.portfolio-card,.approve-card{max-width:100%}
-  .rc-header,.rc-findings,.rc-footer{padding-left:14px;padding-right:14px}
+  .rc-header,.rc-findings,.rc-footer,.rc-priv{padding-left:14px;padding-right:14px}
   .wallet-btn{padding:7px 10px;font-size:10px}
   .welcome h2{font-size:19px}
 }
+.rc-priv{padding:12px 18px;border-bottom:1px solid var(--border)}
+.rc-acs{font-family:var(--mono);font-size:9px;color:var(--muted2);margin-bottom:8px;line-height:1.6}
+.rc-priv-item{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:11px;border-bottom:1px dashed var(--border)}
+.rc-priv-item:last-child{border-bottom:none}
+.rc-priv-op{font-weight:700;min-width:84px}
+.rc-priv-fn{font-family:var(--mono);font-size:9px;color:var(--muted);flex:1;word-break:break-all}
+.rc-priv-access{font-weight:700;padding:1px 6px;border-radius:4px;border:1px solid var(--border);font-size:9px;white-space:nowrap}
+.rc-access-ok{color:var(--green);border-color:rgba(0,255,136,.25)}
+.rc-access-unknown{color:var(--yellow);border-color:rgba(245,166,35,.25)}
+.rc-access-risk{color:var(--red);border-color:rgba(255,59,59,.25)}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -729,6 +739,43 @@ function buildResultCard(data, address, chainId) {
   const tagsHtml = (data.tags||[]).map(t=>`<span class="rc-tag">${escHtml(t)}</span>`).join('');
   const shortAddr = address.slice(0,10)+'…'+address.slice(-8);
 
+  // Privileged Operations & Access Control (Phase 6).
+  const privOps = data.privilegedOperations || [];
+  const acs = data.accessControlSummary || null;
+  const accessLabel = {
+    'CONFIRMED_RESTRICTED': 'Restricted',
+    'LIKELY_RESTRICTED': 'Likely restricted',
+    'INFERRED_RESTRICTED': 'Inferred restricted',
+    'UNKNOWN': 'Unknown',
+    'POSSIBLY_UNRESTRICTED': 'Possibly unrestricted'
+  };
+  const accessCls = {
+    'CONFIRMED_RESTRICTED': 'rc-access-ok',
+    'LIKELY_RESTRICTED': 'rc-access-ok',
+    'INFERRED_RESTRICTED': 'rc-access-ok',
+    'UNKNOWN': 'rc-access-unknown',
+    'POSSIBLY_UNRESTRICTED': 'rc-access-risk'
+  };
+  let privHtml = '';
+  if (privOps.length) {
+    const acsHtml = acs
+      ? `<div class="rc-acs">Ownership: <b>${escHtml(acs.ownership)}</b> · Roles: <b>${escHtml(acs.roleBased)}</b> · Privileged: <b>${acs.privilegedFunctions}</b> · Restricted: <b>${acs.restricted}</b> · Unknown: <b>${acs.unknown}</b> · Pot. unrestricted: <b>${acs.potentiallyUnrestricted}</b></div>`
+      : '';
+    const privItems = privOps.map(o => {
+      const icon = o.accessControl === 'POSSIBLY_UNRESTRICTED' ? '⚠️' : (o.accessControl === 'UNKNOWN' ? '❓' : 'ℹ️');
+      return `<div class="rc-priv-item">
+        <span class="rc-priv-op">${icon} ${escHtml(o.operation)}</span>
+        <span class="rc-priv-fn">${escHtml(o.function)}</span>
+        <span class="rc-priv-access ${accessCls[o.accessControl] || ''}">${escHtml(accessLabel[o.accessControl] || o.accessControl)} · ${escHtml(o.confidence)}</span>
+      </div>`;
+    }).join('');
+    privHtml = `<div class="rc-priv">
+      <div class="rc-findings-title">Privileged Operations</div>
+      ${acsHtml}
+      ${privItems}
+    </div>`;
+  }
+
   const html = `<div class="result-card" data-card-addr="${address.toLowerCase()}">
     <div class="rc-header">
       <div class="rc-ring">
@@ -751,6 +798,7 @@ function buildResultCard(data, address, chainId) {
       <div class="rc-findings-title">Findings</div>
       ${findingsHtml}
     </div>
+    ${privHtml}
     <div class="rc-glstatus">
       <span class="gl-status-item">Local Analysis <span class="gl-status-badge gl-ok">Complete</span></span>
       <span class="gl-status-item">GenLayer Analysis <span class="gl-status-badge" id="gl-analysis-${address.toLowerCase()}">Not requested</span></span>

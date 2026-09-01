@@ -47,7 +47,10 @@
       bytecodeHash: result.bytecodeHash,
       analysisVersion: result.analysisVersion,
       payload: result.payload || null,
-      evidenceGraph: result.evidenceGraph || null
+      evidenceGraph: result.evidenceGraph || null,
+      privilegedOperations: result.privilegedOperations || [],
+      accessControlSummary: result.accessControlSummary || null,
+      privilegeGraph: result.privilegeGraph || null
     };
   }
 
