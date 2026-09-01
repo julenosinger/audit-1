@@ -40,8 +40,8 @@
 })(function () {
   'use strict';
 
-  var VERSION = '7.0.0';
-  var ANALYSIS_VERSION = '7.0.0';
+  var VERSION = '8.0.0';
+  var ANALYSIS_VERSION = '8.0.0';
 
   // Network registry (single source of truth) — used for the network-aware
   // fetch path. Loaded from the UMD global in the browser, or required directly
@@ -947,6 +947,14 @@
         privilegedOperations: result.privilegedOperations,
         accessControlSummary: result.accessControlSummary,
         privilegeGraph: result.privilegeGraph,
+        proxyAnalysis: result.proxyAnalysis,
+        upgradeability: result.upgradeability,
+        implementationEvidence: result.implementationEvidence,
+        adminEvidence: result.adminEvidence,
+        upgradeFunctions: result.upgradeFunctions,
+        upgradeAuthorization: result.upgradeAuthorization,
+        delegatecallEvidence: result.delegatecallEvidence,
+        proxyStorageEvidence: result.proxyStorageEvidence,
         evidenceGraph: result.evidenceGraph
       },
       findings: result.findings
@@ -1106,6 +1114,17 @@
     admin: 'b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103',
     beacon: 'a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50'
   };
+
+  // ── Proxy / upgradeability selectors (Phase 7) ─────────────────────────────
+  var UPGRADE_SELECTORS = { upgradeTo: '3659cfe6', upgradeToAndCall: '4f1ef286' };
+  var CHANGE_ADMIN_SELECTOR = '8f283970';
+  var PROXIABLE_UUID_SELECTOR = '52d1902d';
+  var IMPLEMENTATION_SELECTOR = '5c60da1b';
+  var ADMIN_SELECTOR = 'f851a440';
+  var BEACON_IMPL_SELECTOR = '0ccae318'; // beacon proxy: implementation()  (not standard; informational)
+  // EIP-1167 minimal proxy canonical runtime: 363d3d373d3d3d363d73<20-byte impl>5af43d82803e903d91602b57fd5bf3
+  var EIP1167_PREFIX = '363d3d373d3d3d363d73';
+  var EIP1167_SUFFIX = '5af43d82803e903d91602b57fd5bf3';
 
   // ── Privileged operation catalog (extensible) ───────────────────────────────
   // Each entry describes WHAT may be a privileged capability — never a security
@@ -1733,6 +1752,284 @@
     }
   }
 
+  // ── 7. Proxy & Upgradeability Intelligence (Phase 7) ──────────────────────
+  // Dedicated upgradeability analysis layer that EXTENDS the existing CFG /
+  // reachability / data-flow / privilege pipeline. It classifies proxy patterns
+  // honestly (never upgrading a heuristic into CONFIRMED) and correlates upgrade
+  // functions with the Phase 6 authorization analysis. No fabricated addresses.
+
+  // Classify the authorization of an upgrade function using the same evidence
+  // model as Phase 6: a CALLER gate that dominates a state write is the only
+  // CONFIRMED case; absence of a detected gate is UNKNOWN (never "unrestricted").
+  function classifyUpgradeAuthorization(fnId, functionGraph, dataFlow) {
+    var gatedByCaller = {}, callerCmpByBlock = {}, writesByBlock = {};
+    (dataFlow.controlDependencies || []).forEach(function (cd) {
+      if (typeof cd.gatedBy === 'string' && cd.gatedBy.indexOf('CALLER') === 0) gatedByCaller[cd.blockId] = true;
+    });
+    (dataFlow.comparisons || []).forEach(function (c) {
+      if ((c.left && c.left.source === 'CALLER') || (c.right && c.right.source === 'CALLER')) callerCmpByBlock[c.blockId] = true;
+    });
+    (dataFlow.storageWrites || []).forEach(function (w) { writesByBlock[w.blockId] = true; });
+
+    var blockFn = functionGraph.blockFn || {};
+    var owned = [];
+    if (fnId) Object.keys(blockFn).forEach(function (bid) { if (blockFn[bid] === fnId) owned.push(parseInt(bid, 10)); });
+
+    var stateWriteGated = false, anyGated = false, callerCmp = false, writes = 0;
+    owned.forEach(function (bid) {
+      if (gatedByCaller[bid]) { anyGated = true; if (writesByBlock[bid]) stateWriteGated = true; }
+      if (callerCmpByBlock[bid]) callerCmp = true;
+      if (writesByBlock[bid]) writes++;
+    });
+
+    if (stateWriteGated) return { status: 'CONFIRMED_RESTRICTED', confidence: 'HIGH', storageWrites: writes };
+    if (anyGated) return { status: 'LIKELY_RESTRICTED', confidence: 'MEDIUM', storageWrites: writes };
+    if (callerCmp) return { status: 'INFERRED_RESTRICTED', confidence: 'LOW', storageWrites: writes };
+    return { status: 'UNKNOWN', confidence: 'LOW', storageWrites: writes };
+  }
+
+  // Detect EIP-1167 minimal proxy and extract the embedded implementation.
+  function detectMinimalProxy(hex) {
+    if (!hex) return null;
+    var h = String(hex);
+    var start = h.indexOf(EIP1167_PREFIX);
+    if (start === -1) return null;
+    var addrStart = start + EIP1167_PREFIX.length;
+    var addr = h.substr(addrStart, 40);
+    if (!/^[0-9a-f]{40}$/.test(addr)) return null;
+    var rest = h.substr(addrStart + 40);
+    if (rest.slice(0, EIP1167_SUFFIX.length) !== EIP1167_SUFFIX) return null;
+    return { implementation: '0x' + addr, confidence: 'CONFIRMED', source: 'EIP-1167 embedded address' };
+  }
+
+  function analyzeProxyUpgradeability(ctx, cfg, dataFlow, functionMap, functionGraph, hex) {
+    var dels = [];
+    (ctx.instructions || []).forEach(function (ins) {
+      if (ins.opcode === 'DELEGATECALL') {
+        dels.push({ pc: ins.pc, block: ins.block, reach: ins.reach || 'UNREACHABLE' });
+      }
+    });
+
+    var selectors = ctx.selectors || {};
+    var hasImplSlot = (ctx.push32 || []).indexOf(EIP1967_SLOTS.implementation) !== -1;
+    var hasAdminSlot = (ctx.push32 || []).indexOf(EIP1967_SLOTS.admin) !== -1;
+    var hasBeaconSlot = (ctx.push32 || []).indexOf(EIP1967_SLOTS.beacon) !== -1;
+    var hasUpgradeTo = !!selectors[UPGRADE_SELECTORS.upgradeTo];
+    var hasUpgradeToAndCall = !!selectors[UPGRADE_SELECTORS.upgradeToAndCall];
+    var hasChangeAdmin = !!selectors[CHANGE_ADMIN_SELECTOR];
+    var hasProxiableUUID = !!selectors[PROXIABLE_UUID_SELECTOR];
+    var hasImplementationFn = !!selectors[IMPLEMENTATION_SELECTOR];
+    var hasAdminFn = !!selectors[ADMIN_SELECTOR];
+
+    var minimal = detectMinimalProxy(hex);
+
+    var hasDelegatecall = dels.length > 0;
+
+    // ── Delegatecall contextualization ───────────────────────────────────────
+    var delegatecall = dels.map(function (d) {
+      var context = d.reach === 'REACHABLE' ? 'reachable' : (d.reach === 'MAYBE_REACHABLE' ? 'maybe-reachable' : 'unreachable');
+      var cls = 'unreachable';
+      if (d.reach === 'REACHABLE') cls = hasImplSlot || hasAdminSlot || hasBeaconSlot || hasUpgradeTo || hasUpgradeToAndCall || hasChangeAdmin || hasProxiableUUID || minimal ? 'proxy-like' : 'external/untrusted target';
+      else if (d.reach === 'MAYBE_REACHABLE') cls = 'maybe reachable';
+      return { pc: d.pc, block: d.block, reach: d.reach, context: context, classification: cls };
+    });
+
+    // ── Implementation detection ─────────────────────────────────────────────
+    var implementation = { address: null, source: 'UNKNOWN', confidence: 'UNKNOWN' };
+    if (minimal) {
+      implementation = { address: minimal.implementation, source: minimal.source, confidence: 'CONFIRMED' };
+    } else if (hasImplSlot) {
+      implementation = { address: null, source: 'EIP-1967 implementation slot (0x' + EIP1967_SLOTS.implementation.slice(0, 8) + '…)', confidence: 'INFERRED' };
+    } else if (hasBeaconSlot) {
+      implementation = { address: null, source: 'beacon slot (implementation resolved via beacon, address not resolved)', confidence: 'UNKNOWN' };
+    } else {
+      var implCandidate = (ctx.push20 || []).filter(function (a) { return /^[0-9a-f]{40}$/.test(a) && a !== '0'.repeat(40); });
+      if (implCandidate.length) {
+        implementation = { address: '0x' + implCandidate[0], source: 'hard-coded 20-byte address constant', confidence: 'LIKELY' };
+      }
+    }
+
+    // ── Admin detection ──────────────────────────────────────────────────────
+    var admin = { address: null, source: 'UNKNOWN', confidence: 'UNKNOWN' };
+    if (hasAdminSlot) {
+      admin = { address: null, source: 'EIP-1967 admin slot (0x' + EIP1967_SLOTS.admin.slice(0, 8) + '…)', confidence: 'INFERRED' };
+    } else if (hasAdminFn) {
+      admin = { address: null, source: 'admin() selector present', confidence: 'INFERRED' };
+    } else if (hasOwnershipSelector(ctx)) {
+      admin = { address: null, source: 'Ownable-style owner()/transferOwnership() selectors present', confidence: 'INFERRED' };
+    }
+
+    // ── Proxy type classification ────────────────────────────────────────────
+    var proxyType = 'NONE', confidence = 'UNKNOWN';
+    if (minimal) {
+      proxyType = 'MINIMAL_PROXY'; confidence = 'CONFIRMED';
+    } else if (hasBeaconSlot) {
+      proxyType = 'BEACON'; confidence = hasDelegatecall ? 'CONFIRMED' : 'LIKELY';
+    } else if (hasImplSlot && hasAdminSlot) {
+      proxyType = 'TRANSPARENT'; confidence = 'CONFIRMED';
+    } else if (hasImplSlot) {
+      if (hasProxiableUUID) { proxyType = 'UUPS'; confidence = 'CONFIRMED'; }
+      else if (hasUpgradeTo || hasUpgradeToAndCall) { proxyType = 'UUPS'; confidence = 'LIKELY'; }
+      else if (hasChangeAdmin) { proxyType = 'TRANSPARENT'; confidence = 'LIKELY'; }
+      else { proxyType = 'EIP-1967'; confidence = 'CONFIRMED'; }
+    } else if (hasAdminSlot) {
+      proxyType = 'EIP-1967'; confidence = 'LIKELY';
+    } else if (hasChangeAdmin && hasDelegatecall) {
+      proxyType = 'TRANSPARENT'; confidence = 'INFERRED';
+    } else if ((hasProxiableUUID || hasUpgradeTo || hasUpgradeToAndCall) && hasDelegatecall) {
+      proxyType = 'UUPS'; confidence = 'INFERRED';
+    } else if (hasDelegatecall && implementation.address) {
+      proxyType = 'CUSTOM'; confidence = 'LIKELY';
+    } else if (hasDelegatecall) {
+      proxyType = 'CUSTOM'; confidence = 'UNKNOWN';
+    }
+
+    var detected = proxyType !== 'NONE';
+
+    // ── Upgrade functions + authorization ────────────────────────────────────
+    var blockFn = functionGraph.blockFn || {};
+    var entryToId = functionGraph.entryToId || {};
+    var implSlotKey = '0x' + EIP1967_SLOTS.implementation;
+    var writesImplSlot = (dataFlow.storageWrites || []).some(function (w) { return w.slot === implSlotKey; });
+
+    var upgradeFunctions = [];
+    function pushUpgradeFn(name, sel) {
+      var fm = functionMap[sel];
+      var fnId = null, resolved = false;
+      if (fm && fm.entryPc !== null && fm.entryPc !== undefined) {
+        fnId = entryToId[fm.entryPc] || null;
+        resolved = !!fnId;
+      }
+      var auth = classifyUpgradeAuthorization(fnId, functionGraph, dataFlow);
+      upgradeFunctions.push({
+        function: name,
+        selector: '0x' + sel,
+        functionId: fnId,
+        resolved: resolved,
+        authorization: { status: auth.status, confidence: auth.confidence },
+        accessControl: auth.status,
+        writesImplementationSlot: auth.storageWrites > 0 ? writesImplSlot : false,
+        storageWrites: auth.storageWrites
+      });
+    }
+    if (hasUpgradeTo) pushUpgradeFn('upgradeTo(address)', UPGRADE_SELECTORS.upgradeTo);
+    if (hasUpgradeToAndCall) pushUpgradeFn('upgradeToAndCall(address,bytes)', UPGRADE_SELECTORS.upgradeToAndCall);
+    if (hasChangeAdmin) {
+      var fmChange = functionMap[CHANGE_ADMIN_SELECTOR];
+      var fnIdC = (fmChange && fmChange.entryPc !== null && fmChange.entryPc !== undefined) ? (entryToId[fmChange.entryPc] || null) : null;
+      var authC = classifyUpgradeAuthorization(fnIdC, functionGraph, dataFlow);
+      upgradeFunctions.push({
+        function: 'changeAdmin(address)', selector: '0x' + CHANGE_ADMIN_SELECTOR, functionId: fnIdC, resolved: !!fnIdC,
+        authorization: { status: authC.status, confidence: authC.confidence }, accessControl: authC.status,
+        writesImplementationSlot: false, storageWrites: authC.storageWrites
+      });
+    }
+
+    var statuses = { CONFIRMED_RESTRICTED: 0, LIKELY_RESTRICTED: 0, INFERRED_RESTRICTED: 0, UNKNOWN: 0 };
+    upgradeFunctions.forEach(function (u) { statuses[u.accessControl] = (statuses[u.accessControl] || 0) + 1; });
+    var upgradeAuthorization = {
+      total: upgradeFunctions.length,
+      confirmedRestricted: statuses.CONFIRMED_RESTRICTED,
+      likelyRestricted: statuses.LIKELY_RESTRICTED,
+      inferredRestricted: statuses.INFERRED_RESTRICTED,
+      restricted: statuses.CONFIRMED_RESTRICTED + statuses.LIKELY_RESTRICTED + statuses.INFERRED_RESTRICTED,
+      unknown: statuses.UNKNOWN,
+      writesImplementationSlot: writesImplSlot,
+      mechanism: hasUpgradeToAndCall ? 'upgradeToAndCall' : (hasUpgradeTo ? 'upgradeTo' : (hasChangeAdmin ? 'changeAdmin' : (detected ? 'unknown upgrade path' : 'none')))
+    };
+
+    // ── Storage slots ─────────────────────────────────────────────────────────
+    var storageSlots = [];
+    if (hasImplSlot) storageSlots.push({ slot: '0x' + EIP1967_SLOTS.implementation, role: 'EIP-1967 implementation slot' });
+    if (hasAdminSlot) storageSlots.push({ slot: '0x' + EIP1967_SLOTS.admin, role: 'EIP-1967 admin slot' });
+    if (hasBeaconSlot) storageSlots.push({ slot: '0x' + EIP1967_SLOTS.beacon, role: 'EIP-1967 beacon slot' });
+
+    return {
+      detected: detected,
+      proxyType: proxyType,
+      confidence: confidence,
+      upgradeable: detected && (hasUpgradeTo || hasUpgradeToAndCall || hasChangeAdmin || hasBeaconSlot || hasAdminSlot || hasImplSlot || !!minimal),
+      implementation: implementation,
+      admin: admin,
+      delegatecall: delegatecall,
+      upgradeFunctions: upgradeFunctions,
+      upgradeAuthorization: upgradeAuthorization,
+      storageSlots: storageSlots,
+      proxiableUUID: hasProxiableUUID,
+      hasImplementationSlot: hasImplSlot,
+      hasAdminSlot: hasAdminSlot,
+      hasBeaconSlot: hasBeaconSlot,
+      hasChangeAdmin: hasChangeAdmin,
+      evidence: {
+        proxyType: proxyType,
+        confidence: confidence,
+        implementation: implementation,
+        admin: admin,
+        upgradeFunctions: upgradeFunctions,
+        upgradeAuthorization: upgradeAuthorization,
+        delegatecall: delegatecall,
+        storageSlots: storageSlots
+      }
+    };
+  }
+
+  function hasOwnershipSelector(ctx) {
+    var s = ctx.selectors || {};
+    return !!(s[OWNABLE_SELECTORS.owner] || s[OWNABLE_SELECTORS.transferOwnership]);
+  }
+
+  // Extend the evidence graph with proxy/upgrade relationships (no edges
+  // without evidence).
+  function extendEvidenceGraphWithProxy(evidenceGraph, proxy) {
+    if (!evidenceGraph) return evidenceGraph;
+    var nodes = (evidenceGraph.nodes || []).slice();
+    var edges = (evidenceGraph.edges || []).slice();
+
+    var proxyNode = null;
+    if (proxy.detected) {
+      proxyNode = 'proxy_main';
+      nodes.push({ id: proxyNode, type: 'PROXY', proxyType: proxy.proxyType, confidence: proxy.confidence });
+    }
+
+    var implNode = null;
+    if (proxy.implementation && proxy.implementation.source !== 'UNKNOWN') {
+      implNode = 'impl_main';
+      nodes.push({ id: implNode, type: 'IMPLEMENTATION', address: proxy.implementation.address, source: proxy.implementation.source, confidence: proxy.implementation.confidence });
+      if (proxyNode) edges.push({ from: proxyNode, to: implNode, type: 'IMPLEMENTS' });
+    }
+
+    var adminNode = null;
+    if (proxy.admin && proxy.admin.source !== 'UNKNOWN') {
+      adminNode = 'admin_main';
+      nodes.push({ id: adminNode, type: 'ADMIN', address: proxy.admin.address, source: proxy.admin.source, confidence: proxy.admin.confidence });
+      if (proxyNode) edges.push({ from: proxyNode, to: adminNode, type: 'CONTROLLED_BY' });
+    }
+
+    (proxy.delegatecall || []).forEach(function (d) {
+      var id = 'del_' + d.pc;
+      nodes.push({ id: id, type: 'DELEGATECALL', pc: d.pc, reach: d.reach, classification: d.classification });
+      if (proxyNode) edges.push({ from: proxyNode, to: id, type: 'USES' });
+    });
+
+    (proxy.upgradeFunctions || []).forEach(function (u, i) {
+      var id = 'upfn_' + i;
+      nodes.push({ id: id, type: 'UPGRADE_FUNCTION', function: u.function, selector: u.selector, accessControl: u.accessControl });
+      if (proxyNode) edges.push({ from: proxyNode, to: id, type: 'HAS' });
+      if (u.resolved && u.functionId) edges.push({ from: id, to: u.functionId, type: 'TARGETS' });
+      if (u.writesImplementationSlot && implNode) edges.push({ from: id, to: implNode, type: 'WRITES' });
+      if (adminNode) edges.push({ from: adminNode, to: id, type: 'CONTROLS' });
+    });
+
+    (proxy.storageSlots || []).forEach(function (s) {
+      var sid = 'pslot_' + s.slot.replace('0x', '');
+      nodes.push({ id: sid, type: 'STORAGE_SLOT', slot: s.slot, role: s.role });
+      if (implNode && s.role.indexOf('implementation') !== -1) edges.push({ from: implNode, to: sid, type: 'STORED_AT' });
+      if (adminNode && s.role.indexOf('admin') !== -1) edges.push({ from: adminNode, to: sid, type: 'STORED_AT' });
+    });
+
+    return { nodes: nodes, edges: edges };
+  }
+
   // ── 7. Orchestrator ────────────────────────────────────────────────────────
   function analyze(bytecode, opts) {
     opts = opts || {};
@@ -1927,6 +2224,17 @@
     result.privilegedOperations = priv.operations;
     result.accessControlSummary = priv.summary;
     result.privilegeGraph = priv.graph;
+
+    // Proxy & Upgradeability Intelligence (Phase 7).
+    var proxy = analyzeProxyUpgradeability(ctx, cfg, dataFlow, functionMap, functionGraph, hex);
+    result.proxyAnalysis = proxy;
+    result.upgradeability = proxy;
+    result.implementationEvidence = proxy.implementation;
+    result.adminEvidence = proxy.admin;
+    result.upgradeFunctions = proxy.upgradeFunctions;
+    result.upgradeAuthorization = proxy.upgradeAuthorization;
+    result.delegatecallEvidence = proxy.delegatecall;
+    result.proxyStorageEvidence = proxy.storageSlots;
     if (priv.operations.length) {
       ctx.findings.push(createFinding({
         id: 'privileged-operations-summary', category: 'privileged-operations', severity: 'INFO', confidence: 'MEDIUM', exploitability: 0,
@@ -1955,6 +2263,49 @@
       }));
     }
 
+    // Proxy & upgradeability findings (Phase 7) — informational unless evidence
+    // indicates a genuine concern. Upgradeability is a capability, not a vuln.
+    if (proxy.detected) {
+      ctx.findings.push(createFinding({
+        id: 'proxy-detected-v2', category: 'proxy', severity: 'INFO', confidence: proxy.confidence === 'CONFIRMED' ? 'HIGH' : (proxy.confidence === 'LIKELY' ? 'MEDIUM' : 'LOW'), exploitability: 0.3,
+        title: proxy.proxyType.replace('_', ' ') + ' proxy detected',
+        description: 'Static evidence is consistent with a ' + proxy.proxyType.replace('_', ' ') + ' proxy (' + proxy.confidence + ').' +
+          (proxy.implementation.address ? ' Implementation address: ' + proxy.implementation.address + ' (' + proxy.implementation.confidence + ').' : '') +
+          (proxy.admin.source !== 'UNKNOWN' ? ' Admin: ' + proxy.admin.source + '.' : ''),
+        evidence: [{ kind: 'OBSERVED', text: 'proxy type ' + proxy.proxyType + ' (' + proxy.confidence + ')' }],
+        recommendation: 'Verify the implementation, admin, and upgrade controls. Upgradability is a capability, not a vulnerability by itself.'
+      }));
+    }
+    if (proxy.upgradeFunctions.length) {
+      var unknownUpg = proxy.upgradeFunctions.filter(function (u) { return u.accessControl === 'UNKNOWN'; }).length;
+      ctx.findings.push(createFinding({
+        id: 'upgrade-mechanism', category: 'proxy', severity: 'INFO', confidence: 'MEDIUM', exploitability: 0.3,
+        title: 'Upgrade mechanism detected (' + proxy.upgradeAuthorization.mechanism + ')',
+        description: 'The contract exposes ' + proxy.upgradeFunctions.length + ' upgrade/administrative function(s): ' +
+          proxy.upgradeFunctions.map(function (u) { return u.function; }).join(', ') + '.',
+        evidence: proxy.upgradeFunctions.map(function (u) { return { kind: 'OBSERVED', text: u.function + ' — access ' + u.accessControl }; }),
+        recommendation: 'Review who can trigger upgrades and whether the upgrade authority is properly secured.'
+      }));
+      if (unknownUpg > 0) {
+        ctx.findings.push(createFinding({
+          id: 'upgrade-authorization-unknown', category: 'proxy', severity: 'MEDIUM', confidence: 'LOW', exploitability: 0.5,
+          title: 'Upgrade authorization could not be determined',
+          description: unknownUpg + ' upgrade function(s) have UNKNOWN authorization. Static analysis cannot prove whether the upgrade authority is properly secured — this is absence of evidence, not evidence of a vulnerability.',
+          evidence: [{ kind: 'UNKNOWN', text: 'upgrade authorization not statically resolvable for ' + unknownUpg + ' function(s)' }],
+          recommendation: 'Review the upgrade access control in the source; ensure only a trusted authority can upgrade the implementation.'
+        }));
+      }
+    }
+    if (proxy.implementation && proxy.implementation.address) {
+      ctx.findings.push(createFinding({
+        id: 'implementation-changeable', category: 'proxy', severity: 'INFO', confidence: proxy.implementation.confidence === 'CONFIRMED' ? 'HIGH' : 'MEDIUM', exploitability: 0.2,
+        title: 'Implementation address detected',
+        description: 'The proxy implementation appears to be ' + proxy.implementation.address + ' (' + proxy.implementation.source + ').',
+        evidence: [{ kind: 'OBSERVED', text: 'implementation ' + proxy.implementation.address + ' — ' + proxy.implementation.source }],
+        recommendation: 'Verify the implementation contract independently; the implementation code can change, so review its current logic.'
+      }));
+    }
+
     cap.upgradeability = cap.proxy.detected ? (cap.proxy.upgradeable === 'Detected' ? 'Detected' : 'Unknown') : 'NotDetected';
 
     // Sort findings by severity then confidence
@@ -1966,16 +2317,20 @@
 
     result.evidenceGraph = buildEvidenceGraph(cfg, functionMap, dataFlow, result.findings, functionGraph);
     result.evidenceGraph = extendEvidenceGraphWithPrivileges(result.evidenceGraph, priv);
+    result.evidenceGraph = extendEvidenceGraphWithProxy(result.evidenceGraph, proxy);
     result.evidenceIds = collectEvidenceIds(result.evidenceGraph);
 
     result.risk = assessRisk(result.findings, completeness);
 
     // Inferred / unknown summaries (kept separate from observed facts)
     if (cap.proxy.detected) result.inferred.push('proxy pattern (' + cap.proxy.classification + ')');
+    if (proxy.detected) result.inferred.push(proxy.proxyType.replace('_', ' ') + ' proxy (' + proxy.confidence + ')');
     if (cap.ownership === 'Detected') result.inferred.push('Ownable-style ownership');
     if (cap.mint.present) result.inferred.push('mint capability, restriction ' + cap.mint.restriction);
     if (!abi) result.unknown.push('ABI not provided — administrative/privileged functions could not be fully enumerated');
     if (completeness === 'PARTIAL') result.unknown.push('dynamic jumps present — analysis completeness is PARTIAL');
+    if (proxy.detected && proxy.implementation.confidence === 'UNKNOWN') result.unknown.push('proxy implementation address not statically resolved');
+    if (proxy.upgradeFunctions.length && proxy.upgradeAuthorization.unknown > 0) result.unknown.push('upgrade authorization UNKNOWN for ' + proxy.upgradeAuthorization.unknown + ' function(s)');
 
     result.summary = buildSummary(result);
     result.analysisText = result.summary;
@@ -2187,6 +2542,9 @@
     buildEvidenceGraph: buildEvidenceGraph,
     buildEvidenceTrace: buildEvidenceTrace,
     buildAuditPayload: buildAuditPayload,
+    analyzeProxyUpgradeability: analyzeProxyUpgradeability,
+    classifyUpgradeAuthorization: classifyUpgradeAuthorization,
+    detectMinimalProxy: detectMinimalProxy,
     bytecodeHash: bytecodeHash,
     analyze: analyze,
     auditContract: auditContract,

@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="networks.js"></script>
+<script src="contract-builder.js"></script>
 <script src="genlayer-sdk.bundle.js"></script>
 <script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
@@ -360,6 +361,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     <!-- Quick prompts shown after first message -->
     <div class="quick-prompts" id="quickPrompts" style="display:none">
       <div class="qp" onclick="sendQuick('Audit another contract')">Audit contract</div>
+      <div class="qp" onclick="sendQuick('Create an ERC-20 token called MyToken with symbol MTK and 1 million initial supply')">Create contract</div>
       <div class="qp" onclick="scanPortfolio()">My portfolio</div>
       <div class="qp" onclick="checkApprovals()">Check approvals</div>
       <div class="qp" onclick="sendQuick('Explain the last finding in detail')">Explain findings</div>
@@ -435,6 +437,11 @@ const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
 const GL_AUDIT_STORE = {};
 const AUDIT_NETWORK_KEY = 'auditai.audit.network';
+
+// Phase 7 Contract Builder state: a pending generated contract (never deployed
+// until the user explicitly clicks "Deploy Contract").
+let pendingBuild = null;
+const DEPLOY_BUSY = {};
 
 // Phase 6.5: the network of the contract being audited is a first-class part
 // of the audit context. It is stored separately from the GenLayer execution
@@ -840,6 +847,38 @@ function buildResultCard(data, address, networkId) {
     </div>`;
   }
 
+  // Proxy & Upgradeability Intelligence (Phase 7).
+  const proxy = data.proxyAnalysis || data.upgradeability || null;
+  let proxyHtml = '';
+  if (proxy && proxy.detected) {
+    const implText = proxy.implementation && proxy.implementation.address
+      ? proxy.implementation.address
+      : (proxy.implementation && proxy.implementation.source !== 'UNKNOWN' ? 'slot detected (unresolved)' : 'Unknown');
+    const adminText = proxy.admin && proxy.admin.source !== 'UNKNOWN' ? (proxy.admin.address || 'slot detected (unresolved)') : 'Unknown';
+    const upgItems = (proxy.upgradeFunctions || []).map(u => {
+      return `<div class="rc-priv-item">
+        <span class="rc-priv-op">⬆️ ${escHtml(u.function)}</span>
+        <span class="rc-priv-fn">${escHtml(u.selector)}</span>
+        <span class="rc-priv-access ${accessCls[u.accessControl] || ''}">${escHtml(accessLabel[u.accessControl] || u.accessControl)} · ${escHtml((u.authorization && u.authorization.confidence) || 'LOW')}</span>
+      </div>`;
+    }).join('');
+    const delItems = (proxy.delegatecall || []).map(d => {
+      return `<div class="rc-priv-item">
+        <span class="rc-priv-op">🔀 DELEGATECALL</span>
+        <span class="rc-priv-fn">PC ${d.pc} · ${escHtml(d.reach)}</span>
+        <span class="rc-priv-access ${d.reach === 'REACHABLE' ? 'rc-access-unknown' : ''}">${escHtml(d.classification)}</span>
+      </div>`;
+    }).join('');
+    proxyHtml = `<div class="rc-priv">
+      <div class="rc-findings-title">Proxy & Upgradeability</div>
+      <div class="rc-acs">Type: <b>${escHtml(proxy.proxyType.replace('_',' '))}</b> · Confidence: <b>${escHtml(proxy.confidence)}</b> · Upgradeable: <b>${proxy.upgradeable ? 'Yes' : 'No'}</b></div>
+      <div class="rc-acs">Implementation: <b>${escHtml(implText)}</b> · Admin: <b>${escHtml(adminText)}</b></div>
+      <div class="rc-acs">Upgrade mechanism: <b>${escHtml((proxy.upgradeAuthorization && proxy.upgradeAuthorization.mechanism) || 'none')}</b></div>
+      ${upgItems}
+      ${delItems}
+    </div>`;
+  }
+
   const html = `<div class="result-card" data-card-addr="${address.toLowerCase()}">
     <div class="rc-header">
       <div class="rc-ring">
@@ -864,6 +903,7 @@ function buildResultCard(data, address, networkId) {
       ${findingsHtml}
     </div>
     ${privHtml}
+    ${proxyHtml}
     <div class="rc-glstatus">
       <span class="gl-status-item">Network <span class="gl-status-badge gl-ok">${escHtml(net.name || 'Unknown')}</span></span>
       <span class="gl-status-item">Chain ID <span class="gl-status-badge">${chainId !== undefined && chainId !== null ? chainId : '—'}</span></span>
@@ -1192,8 +1232,10 @@ async function parseIntent(text) {
   const isApprovals = /approv|allowance/i.test(text) && !address;
   const isExplain   = /explain|what is|what are|how does|define/i.test(text) && !address;
   const isAudit     = !!address;
+  // Phase 7: contract creation is detected only when no address is present.
+  const isCreate    = !address && (window.AuditAIContractBuilder ? window.AuditAIContractBuilder.isCreateIntent(text) : false);
 
-  return { address, networkId, isCompare, isPortfolio, isApprovals, isExplain, isAudit };
+  return { address, networkId, isCompare, isPortfolio, isApprovals, isExplain, isAudit, isCreate };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1253,6 +1295,7 @@ async function handleInput() {
   if (intent.isPortfolio) { document.getElementById('sendBtn').disabled = false; await scanPortfolio(); return; }
   if (intent.isApprovals) { document.getElementById('sendBtn').disabled = false; await checkApprovals(); return; }
   if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.networkId); return; }
+  if (intent.isCreate)    { document.getElementById('sendBtn').disabled = false; await handleCreateContract(text); return; }
 
   if (intent.isAudit) {
     showTyping();
@@ -1710,6 +1753,142 @@ updateGLStatus();
   const sel = document.getElementById('auditNetworkSelect');
   if (sel && window.AuditAINetworks) sel.value = window.AuditAINetworks.getNetwork(auditNetworkId) ? auditNetworkId : 'ethereum';
 })();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART CONTRACT BUILDER (Phase 7)
+// ═══════════════════════════════════════════════════════════════════════════════
+async function handleCreateContract(text) {
+  const builder = window.AuditAIContractBuilder;
+  if (!builder) { appendAIMessage('⚠️ Contract Builder not loaded.'); return; }
+
+  const spec = builder.parseSpec(text);
+  const source = builder.generateSolidity(spec);
+  const validation = builder.validateSolidity(source);
+  if (!validation.valid) {
+    appendAIMessage('⚠️ **INVALID_SOLIDITY** — generated source failed validation:\n' + validation.errors.map(e => '• ' + e).join('\n'));
+    return;
+  }
+  const targetNet = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
+  const pv = builder.preview(spec, source, targetNet ? { id: targetNet.id, name: targetNet.name, chainId: targetNet.chainId } : null);
+  pendingBuild = { id: 'b' + Date.now().toString(36), spec: spec, source: source, network: targetNet };
+
+  const argsHtml = (pv.constructorArgs || []).map(a => {
+    const shown = a.units ? (a.units + ' tokens') : (a.value || '—');
+    return `<div class="rc-finding-desc">• <code>${escHtml(a.name)}</code> (<b>${escHtml(a.type)}</b>) — ${escHtml(a.label)}${a.value !== undefined && a.value !== '' ? ' · ' + escHtml(shown) : ''}</div>`;
+  }).join('');
+  const warningsHtml = (pv.warnings || []).map(w =>
+    `<div class="rc-finding-desc">${w.level === 'HIGH' ? '⚠️' : 'ℹ️'} ${escHtml(w.text)}</div>`).join('');
+  const card = `<div class="result-card">
+    <div class="rc-findings"><div class="rc-findings-title">Contract Specification</div>
+      <div class="rc-acs">Type: <b>${escHtml(spec.type.toUpperCase())}</b> · Name: <b>${escHtml(spec.name)}</b>${spec.symbol ? ' · Symbol: <b>' + escHtml(spec.symbol) + '</b>' : ''}${spec.supply ? ' · Supply: <b>' + spec.supply + '</b> tokens' : ''}</div>
+      ${argsHtml}
+    </div>
+    <div class="rc-findings"><div class="rc-findings-title">Target Network</div>
+      <div class="rc-acs">${targetNet ? escHtml(targetNet.name) + ' (chain ' + targetNet.chainId + ')' : 'Not selected'}</div>
+    </div>
+    <div class="rc-findings"><div class="rc-findings-title">Solidity</div>
+      <pre style="font-family:var(--mono);font-size:10px;color:var(--muted);max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escHtml(source)}</pre>
+    </div>
+    <div class="rc-findings"><div class="rc-findings-title">Security Review</div>${warningsHtml}</div>
+    <div class="rc-footer"><span class="rc-footer-left">Deployment requires explicit approval</span>
+      <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="deployBuiltContract()">Deploy Contract</button></div>
+    </div>
+  </div>`;
+  appendAIMessage('I can create that contract. Review the source below — **nothing has been deployed yet**. Deployment is a separate, explicit step.', card);
+}
+
+async function deployBuiltContract() {
+  if (!pendingBuild) { appendAIMessage('No pending contract to deploy.'); return; }
+  const build = pendingBuild;
+  if (DEPLOY_BUSY[build.id]) { appendAIMessage('⏳ Deployment already in progress — please wait.'); return; }
+
+  if (!window.AuditAIGenLayer) { appendAIMessage('⚠️ GenLayer bridge not loaded.'); return; }
+  const net = window.AuditAIGenLayer.getNetwork();
+  if (!net) { appendAIMessage('⚠️ No GenLayer network selected.'); return; }
+  if (!walletAddress) {
+    appendAIMessage('⚠️ **WALLET_REQUIRED** — connect a wallet to sign the deployment, then retry.');
+    await connectWallet();
+    return;
+  }
+  if (String(walletChainId) !== String(net.chainId)) {
+    appendAIMessage('⚠️ **WRONG_NETWORK** — your wallet is on chain ' + (walletChainId || 'unknown') + ' but the target is **' + net.name + ' (chain ' + net.chainId + ')**. Switch networks in your wallet, then retry.');
+    return;
+  }
+
+  const client = window.AuditAIGenLayer.getClient();
+  if (!client || typeof client.deployContract !== 'function') {
+    appendAIMessage('⚠️ **GENLAYER_UNAVAILABLE** — GenLayer deploy support is not available.');
+    return;
+  }
+
+  const builder = window.AuditAIContractBuilder;
+  const ctor = builder ? builder.constructorArgs(build.spec) : [];
+  const args = [];
+  for (const a of ctor) {
+    if (a.type === 'address') {
+      const v = prompt('Enter ' + a.label + ' for ' + build.spec.name + ' (0x address):', walletAddress || '');
+      if (v === null) { appendAIMessage('Deployment cancelled (address required).'); return; }
+      if (!/^0x[0-9a-fA-F]{40}$/.test(String(v).trim())) { appendAIMessage('⚠️ **INVALID_ADDRESS** for `' + a.name + '`.'); return; }
+      args.push(String(v).trim());
+    } else {
+      try { args.push(BigInt(a.value)); } catch (e) { args.push(a.value); }
+    }
+  }
+
+  DEPLOY_BUSY[build.id] = true;
+  appendAIMessage('🚀 Deploying **' + build.spec.name + '** to **' + net.name + '**…');
+  try {
+    const res = await client.deployContract(build.source, {
+      account: walletAddress,
+      args: args,
+      onStatus: function (state, detail) {
+        if (state === 'DEPLOYMENT_PENDING') appendAIMessage('⏳ **DEPLOYMENT_PENDING** — transaction `' + detail + '` awaiting finalization…');
+        if (state === 'DEPLOYMENT_CONFIRMED') appendAIMessage('✅ **DEPLOYMENT_CONFIRMED**');
+      }
+    });
+    const card = buildDeployedCard(build, net, res);
+    appendAIMessage('🎉 **Deployment complete.**\n\nContract: `' + res.contractAddress + '`\nTransaction: `' + res.hash + '`\nNetwork: **' + net.name + '**\nChain ID: **' + net.chainId + '**', card);
+  } catch (e) {
+    showDeploymentError(String((e && e.message) || e), net);
+  } finally {
+    DEPLOY_BUSY[build.id] = false;
+  }
+}
+
+function buildDeployedCard(build, net, res) {
+  const auditNetName = net ? net.name : 'Studionet';
+  return `<div class="result-card">
+    <div class="rc-findings"><div class="rc-findings-title">Deployment Complete</div>
+      <div class="rc-acs">Contract: <b>${escHtml(res.contractAddress)}</b></div>
+      <div class="rc-acs">Transaction: <b>${escHtml(res.hash)}</b></div>
+      <div class="rc-acs">Network: <b>${escHtml(auditNetName)}</b>${net ? ' · Chain ID: <b>' + net.chainId + '</b>' : ''}</div>
+    </div>
+    <div class="rc-footer"><span class="rc-footer-left">Create → Deploy → Audit</span>
+      <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="sendQuick('Audit ${res.contractAddress} on ${auditNetName}')">Audit Contract</button></div>
+    </div>
+  </div>`;
+}
+
+function showDeploymentError(code, net) {
+  const netName = net ? net.name : 'the selected network';
+  const base = String(code || '').split(':')[0];
+  const map = {
+    'SDK_UNAVAILABLE': 'the GenLayer SDK failed to initialize.',
+    'UNKNOWN_NETWORK': 'the selected GenLayer network is unknown.',
+    'CONTRACT_GENERATION_FAILED': 'the contract source is empty or invalid.',
+    'WALLET_REQUIRED': 'a connected wallet is required to sign the deployment.',
+    'WRONG_NETWORK': 'your wallet is on the wrong network. Switch to ' + netName + '.',
+    'USER_REJECTED': 'the transaction was rejected in your wallet.',
+    'NO_TX_HASH': 'the deployment was submitted but no transaction hash was returned.',
+    'TRANSACTION_FAILED': 'the deployment transaction failed/reverted.',
+    'TRANSACTION_TIMEOUT': 'the deployment timed out waiting for finalization.',
+    'CONTRACT_ADDRESS_UNAVAILABLE': 'the deployment finalized but the contract address could not be read.',
+    'GENLAYER_NETWORK_UNAVAILABLE': 'the ' + netName + ' GenLayer network is unreachable.',
+    'GENLAYER_ERROR': 'an unknown GenLayer error occurred.'
+  };
+  const label = base === 'TRANSACTION_TIMEOUT' ? 'DEPLOYMENT_TIMEOUT' : (base === 'TRANSACTION_FAILED' ? 'DEPLOYMENT_FAILED' : base);
+  appendAIMessage('⚠️ **' + label + '** — ' + (map[base] || (base + '.')) + ' No deployment was recorded.');
+}
 </script>
 </body>
 </html>

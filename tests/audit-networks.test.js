@@ -364,7 +364,7 @@ test('analyze propagates network identity into the result and payload', function
   assert.equal(p.chainId, 61999);
   assert.equal(p.contract.chainId, 61999);
   assert.equal(p.contract.bytecodeHash, r.bytecodeHash);
-  assert.equal(p.analysisVersion, '7.0.0');
+  assert.equal(p.analysisVersion, '8.0.0');
 });
 
 test('LIMITED analysis result separates completeness from score (never "safe")', function () {

@@ -299,6 +299,64 @@
       return norm.value;
     }
 
+    // ── Contract deployment (Phase 7 Contract Builder) ───────────────────────
+    // Deploys a new contract on the selected GenLayer network via the SDK, waits
+    // for finalization, and returns the REAL transaction hash + contract address.
+    // It NEVER fabricates a hash or address — values are read from the receipt.
+    //
+    // `code` is the contract source/bytecode string. `args` are constructor args
+    // (CalldataEncodable[]). Emits onStatus(state, detail) for the UI.
+    async function deployContract(code, opts) {
+      opts = opts || {};
+      emit(opts, 'PREPARING');
+      if (!available()) throw new Error('SDK_UNAVAILABLE');
+      var n = network();
+      if (!n) throw new Error('UNKNOWN_NETWORK');
+      if (typeof code !== 'string' || !code.trim()) throw new Error('CONTRACT_GENERATION_FAILED');
+
+      var account = opts.account;
+      emit(opts, 'WAITING_WALLET');
+      if (!account) throw new Error('WALLET_REQUIRED');
+
+      var wc;
+      try { wc = sdk.createClient({ chain: sdkChain(), account: account }); }
+      catch (e) { throw new Error(toErrorCode(e)); }
+
+      emit(opts, 'DEPLOYING');
+      var hash;
+      try {
+        hash = await wc.deployContract({ code: code, args: opts.args || undefined });
+      } catch (e) { throw new Error(toErrorCode(e)); }
+
+      hash = (hash && typeof hash === 'object' && (hash.hash !== undefined || hash.txId !== undefined))
+        ? (hash.hash || hash.txId)
+        : hash;
+      if (!hash) throw new Error('NO_TX_HASH');
+
+      emit(opts, 'DEPLOYMENT_PENDING', hash);
+
+      var receipt;
+      try {
+        receipt = await wc.waitForTransactionReceipt({
+          hash: hash,
+          status: 'FINALIZED',
+          interval: (opts.interval || 2000),
+          retries: (opts.retries || 90)
+        });
+        if (receipt && receipt.status === 'FAILED') throw new Error('TRANSACTION_FAILED');
+      } catch (e) {
+        if (e && e.message === 'TRANSACTION_FAILED') throw e;
+        if (e && e.message === 'TRANSACTION_TIMEOUT') throw e;
+        throw new Error(toErrorCode(e));
+      }
+
+      var contractAddress = extractContractAddress(receipt);
+      if (!contractAddress) throw new Error('CONTRACT_ADDRESS_UNAVAILABLE');
+
+      emit(opts, 'DEPLOYMENT_CONFIRMED', { hash: hash, contractAddress: contractAddress });
+      return { hash: hash, contractAddress: contractAddress, receipt: receipt };
+    }
+
     return {
       isAvailable: isAvailable,
       getNetwork: getNetwork,
@@ -309,8 +367,26 @@
       read: read,
       getAnalysis: getAnalysis,
       preflight: preflight,
-      analyzeEvidence: analyzeEvidence
+      analyzeEvidence: analyzeEvidence,
+      deployContract: deployContract
     };
+  }
+
+  // Extract the deployed contract address from a GenLayer receipt. The SDK
+  // exposes it either directly or via txDataDecoded.contractAddress.
+  function extractContractAddress(receipt) {
+    if (!receipt) return null;
+    if (receipt.contractAddress) return receipt.contractAddress;
+    if (receipt.txDataDecoded && receipt.txDataDecoded.contractAddress) return receipt.txDataDecoded.contractAddress;
+    if (receipt.data && receipt.data.contractAddress) return receipt.data.contractAddress;
+    if (receipt.to_address && typeof receipt.to_address === 'string' && receipt.to_address.indexOf('0x') === 0 && !isZeroAddress(receipt.to_address)) {
+      return receipt.to_address;
+    }
+    return null;
+  }
+
+  function isZeroAddress(addr) {
+    return /^0x0+$/i.test(String(addr).replace('0x', ''));
   }
 
   return {
@@ -318,6 +394,7 @@
     getSdk: getSdk,
     toErrorCode: toErrorCode,
     normalizeGenLayerResult: normalizeGenLayerResult,
+    extractContractAddress: extractContractAddress,
     NETWORKS: NETWORKS,
     DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
     SDK_CHAIN_KEY: SDK_CHAIN_KEY

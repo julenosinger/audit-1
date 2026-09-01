@@ -51,6 +51,8 @@
       privilegedOperations: result.privilegedOperations || [],
       accessControlSummary: result.accessControlSummary || null,
       privilegeGraph: result.privilegeGraph || null,
+      proxyAnalysis: result.proxyAnalysis || null,
+      upgradeability: result.upgradeability || null,
       // Phase 6.5: network is part of the audit identity.
       networkId: result.networkId,
       networkName: result.networkName,
