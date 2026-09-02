@@ -855,6 +855,26 @@ function persistMessage(msg) {
   return msg;
 }
 
+// Build the inner HTML for a message (avatar + bubble + card + time).
+function renderMsgInner(msg) {
+  const time = timeStrFrom(msg.timestamp || Date.now());
+  if (msg.role === 'user') {
+    return `
+      <div class="msg-avatar user">🧑</div>
+      <div class="msg-content">
+        <div class="msg-bubble">${escHtml(msg.content || '')}</div>
+        <div class="msg-time">${time}</div>
+      </div>`;
+  }
+  return `
+    <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+    <div class="msg-content">
+      <div class="msg-bubble">${mdToHtml(msg.content || '')}</div>
+      ${msg.cardHtml ? msg.cardHtml : ''}
+      <div class="msg-time">${time} · forgeContract</div>
+    </div>`;
+}
+
 // Render a stored/new message into the DOM (idempotent by msg.id).
 function appendMsgEl(msg) {
   hideWelcome();
@@ -862,26 +882,27 @@ function appendMsgEl(msg) {
   const el = document.createElement('div');
   el.className = 'msg ' + (msg.role === 'user' ? 'user' : 'ai');
   if (msg.id) el.dataset.msgId = msg.id;
-  const time = timeStrFrom(msg.timestamp || Date.now());
-  if (msg.role === 'user') {
-    el.innerHTML = `
-      <div class="msg-avatar user">🧑</div>
-      <div class="msg-content">
-        <div class="msg-bubble">${escHtml(msg.content || '')}</div>
-        <div class="msg-time">${time}</div>
-      </div>`;
-  } else {
-    el.innerHTML = `
-      <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-      <div class="msg-content">
-        <div class="msg-bubble">${mdToHtml(msg.content || '')}</div>
-        ${msg.cardHtml ? msg.cardHtml : ''}
-        <div class="msg-time">${time} · forgeContract</div>
-      </div>`;
-  }
+  el.innerHTML = renderMsgInner(msg);
   msgs.appendChild(el);
   scrollBottom();
   return el;
+}
+
+// Update an existing message DOM node in place (no new message, no spam).
+function updateMsgEl(msg) {
+  const el = document.querySelector('[data-msg-id="' + msg.id + '"]');
+  if (!el) return appendMsgEl(msg);
+  el.className = 'msg ' + (msg.role === 'user' ? 'user' : 'ai');
+  el.innerHTML = renderMsgInner(msg);
+  scrollBottom();
+  return el;
+}
+
+// Create or update a message by stable id (single message per txHash/event).
+function upsertMessage(msg) {
+  const existing = document.querySelector('[data-msg-id="' + msg.id + '"]');
+  if (existing) return updateMsgEl(msg);
+  return appendMsgEl(msg);
 }
 
 function appendUserMessage(text) {
@@ -1601,8 +1622,8 @@ function restoreAppState() {
   resumePendingAudits();
 }
 
-// Re-query and resume any audit transaction that was in flight before a refresh
-// (a refresh must never orphan an on-chain audit).
+// Re-query and resume any transaction that was in flight before a refresh
+// (a refresh must never orphan an on-chain audit or deployment).
 function resumePendingAudits() {
   var Store = window.AuditAIChatStore;
   if (!Store || typeof Store.loadTxs !== 'function') return;
@@ -1610,38 +1631,136 @@ function resumePendingAudits() {
   try { txs = Store.loadTxs(); } catch (e) { return; }
   if (!txs || !txs.length) return;
   txs.forEach(function (tx) {
-    if (tx && tx.operation === 'AUDIT_AI' && tx.status !== 'FINALIZED' && tx.status !== 'CONFIRMED' && tx.status !== 'FAILED') {
-      recoverPendingAudit(tx);
-    }
+    if (!tx || !tx.txHash) return;
+    if (['FINALIZED', 'CONFIRMED', 'FAILED', 'CANCELED', 'UNDETERMINED'].indexOf(tx.status) !== -1) return;
+    recoverPendingTx(tx);
   });
 }
 
-async function recoverPendingAudit(tx) {
-  var client = (window.AuditAIGenLayer && window.AuditAIGenLayer.getClient && window.AuditAIGenLayer.getClient()) || null;
+async function recoverPendingTx(tx) {
+  var client = (window.AuditAIGenLayer && window.AuditAIGenLayer.getClient) ? window.AuditAIGenLayer.getClient() : null;
   if (!client || typeof client.getTransaction !== 'function') return;
   var Tx = window.AuditAIGenLayerTx;
   if (!Tx || typeof Tx.monitorTransaction !== 'function') return;
-  appendAIMessage('⏳ Resuming GenLayer audit for transaction `' + tx.txHash + '`…');
+
+  var isDeploy = tx.operation === 'DEPLOY';
+  appendAIMessage('↻ Reconnected to transaction\n\nTransaction:\n`' + tx.txHash + '`\n\nCurrent state:\n**' + (tx.status || 'UNKNOWN') + '**');
+
   try {
     var outcome = await Tx.monitorTransaction({
       hash: tx.txHash,
       getStatus: function (h) { return client.getTransaction({ hash: h }); },
       onStatus: function (state) {
-        window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: state, lastStatusAt: Date.now() });
+        window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: state, lastUpdatedAt: Date.now() });
       },
       pollInterval: 3000,
-      maxConsecutiveRpcErrors: 5
+      maxConsecutiveRpcErrors: 5,
+      meta: {
+        txHash: tx.txHash,
+        operation: tx.operation || 'AUDIT_AI',
+        networkId: tx.networkId,
+        chainId: tx.chainId,
+        contractAddress: tx.contractAddress || null,
+        submittedAt: tx.submittedAt,
+        source: 'genlayer'
+      }
     });
+
     if (outcome.kind === 'ACCEPTED' || outcome.kind === 'FINALIZED') {
-      window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: outcome.status, acceptedAt: Date.now(), finalizedAt: outcome.kind === 'FINALIZED' ? Date.now() : null });
+      if (isDeploy) {
+        var extractor = window.AuditAIGenLayerClient && window.AuditAIGenLayerClient.extractContractAddress;
+        var contractAddr = extractor ? extractor(outcome.tx) : null;
+        if (contractAddr) {
+          lastDeployment = {
+            address: contractAddr,
+            txHash: tx.txHash,
+            network: tx.networkId === 'bradbury' ? 'Bradbury Testnet' : 'Studionet',
+            networkId: tx.networkId === 'bradbury' ? 'genlayerBradbury' : 'genlayerStudionet',
+            chainId: tx.chainId,
+            status: outcome.status,
+            deploymentTimestamp: Date.now()
+          };
+          persistAppContext();
+          appendAIMessage('✅ Deployment recovered.\n\nContract:\n`' + contractAddr + '`\n\nStatus: **' + outcome.status + '**');
+        }
+      }
       window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
-      appendAIMessage('✅ GenLayer analysis for transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
     } else if (outcome.kind === 'FAILED_TERMINAL') {
       window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: outcome.status });
       window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
-      appendAIMessage('⚠️ GenLayer transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
+      appendAIMessage('⚠️ Transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
     }
   } catch (e) {}
+}
+
+// ── Transaction observability (Phase 7.6.2) ──────────────────────────────────
+// Chat and cards consume the SAME state produced by GenLayerTxEngine. A single
+// subscription updates the progress message (in place) and the card badge.
+var GL_TX_TO_ADDR = {};   // txHash -> contract address (audit)
+var GL_TX_TO_BUILD = {};  // txHash -> { build, net } (deploy)
+
+function explorerUrlFor(networkId) {
+  if (networkId === 'bradbury') return 'https://explorer-bradbury.genlayer.com/';
+  return null; // Studionet has no public explorer URL.
+}
+
+function explorerLinkHtml(txHash, networkId) {
+  var base = explorerUrlFor(networkId);
+  if (!base) return '';
+  return '<a class="wchip" href="' + base + '" target="_blank" rel="noopener">Explorer ↗</a>';
+}
+
+// Compose the single, live progress message content from engine state.
+function renderTxProgressContent(state) {
+  var Tx = window.AuditAIGenLayerTx;
+  var emoji = Tx ? Tx.statusEmoji(state.status) : '';
+  var line = Tx ? Tx.statusMessage(state.status) : String(state.status || '');
+  var opTitle = state.operation === 'DEPLOY' ? '🚀 Deployment' : '⚡ GenLayer Audit';
+  var netName = (state.networkId === 'bradbury') ? 'Bradbury Testnet' : ((state.networkId === 'studionet') ? 'Studionet' : 'GenLayer');
+  var parts = [opTitle + ' · ' + netName, ''];
+  if (state.txHash) parts.push('Transaction:\n`' + state.txHash + '`');
+  parts.push('');
+  parts.push(emoji + ' **' + state.status + '**\n' + line);
+  if (state.contractAddress) parts.push('\nContract:\n`' + state.contractAddress + '`');
+  return parts.join('\n');
+}
+
+// Upsert the progress message (stable id `transaction-progress:{txHash}`).
+function upsertTxMessage(txHash, content, cardHtml) {
+  var id = (window.AuditAIGenLayerTx && window.AuditAIGenLayerTx.progressKey) ? window.AuditAIGenLayerTx.progressKey(txHash) : ('transaction-progress:' + txHash);
+  var ts = Date.now();
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.loadMessages === 'function') {
+    try {
+      var msgs = Store.loadMessages();
+      for (var i = 0; i < msgs.length; i++) { if (msgs[i] && msgs[i].id === id) { ts = msgs[i].timestamp; break; } }
+    } catch (e) {}
+  }
+  var msg = persistMessage({ id: id, role: 'assistant', content: content, cardHtml: cardHtml || null, timestamp: ts, type: 'assistant' });
+  upsertMessage(msg);
+}
+
+// Single subscription: engine state → persist + chat (in place) + card.
+function syncEngineState(state) {
+  if (!state || !state.txHash) return;
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.saveTx === 'function') {
+    try { Store.saveTx({ type: state.operation === 'DEPLOY' ? 'GENLAYER_DEPLOY' : 'GENLAYER_AUDIT', operation: state.operation, txHash: state.txHash, networkId: state.networkId, chainId: state.chainId, contractAddress: state.contractAddress || null, submittedAt: state.submittedAt, status: state.status, lastUpdatedAt: state.lastUpdatedAt, acceptedAt: state.acceptedAt, finalizedAt: state.finalizedAt, source: 'genlayer' }); } catch (e) {}
+  }
+
+  var cardHtml = explorerLinkHtml(state.txHash, state.networkId);
+  var content = renderTxProgressContent(state);
+  upsertTxMessage(state.txHash, content, cardHtml);
+
+  var addr = GL_TX_TO_ADDR[state.txHash];
+  if (addr) setGLAnalysisStatus(addr, state.status);
+}
+
+// Subscribe the UI to the single transaction engine (once).
+function initTxEngine() {
+  var Tx = window.AuditAIGenLayerTx;
+  if (!Tx || typeof Tx.subscribe !== 'function') return;
+  Tx.subscribe(syncEngineState);
 }
 
 // Resolve the GenLayer network descriptor (name, networkId, chainId, auditor
@@ -2567,6 +2686,7 @@ async function requestGenLayerAnalysis(addr) {
       onStatus: function (state, detail) {
         if (state === 'SUBMITTED') {
           data.glTxHash = detail;
+          GL_TX_TO_ADDR[detail] = addr;
           persistPendingAuditTx({
             type: 'GENLAYER_AUDIT',
             operation: 'AUDIT_AI',
@@ -2641,6 +2761,7 @@ function showGenLayerResult(addr, res) {
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
+initTxEngine();
 restoreAppState();
 renderSidebar();
 updateNavStats();
@@ -2841,17 +2962,18 @@ async function deployBuiltContract() {
   }
 
   DEPLOY_BUSY[build.id] = true;
-  appendAIMessage('🚀 Deploying **' + build.spec.name + '** to **' + net.name + '**…');
+  appendAIMessage('🚀 Creating **' + build.spec.name + '** on **' + net.name + '**…');
   try {
     const res = await client.deployContract(build.source, {
       account: walletAddress,
       args: args,
       onStatus: function (state, detail) {
-        if (state === 'DEPLOYMENT_PENDING') appendAIMessage('⏳ **DEPLOYMENT_PENDING** — transaction `' + detail + '` awaiting finalization…');
-        if (state === 'DEPLOYMENT_CONFIRMED') appendAIMessage('✅ **DEPLOYMENT_CONFIRMED**');
+        if (state === 'SUBMITTED') {
+          GL_TX_TO_BUILD[detail] = { build: build, net: net };
+        }
       }
     });
-    const card = buildDeployedCard(build, net, res);
+    const status = (res && res.status) || ((res && res.finalized) ? 'FINALIZED' : 'ACCEPTED');
     // Phase 7.4: preserve the real deployment context for the GenLayer audit flow.
     lastDeployment = {
       address: res.contractAddress,
@@ -2863,10 +2985,12 @@ async function deployBuiltContract() {
       source: build.source,
       spec: build.spec,
       deploymentTimestamp: Date.now(),
-      status: 'FINALIZED'
+      status: status
     };
+    clearPendingAuditTx(res.hash);
     persistAppContext();
-    appendAIMessage('🎉 **Deployment complete.**\n\nContract: `' + res.contractAddress + '`\nTransaction: `' + res.hash + '`\nNetwork: **' + net.name + '**\nChain ID: **' + net.chainId + '**', card);
+    const card = buildDeployedCard(build, net, res, status);
+    appendAIMessage(renderDeploymentFinal(build, net, res, status), card);
   } catch (e) {
     showDeploymentError(String((e && e.message) || e), net);
   } finally {
@@ -2874,13 +2998,26 @@ async function deployBuiltContract() {
   }
 }
 
-function buildDeployedCard(build, net, res) {
+function renderDeploymentFinal(build, net, res, status) {
+  const finality = (status === 'FINALIZED') ? '' : '\n⏳ Finality window is still active.';
+  const explorer = explorerLinkHtml(res.hash, net ? net.id : null);
+  return '🎉 **Contract created successfully**\n\n' +
+    '**' + escHtml(build.spec.name) + '**\n' + escHtml(net ? net.name : 'GenLayer') + '\n\n' +
+    'Contract:\n`' + res.contractAddress + '`\n\n' +
+    'Transaction:\n`' + res.hash + '`\n\n' +
+    'Status:\n**' + status + '**' + finality +
+    (explorer ? '\n\n' + explorer : '');
+}
+
+function buildDeployedCard(build, net, res, status) {
   const auditNetName = net ? net.name : 'Studionet';
+  const statusLabel = status || ((res && res.finalized) ? 'FINALIZED' : 'ACCEPTED');
   return `<div class="result-card">
     <div class="rc-findings"><div class="rc-findings-title">Deployment Complete</div>
       <div class="rc-acs">Contract: <b>${escHtml(res.contractAddress)}</b></div>
       <div class="rc-acs">Transaction: <b>${escHtml(res.hash)}</b></div>
       <div class="rc-acs">Network: <b>${escHtml(auditNetName)}</b>${net ? ' · Chain ID: <b>' + net.chainId + '</b>' : ''}</div>
+      <div class="rc-acs">Status: <b>${escHtml(statusLabel)}</b></div>
     </div>
     <div class="rc-footer"><span class="rc-footer-left">Create → Deploy → Audit</span>
       <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Contract</button></div>
@@ -2900,13 +3037,16 @@ function showDeploymentError(code, net) {
     'USER_REJECTED': 'the transaction was rejected in your wallet.',
     'NO_TX_HASH': 'the deployment was submitted but no transaction hash was returned.',
     'TRANSACTION_FAILED': 'the deployment transaction failed/reverted.',
-    'TRANSACTION_TIMEOUT': 'the deployment timed out waiting for finalization.',
-    'CONTRACT_ADDRESS_UNAVAILABLE': 'the deployment finalized but the contract address could not be read.',
+    'TRANSACTION_CANCELED': 'the deployment transaction was canceled by the network.',
+    'TRANSACTION_UNDETERMINED': 'GenLayer could not determine a final consensus result.',
+    'TRANSACTION_TIMEOUT': 'the ' + netName + ' GenLayer RPC could not be reached; the transaction may still be processing.',
+    'CONTRACT_ADDRESS_UNAVAILABLE': 'the deployment was accepted but the contract address could not be read.',
     'GENLAYER_NETWORK_UNAVAILABLE': 'the ' + netName + ' GenLayer network is unreachable.',
     'GENLAYER_ERROR': 'an unknown GenLayer error occurred.'
   };
-  const label = base === 'TRANSACTION_TIMEOUT' ? 'DEPLOYMENT_TIMEOUT' : (base === 'TRANSACTION_FAILED' ? 'DEPLOYMENT_FAILED' : base);
-  appendAIMessage('⚠️ **' + label + '** — ' + (map[base] || (base + '.')) + ' No deployment was recorded.');
+  const label = base === 'TRANSACTION_TIMEOUT' ? 'DEPLOYMENT_RPC_UNAVAILABLE' : (base === 'TRANSACTION_FAILED' ? 'DEPLOYMENT_FAILED' : base);
+  const suffix = (base === 'TRANSACTION_TIMEOUT') ? 'The transaction may still be processing on-chain.' : 'No deployment was recorded.';
+  appendAIMessage('⚠️ **' + label + '** — ' + (map[base] || (base + '.')) + ' ' + suffix);
 }
 </script>
 </body>

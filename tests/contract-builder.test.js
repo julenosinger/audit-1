@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const Builder = require('../public/contract-builder.js');
 const GenLayerClient = require('../public/genlayer-client.js');
+require('../public/genlayer-tx.js');
 
 const TEST_NETWORKS = {
   studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0x' + 'ab'.repeat(20), deployed: true },
@@ -19,7 +20,8 @@ function mockSdk(deployImpl) {
     waitForTransactionReceipt: async function () { return { status: 'FINALIZED', txDataDecoded: { contractAddress: '0x' + 'cd'.repeat(20) } }; }
   };
   var readClient = {
-    getContractSchema: async function () { return { methods: {} }; }
+    getContractSchema: async function () { return { methods: {} }; },
+    getTransaction: async function () { return { statusName: 'FINALIZED', status: 7, txExecutionResultName: 'FINISHED_WITH_RETURN', txDataDecoded: { contractAddress: '0x' + 'cd'.repeat(20) } }; }
   };
   return {
     createClient: function (config) { return config && config.account ? writeClient : readClient; },
@@ -189,11 +191,8 @@ test('deployContract: no tx hash => NO_TX_HASH', async function () {
 test('deployContract: missing contract address => CONTRACT_ADDRESS_UNAVAILABLE', async function () {
   var sdk = mockSdk();
   sdk.createClient = function (config) {
-    var write = {
-      deployContract: async function () { return '0xhash123'; },
-      waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; }
-    };
-    var read = { getContractSchema: async function () { return { methods: {} }; } };
+    var write = { deployContract: async function () { return '0xhash123'; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
+    var read = { getContractSchema: async function () { return { methods: {} }; }, getTransaction: async function () { return { statusName: 'FINALIZED', status: 7 }; } };
     return config && config.account ? write : read;
   };
   var a = makeAdapter(sdk, 'studionet');
@@ -207,7 +206,7 @@ test('deployContract: wallet rejection => USER_REJECTED', async function () {
       deployContract: async function () { var e = new Error('User rejected the request'); e.code = 4001; throw e; },
       waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; }
     };
-    var read = { getContractSchema: async function () { return { methods: {} }; } };
+    var read = { getContractSchema: async function () { return { methods: {} }; }, getTransaction: async function () { return { statusName: 'FINALIZED', status: 7 }; } };
     return config && config.account ? write : read;
   };
   var a = makeAdapter(sdk, 'studionet');
