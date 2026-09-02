@@ -84,7 +84,7 @@
     }
   };
 
-  var DEFAULT_NETWORK_ID = 'ethereum';
+  var DEFAULT_NETWORK_ID = 'genlayerStudionet';
   var NETWORK_IDS = ['ethereum', 'bsc', 'base', 'arbitrum', 'optimism', 'genlayerStudionet', 'genlayerBradbury'];
 
   // GenLayer *audit* networks that map 1:1 onto a GenLayer execution network id.

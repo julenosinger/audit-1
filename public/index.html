@@ -1449,7 +1449,29 @@ function renderAuditResult(address, networkId, result, net) {
     body += `No known issues detected by the local static analyzer.`;
   }
 
-  appendAIMessage(header + '\n\n' + body, cardHtml);
+  appendAIMessage(header + '\n\n' + body, cardHtml + renderNextActionsHtml());
+}
+
+// Phase 7.5: next best actions derived from the Context Engine (never
+// fabricated, never unsupported operations).
+function renderNextActionsHtml() {
+  const ctx = getAppContext();
+  const acts = window.AuditAIIntentRouter ? window.AuditAIIntentRouter.nextActions(ctx) : [];
+  if (!acts.length) return '';
+  const map = {
+    audit_contract: { label: 'Audit Contract', fn: "dispatchQuickAction('audit_contract')" },
+    explain_findings: { label: 'Explain Findings', fn: "dispatchQuickAction('explain_findings')" },
+    audit_again: { label: 'Audit Another', fn: "dispatchQuickAction('audit_contract')" },
+    create_genlayer: { label: 'Create GenLayer Contract', fn: "dispatchQuickAction('create_contract')" },
+    copy_solidity: { label: 'Copy Solidity', fn: 'copyContractSource()' }
+  };
+  const buttons = acts.map(function (a) {
+    const m = map[a.id];
+    if (!m) return '';
+    return '<button type="button" class="publish-btn llm-btn" onclick="' + m.fn + '">' + m.label + '</button>';
+  }).filter(Boolean).join(' ');
+  if (!buttons) return '';
+  return '<div class="result-card" style="max-width:560px"><div class="rc-footer" style="border:none"><div class="rc-footer-actions">' + buttons + '</div></div></div>';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1485,6 +1507,9 @@ async function auditGenLayerContract(deployment) {
 
   const chainId = d.chainId || 61999;
   const storeKey = chainId + ':' + String(d.address).toLowerCase();
+  const findings = review ? review.warnings.map(function (w, i) {
+    return { id: 'src-' + String(i + 1).padStart(3, '0'), severity: w.level === 'HIGH' ? 'MEDIUM' : 'INFO', confidence: 'LOW', category: 'other', title: w.text };
+  }) : [];
   const payload = {
     version: '8.1.0',
     analysisVersion: '8.1.0',
@@ -1492,12 +1517,12 @@ async function auditGenLayerContract(deployment) {
     networkName: 'GenLayer Studionet',
     chainId: chainId,
     contract: { address: d.address, chainId: chainId, network: 'genlayerStudionet', contractType: 'GENLAYER', bytecodeAvailable: false },
-    analysis: { sourceReview: review, source: d.source || null, contractType: d.contractType || null },
-    findings: review ? review.warnings.map(function (w) { return { id: 'src-' + w.level, severity: w.level === 'HIGH' ? 'MEDIUM' : 'INFO', confidence: 'LOW', category: 'other', title: w.text }; }) : []
+    analysis: { auditType: 'GENLAYER_SOURCE_REVIEW', sourceReview: review, source: d.source || null, contractType: d.contractType || null },
+    findings: findings
   };
   GL_AUDIT_STORE[storeKey] = {
     address: String(d.address).toLowerCase(), chainId: chainId, networkId: 'genlayerStudionet', networkName: 'GenLayer Studionet',
-    score: 100, verdict: 'UNKNOWN', confidence: 'LOW',
+    score: null, verdict: 'UNKNOWN', confidence: 'LOW',
     summary: 'GenLayer intelligent contract — source-based security review.',
     context: d.source || '', payload: payload, hasBytecode: false, glNetwork: { name: 'Studionet', chainId: 61999, contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B' }
   };
@@ -1519,31 +1544,38 @@ async function auditGenLayerContract(deployment) {
       '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
       '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="requestGenLayerAnalysis(\'' + d.address + '\')">Analyze with GenLayer AI</button></div></div></div>';
   }
-  appendAIMessage(msg + '\n\nRisk: **UNKNOWN** · Confidence: **LOW**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
+  appendAIMessage(msg + '\n\nAudit type: **GENLAYER_SOURCE_REVIEW** · Risk: **UNKNOWN** · Confidence: **LOW** · Score: **N/A**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
+}
+
+// Unified audit handler — used by BOTH the Chat ("audit 0x…") and the
+// "Audit Contract" quick action. Context decides: a GenLayer deployment is
+// audited via the GenLayer pipeline (never eth_getCode); otherwise auto-discovery.
+async function handleAuditIntent(address) {
+  if (address) { await discoverAndAudit(address); return; }
+  const ctx = getAppContext();
+  const plan = window.AuditAIIntentRouter.planAudit(ctx);
+  if (plan.mode === 'genlayer' && plan.deployment) {
+    appendUserMessage('Audit Contract');
+    const d = plan.deployment;
+    const card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Recent Deployment Detected</div>' +
+      '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
+      '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + (d.chainId || 61999) + '</b></div>' +
+      '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div></div>' +
+      '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Now</button></div></div></div>';
+    appendAIMessage('A **recent deployment** is available — I can audit it directly without asking for the address again.', card);
+    return;
+  }
+  if (plan.mode === 'discover' && plan.address) { await discoverAndAudit(plan.address); return; }
+  appendUserMessage('Audit Contract');
+  appendAIMessage('Please provide a contract address to audit — paste a `0x…` address and I will discover its network and run the local audit.');
 }
 
 async function dispatchQuickAction(action) {
-  const ctx = getAppContext();
   currentIntent = action;
   switch (action) {
-    case 'audit_contract': {
-      const plan = window.AuditAIIntentRouter.planAudit(ctx);
-      if (plan.mode === 'genlayer' && plan.deployment) {
-        appendUserMessage('Audit Contract');
-        const d = plan.deployment;
-        const card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Recent Deployment Detected</div>' +
-          '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
-          '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + (d.chainId || 61999) + '</b></div>' +
-          '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div></div>' +
-          '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Now</button></div></div></div>';
-        appendAIMessage('A **recent deployment** is available — I can audit it directly without asking for the address again.', card);
-        return;
-      }
-      if (plan.mode === 'discover' && plan.address) { await discoverAndAudit(plan.address); return; }
-      appendUserMessage('Audit Contract');
-      appendAIMessage('Please provide a contract address to audit — paste a `0x…` address and I will discover its network and run the local audit.');
+    case 'audit_contract':
+      await handleAuditIntent(null);
       return;
-    }
     case 'create_contract':
       appendUserMessage('Create Contract');
       await handleCreateContract('');
@@ -1636,30 +1668,15 @@ Well-known protocols (USDC, Uniswap, Aave) score 80+. Unknown contracts score lo
 // ═══════════════════════════════════════════════════════════════════════════════
 // INTENT PARSER
 // ═══════════════════════════════════════════════════════════════════════════════
-async function parseIntent(text) {
-  // Detect address in message
+// Unified intent classification — delegates to the SINGLE Intent Router so the
+// Chat and Quick Actions share the exact same brain. No Ethereum fallback, no
+// legacy intent flags.
+function parseIntent(text) {
   const addrMatch = text.match(/0x[0-9a-fA-F]{40}/i);
   const address = addrMatch ? addrMatch[0] : null;
-
-  // Detect audit network. The selector is authoritative; free text may select
-  // a specific network by name. Unrecognized names fall back to the selector.
-  let networkId = auditNetworkId;
-  const lc = text.toLowerCase();
-  if (lc.includes('studionet')) networkId = 'genlayerStudionet';
-  else if (lc.includes('bradbury')) networkId = 'genlayerBradbury';
-  else if (lc.includes('ethereum') || lc.includes('mainnet') || lc.includes(' eth')) networkId = 'ethereum';
-  if (!window.AuditAINetworks || !window.AuditAINetworks.getNetwork(networkId)) networkId = 'ethereum';
-
-  // Detect intent
-  const isCompare = /compar/i.test(text) && (text.match(/0x[0-9a-fA-F]{40}/gi)||[]).length >= 2;
-  const isPortfolio = /portfolio|my wallet|my contracts/i.test(text) && !address;
-  const isApprovals = /approv|allowance/i.test(text) && !address;
-  const isExplain   = /explain|what is|what are|how does|define/i.test(text) && !address;
-  const isAudit     = !!address;
-  // Phase 7: contract creation is detected only when no address is present.
-  const isCreate    = !address && (window.AuditAIContractBuilder ? window.AuditAIContractBuilder.isCreateIntent(text) : false);
-
-  return { address, networkId, isCompare, isPortfolio, isApprovals, isExplain, isAudit, isCreate };
+  const intent = (window.AuditAIIntentRouter && window.AuditAIIntentRouter.detectIntent(text, !!address)) || 'UNKNOWN';
+  const isCompare = /compar/i.test(text) && (text.match(/0x[0-9a-fA-F]{40}/gi) || []).length >= 2;
+  return { address, intent, isCompare };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1714,25 +1731,21 @@ async function handleInput() {
 
   appendUserMessage(text);
 
-  const intent = await parseIntent(text);
+  const intent = parseIntent(text);
 
-  if (intent.isPortfolio) { document.getElementById('sendBtn').disabled = false; await scanPortfolio(); return; }
-  if (intent.isApprovals) { document.getElementById('sendBtn').disabled = false; await checkApprovals(); return; }
-  if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.networkId); return; }
-  if (intent.isCreate)    { document.getElementById('sendBtn').disabled = false; await handleCreateContract(text); return; }
+  if (intent.isCompare) { document.getElementById('sendBtn').disabled = false; await compareContracts(text, auditNetworkId); return; }
 
-  // Phase 7.4: route EXPLAIN_FINDINGS / ASSESS_APPROVAL through the same
-  // handlers as the quick actions (shared Intent Router).
-  if (window.AuditAIIntentRouter) {
-    const routed = window.AuditAIIntentRouter.detectIntent(text, !!intent.address);
-    if (routed === 'EXPLAIN_FINDINGS') { document.getElementById('sendBtn').disabled = false; explainFindings(); return; }
-    if (routed === 'ASSESS_APPROVAL') { document.getElementById('sendBtn').disabled = false; assessApproval(); return; }
-  }
-
-  if (intent.isAudit) {
-    document.getElementById('sendBtn').disabled = false;
-    await discoverAndAudit(intent.address);
-    return;
+  // Phase 7.5: single brain — route by intent exactly like the Quick Actions.
+  switch (intent.intent) {
+    case 'VIEW_PORTFOLIO': document.getElementById('sendBtn').disabled = false; await scanPortfolio(); return;
+    case 'CHECK_APPROVALS': document.getElementById('sendBtn').disabled = false; await checkApprovals(); return;
+    case 'CREATE_CONTRACT': document.getElementById('sendBtn').disabled = false; await handleCreateContract(text); return;
+    case 'EXPLAIN_FINDINGS': document.getElementById('sendBtn').disabled = false; explainFindings(); return;
+    case 'ASSESS_APPROVAL': document.getElementById('sendBtn').disabled = false; assessApproval(); return;
+    case 'AUDIT_CONTRACT':
+      document.getElementById('sendBtn').disabled = false;
+      await handleAuditIntent(intent.address);
+      return;
   }
 
   // General question — local glossary (default) or Claude (flag)
