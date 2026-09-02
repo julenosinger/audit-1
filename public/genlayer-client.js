@@ -401,8 +401,9 @@
       // ── ONE transaction engine (Phase 7.6.2) ────────────────────────────────
       // Poll the REAL GenLayer transaction status through the single GenLayerTx
       // engine. There is NO local elapsed-time timeout and NO alternate
-      // lifecycle: the transaction continues until the chain reports ACCEPTED /
-      // FINALIZED / a real terminal failure.
+      // lifecycle. The audit result is only treated as on-chain after FINALIZED
+      // (ACCEPTED is kept as an intermediate "waiting for finality" step), and
+      // only after get_analysis returns a real value.
       var txEngine = (typeof globalThis !== 'undefined' && globalThis.AuditAIGenLayerTx) ? globalThis.AuditAIGenLayerTx : null;
       if (!txEngine || typeof txEngine.monitorTransaction !== 'function') {
         throw new Error('SDK_UNAVAILABLE');
@@ -412,6 +413,7 @@
         hash: hash,
         getStatus: function (h) { return c.getTransaction({ hash: h }); },
         onStatus: function (state, detail) { emit(opts, state, detail); },
+        until: 'FINALIZED',
         pollInterval: opts.pollInterval,
         maxConsecutiveRpcErrors: opts.maxConsecutiveRpcErrors,
         maxAttempts: opts.maxAttempts,

@@ -4,7 +4,7 @@ Smart-contract security scanner in a chat UI. Audit any EVM contract, scan a
 wallet's portfolio, check token approvals, or compare two contracts — then
 publish the result on-chain to **GenLayer**.
 
-Live: <https://auditai-6di.pages.dev/>
+Live: <https://forgecontract.xyz/> (mirror: <https://auditai-6di.pages.dev/>)
 
 ## Architecture
 
@@ -16,6 +16,12 @@ Live: <https://auditai-6di.pages.dev/>
 - **`contracts/audit_ai.py`** — GenLayer Intelligent Contract that records audit
   results on-chain. Records are mutable, caller-submitted analyses (a later
   publish overwrites the stored record; not an append-only log).
+
+The default GenLayer transaction network is **Bradbury** (AuditAI
+`0x119Ac58AF8546Df0B0E55eB24277C756d9458000`, chainId 4221); Studionet stays
+available in the selector. On-chain publish/adjudicate waits for **FINALIZED**
+and reads the contract state before showing an on-chain badge; the Studio
+copy-call fallback (no wallet / no SDK) is explicitly **off-chain**.
 - **`functions/api/claude.js`** — optional Anthropic proxy (kept for regression,
   but **not required**; disabled by default via `USE_CLAUDE = false`).
 - **`wrangler.toml`** — Cloudflare Pages project `auditai`.

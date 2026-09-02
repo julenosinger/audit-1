@@ -137,12 +137,12 @@ test('analyzeEvidence: missing method => METHOD_MISSING', async function () {
   }, /METHOD_MISSING/);
 });
 
-test('analyzeEvidence: NO_ANALYSIS result => AUDIT_RESULT_PENDING (accepted, recovering)', async function () {
+test('analyzeEvidence: FINALIZED + NO_ANALYSIS => AUDIT_RESULT_PENDING (accepted, recovering)', async function () {
   var sdk = mockSdk();
   sdk.createClient = function (config) {
     var read = {
       getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
-      getTransaction: async function () { return { statusName: 'ACCEPTED', status: 5, txExecutionResultName: 'FINISHED_WITH_RETURN' }; },
+      getTransaction: async function () { return { statusName: 'FINALIZED', status: 7, txExecutionResultName: 'FINISHED_WITH_RETURN' }; },
       readContract: async function () { return 'NO_ANALYSIS'; }
     };
     var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };

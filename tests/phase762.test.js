@@ -173,9 +173,9 @@ test('deployContract: FINALIZED returns finalized=true (ACCEPTED ≠ FINALIZED)'
 
 // ── Audit through the single engine ───────────────────────────────────────────
 
-test('analyzeEvidence: LEADER_TIMEOUT then ACCEPTED recovers the real result', async function () {
+test('analyzeEvidence: LEADER_TIMEOUT → appeal → ACCEPTED → FINALIZED recovers the real result', async function () {
   Tx.resetStates();
-  var sdk = sequenceSdk(['PENDING', 'LEADER_TIMEOUT', 'APPEAL_COMMITTING', 'REVEALING', 'ACCEPTED'], null);
+  var sdk = sequenceSdk(['PENDING', 'LEADER_TIMEOUT', 'APPEAL_COMMITTING', 'REVEALING', 'ACCEPTED', 'FINALIZED'], null);
   var a = GenLayerClient.createAdapter(sdk, { networkId: 'bradbury', networks: TEST_NETWORKS });
   var payload = { version: '8.1.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
   var states = [];
@@ -183,10 +183,11 @@ test('analyzeEvidence: LEADER_TIMEOUT then ACCEPTED recovers the real result', a
   assert.equal(resp.verdict, 'NO_CONFIRMED_VULNERABILITY');
   assert.ok(states.indexOf('LEADER_TIMEOUT') !== -1);
   assert.ok(states.indexOf('APPEAL_COMMITTING') !== -1);
-  assert.ok(states.indexOf('ACCEPTED') !== -1);
+  assert.ok(states.indexOf('ACCEPTED') !== -1, 'ACCEPTED kept as intermediate step');
+  assert.ok(states.indexOf('FINALIZED') !== -1, 'FINALIZED required before result recovery');
   assert.equal(states.indexOf('TIMEOUT'), -1);
   assert.equal(Tx.state('0xaudit').operation, 'AUDIT_AI');
-  assert.equal(Tx.state('0xaudit').status, 'ACCEPTED');
+  assert.equal(Tx.state('0xaudit').status, 'FINALIZED');
 });
 
 // ── Persistence + recovery ────────────────────────────────────────────────────
