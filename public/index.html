@@ -21,6 +21,7 @@
 <script src="genlayer-tx.js"></script>
 <script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
+<script src="genlayer-verify.js"></script>
 <script src="genlayer-interaction.js"></script>
 <script src="genlayer-auditor.js"></script>
 <script src="audit-engine.js"></script>
@@ -1700,14 +1701,32 @@ var GL_TX_TO_ADDR = {};   // txHash -> contract address (audit)
 var GL_TX_TO_BUILD = {};  // txHash -> { build, net } (deploy)
 
 function explorerUrlFor(networkId) {
+  var V = window.AuditAIGenLayerVerify;
+  if (V && typeof V.explorerBaseUrl === 'function') return V.explorerBaseUrl(networkId);
   if (networkId === 'bradbury') return 'https://explorer-bradbury.genlayer.com/';
   return null; // Studionet has no public explorer URL.
 }
 
+// Transaction-specific Explorer URL (confirmed route /tx/:hash).
+function explorerTxUrlFor(networkId, txHash) {
+  var V = window.AuditAIGenLayerVerify;
+  if (V && typeof V.explorerTxUrl === 'function') return V.explorerTxUrl(networkId, txHash);
+  return null;
+}
+
+// Address/contract-specific Explorer URL (confirmed route /address/:address).
+function explorerAddressUrlFor(networkId, address) {
+  var V = window.AuditAIGenLayerVerify;
+  if (V && typeof V.explorerAddressUrl === 'function') return V.explorerAddressUrl(networkId, address);
+  return null;
+}
+
+// The label must match the destination: only a real /tx/:hash URL gets
+// "View Transaction"; otherwise no clickable transaction link is shown.
 function explorerLinkHtml(txHash, networkId) {
-  var base = explorerUrlFor(networkId);
-  if (!base) return '';
-  return '<a class="wchip" href="' + base + '" target="_blank" rel="noopener">Explorer ↗</a>';
+  var url = explorerTxUrlFor(networkId, txHash);
+  if (!url) return '';
+  return '<a class="wchip" href="' + url + '" target="_blank" rel="noopener">View Transaction ↗</a>';
 }
 
 // Compose the single, live progress message content from engine state.
@@ -2076,20 +2095,20 @@ function viewContractOnExplorer() {
   const d = lastDeployment;
   if (!d || !d.address) { appendAIMessage('⚠️ No deployment context available.'); return; }
   const ctx = resolveGenLayerContext(d);
-  const explorer = ctx && ctx.isBradbury ? 'https://explorer-bradbury.genlayer.com/' : null;
-  if (!explorer) { appendAIMessage('Contract: `' + d.address + '` — no explorer is available for this network.'); return; }
-  appendAIMessage('Contract: `' + d.address + '`\nExplorer: **' + explorer + '**');
-  try { window.open(explorer, '_blank'); } catch (e) {}
+  const url = ctx && ctx.isBradbury ? explorerAddressUrlFor('bradbury', d.address) : null;
+  if (!url) { appendAIMessage('Contract: `' + d.address + '` — no explorer is available for this network.'); return; }
+  appendAIMessage('Contract: `' + d.address + '`\nExplorer: **' + url + '**');
+  try { window.open(url, '_blank'); } catch (e) {}
 }
 
 function viewTxOnExplorer() {
   const d = lastDeployment;
   if (!d || !d.txHash) { appendAIMessage('⚠️ No deployment transaction available.'); return; }
   const ctx = resolveGenLayerContext(d);
-  const explorer = ctx && ctx.isBradbury ? 'https://explorer-bradbury.genlayer.com/' : null;
-  if (!explorer) { appendAIMessage('Transaction: `' + d.txHash + '` — no explorer is available for this network.'); return; }
-  appendAIMessage('Transaction: `' + d.txHash + '`\nExplorer: **' + explorer + '**');
-  try { window.open(explorer, '_blank'); } catch (e) {}
+  const url = ctx && ctx.isBradbury ? explorerTxUrlFor('bradbury', d.txHash) : null;
+  if (!url) { appendAIMessage('Transaction: `' + d.txHash + '` — no explorer is available for this network.'); return; }
+  appendAIMessage('Transaction: `' + d.txHash + '`\nExplorer: **' + url + '**');
+  try { window.open(url, '_blank'); } catch (e) {}
 }
 
 // Unified audit handler — used by BOTH the Chat ("audit 0x…") and the
@@ -2486,12 +2505,14 @@ async function publishToGenLayer(addr) {
     }
   });
 
-  if (res.ok && res.onChain) {
+  if (res.ok && res.onChain && res.verified) {
     window.AuditAIGenLayer.markPublished(addr);
     markGLButtonPublished(addr);
     renderSidebar();
-    const explorer = (net && net.id === 'bradbury') ? '\n\n[Explorer ↗](https://explorer-bradbury.genlayer.com/)' : '';
-    appendAIMessage('✅ **Published on-chain.**\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + explorer);
+    const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
+    appendAIMessage('✅ **ON-CHAIN VERIFIED** — audit record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
+  } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
+    appendAIMessage('⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state does not match the submitted record.\n\nTransaction: `' + res.hash + '`\n\nFields mismatched: ' + (res.mismatchFields && res.mismatchFields.length ? res.mismatchFields.join(', ') : 'unknown') + '\n\nNot marked on-chain.');
   } else if (res.fallback) {
     window.AuditAIGenLayer.copyToClipboard(res.calldata);
     appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
@@ -2524,13 +2545,15 @@ async function adjudicateGL(addr) {
     }
   });
 
-  if (res.ok && res.onChain) {
+  if (res.ok && res.onChain && res.verified) {
     window.AuditAIGenLayer.markPublished(addr);
     markGLButtonPublished(addr);
     renderSidebar();
-    const explorer = (net && net.id === 'bradbury') ? '\n\n[Explorer ↗](https://explorer-bradbury.genlayer.com/)' : '';
-    appendAIMessage('✅ **Published on-chain.**\n\nTransaction: `' + res.hash + '`' + explorer);
+    const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
+    appendAIMessage('✅ **ON-CHAIN VERIFIED** — adjudicated record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
     applyOnChainResult(addr, res.result);
+  } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
+    appendAIMessage('⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state could not be verified as a valid published record.\n\nTransaction: `' + res.hash + '`\n\nNot marked on-chain.');
   } else if (res.fallback) {
     window.AuditAIGenLayer.copyToClipboard(res.calldata);
     appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');

@@ -149,9 +149,60 @@
     });
   }
 
+  // After FINALIZED: read get_audit + get_author, then run the centralized
+  // OnChainStateVerifier. onChain/verified is TRUE only on VERIFIED_ON_CHAIN.
+  function verifyOnChain(client, target, contractAddr, action, expected, hash) {
+    var net = getNetwork();
+    var Verify = window.AuditAIGenLayerVerify;
+    var readAudit = Promise.resolve().then(function () { return client.read(target, 'get_audit', [contractAddr]); }).catch(function () { return null; });
+    var readAuthor = Promise.resolve().then(function () { return client.read(target, 'get_author', [contractAddr]); }).catch(function () { return null; });
+    return Promise.all([readAudit, readAuthor]).then(function (vals) {
+      var reads = { getAudit: vals[0], getAuthor: vals[1] };
+      var verification;
+      if (Verify && typeof Verify.verifyFinalizedOnChainState === 'function') {
+        verification = Verify.verifyFinalizedOnChainState({
+          action: action,
+          txHash: hash,
+          contractAddress: contractAddr,
+          networkId: net ? net.id : null,
+          chainId: net ? net.chainId : null,
+          submittedBy: expected.submittedBy || null,
+          expected: expected,
+          state: reads
+        });
+      } else {
+        var hasData = (typeof reads.getAudit === 'string' && reads.getAudit && reads.getAudit !== 'NO_AUDIT');
+        verification = {
+          verified: hasData,
+          status: hasData ? 'VERIFIED_ON_CHAIN' : 'VERIFICATION_PENDING',
+          matchedFields: [],
+          mismatchFields: [],
+          verifiedAt: hasData ? Date.now() : null
+        };
+      }
+      var explorerUrl = (Verify && typeof Verify.explorerTxUrl === 'function')
+        ? Verify.explorerTxUrl(net ? net.id : null, hash)
+        : null;
+      return {
+        ok: true,
+        hash: hash,
+        verified: verification.verified,
+        verificationStatus: verification.status,
+        onChain: verification.verified,
+        matchedFields: verification.matchedFields || [],
+        mismatchFields: verification.mismatchFields || [],
+        result: reads.getAudit,
+        author: reads.getAuthor,
+        contract: target,
+        explorerUrl: explorerUrl
+      };
+    });
+  }
+
   // publish(contractAddr, score, verdict, findings, opts) -> Promise
   //   opts: { account, onStatus, pollInterval, maxConsecutiveRpcErrors }
-  //   resolves { ok:true, hash, onChain, result } only after FINALIZED + read.
+  //   resolves { ok:true, hash, verified, verificationStatus, onChain, result }
+  //   only after FINALIZED + read + state verification.
   function publish(contractAddr, score, verdict, findings, opts) {
     opts = opts || {};
     var target = getContract();
@@ -164,14 +215,12 @@
     if (!client || typeof client.writeContract !== 'function' || !account) {
       return Promise.resolve(fallbackResult(target, 'publish_audit', contractAddr, args, 'No wallet connected — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.'));
     }
+    var expected = { score: score, verdict: verdict, findings: findings, submittedBy: account };
     return client.writeContract(target, 'publish_audit', args, { account: account })
       .then(function (hash) {
         if (typeof opts.onStatus === 'function') opts.onStatus('SUBMITTED', hash);
         return waitFinalized(client, hash, opts).then(function () {
-          return client.read(target, 'get_audit', [contractAddr]).then(function (result) {
-            var onChain = (typeof result === 'string' && result && result !== 'NO_AUDIT');
-            return { ok: true, hash: hash, onChain: onChain, result: result, contract: target };
-          });
+          return verifyOnChain(client, target, contractAddr, 'publish_audit', expected, hash);
         });
       })
       .catch(function (e) {
@@ -197,7 +246,8 @@
   }
 
   // analyzeAndPublish(contractAddr, context, opts) -> Promise
-  //   Adjudicates via the GenLayer LLM, waits FINALIZED, then reads get_audit.
+  //   Adjudicates via the GenLayer LLM, waits FINALIZED, then reads + verifies
+  //   get_audit state before reporting it as on-chain.
   function analyzeAndPublish(contractAddr, context, opts) {
     opts = opts || {};
     var target = getContract();
@@ -211,14 +261,12 @@
     if (!client || typeof client.writeContract !== 'function' || !account) {
       return Promise.resolve(fallbackResult(target, 'analyze_and_publish', contractAddr, args, 'No wallet connected — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.'));
     }
+    var expected = { submittedBy: account };
     return client.writeContract(target, 'analyze_and_publish', args, { account: account })
       .then(function (hash) {
         if (typeof opts.onStatus === 'function') opts.onStatus('SUBMITTED', hash);
         return waitFinalized(client, hash, opts).then(function () {
-          return client.read(target, 'get_audit', [contractAddr]).then(function (result) {
-            var onChain = (typeof result === 'string' && result && result !== 'NO_AUDIT');
-            return { ok: true, hash: hash, onChain: onChain, result: result, contract: target };
-          });
+          return verifyOnChain(client, target, contractAddr, 'analyze_and_publish', expected, hash);
         });
       })
       .catch(function (e) {
