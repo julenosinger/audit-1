@@ -26,10 +26,11 @@ test('Studionet chain id is 61999 and AuditAI contract is configured', function 
   assert.equal(GenLayerClient.NETWORKS.studionet.deployed, true);
 });
 
-test('Bradbury chain id is 4221 and is NOT the default / not deployed', function () {
+test('Bradbury chain id is 4221; known contract + deployment tx registered', function () {
   assert.equal(GenLayerClient.NETWORKS.bradbury.chainId, 4221);
-  assert.equal(GenLayerClient.NETWORKS.bradbury.deployed, false);
-  assert.equal(GenLayerClient.NETWORKS.bradbury.contract, '');
+  assert.equal(GenLayerClient.NETWORKS.bradbury.deployed, true); // AuditAI deployed on Bradbury
+  assert.equal(GenLayerClient.NETWORKS.bradbury.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
+  assert.equal(GenLayerClient.NETWORKS.bradbury.knownDeploymentTx, '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc');
   assert.notEqual(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
 });
 

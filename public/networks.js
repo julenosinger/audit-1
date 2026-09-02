@@ -76,9 +76,9 @@
       nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 }
     },
     genlayerBradbury: {
-      id: 'genlayerBradbury', name: 'GenLayer Bradbury', chainId: 4221,
+      id: 'genlayerBradbury', name: 'GenLayer Bradbury Testnet', chainId: 4221,
       rpc: 'https://rpc-bradbury.genlayer.com',
-      explorer: null, explorerName: null,
+      explorer: 'https://explorer-bradbury.genlayer.com/', explorerName: 'Bradbury Explorer',
       type: 'testnet', enabled: true, supportsLocalAudit: true, supportsGenLayer: true, genLayerContract: '',
       nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 }
     }

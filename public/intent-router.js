@@ -22,7 +22,9 @@
     VIEW_PORTFOLIO: 'VIEW_PORTFOLIO',
     CHECK_APPROVALS: 'CHECK_APPROVALS',
     EXPLAIN_FINDINGS: 'EXPLAIN_FINDINGS',
-    ASSESS_APPROVAL: 'ASSESS_APPROVAL'
+    ASSESS_APPROVAL: 'ASSESS_APPROVAL',
+    INSPECT_CONTRACT: 'INSPECT_CONTRACT',
+    INTERACT_CONTRACT: 'INTERACT_CONTRACT'
   };
 
   function networks() {
@@ -44,6 +46,17 @@
 
   function isGenLayerNetwork(networkId) { return networkFamily(networkId) === 'GENLAYER'; }
 
+  // Resolve a contract address to its GenLayer network when it is a *known*
+  // GenLayer contract (Studionet AuditAI or the Bradbury contract). Never
+  // assumes an EVM network for an intelligent contract.
+  function networkForContract(address) {
+    var client = (typeof globalThis !== 'undefined' ? globalThis : window).AuditAIGenLayerClient;
+    if (!client || typeof client.knownContractFor !== 'function') return null;
+    var known = client.knownContractFor(address);
+    if (!known) return null;
+    return { family: 'GENLAYER', networkId: known.networkId, chainId: known.chainId, known: known };
+  }
+
   // Map free text (Chat) or a quick-action label to a real intent.
   // `hasAddress` true when a 0x… address was already detected in the message.
   function detectIntent(text, hasAddress) {
@@ -54,6 +67,8 @@
     if (/approv|allowance/i.test(t)) return INTENTS.CHECK_APPROVALS;
     if (/portfolio|my wallet|my contracts|my tokens/i.test(t)) return INTENTS.VIEW_PORTFOLIO;
     if (/explain|what.*finding|findings|last finding/i.test(t)) return INTENTS.EXPLAIN_FINDINGS;
+    if (/\b(interact|call|write to|execute)\b/.test(t) && /\b(contract|function|method)\b/.test(t)) return INTENTS.INTERACT_CONTRACT;
+    if (/\b(read|show|list|inspect|view)\b/.test(t) && /\b(functions?|schemas?|methods?|contract)\b/.test(t)) return INTENTS.INSPECT_CONTRACT;
     if (/\baudit\b|\bscan\b|\binspect\b|0x[0-9a-f]{40}/i.test(t)) return INTENTS.AUDIT_CONTRACT;
     return 'UNKNOWN';
   }
@@ -73,6 +88,12 @@
         return { wallet: false, read: true, write: false, evm: true, genlayer: true };
       case INTENTS.ASSESS_APPROVAL:
         return { wallet: 'conditional', read: true, write: false, evm: true, genlayer: 'as-applicable' };
+      case INTENTS.INSPECT_CONTRACT:
+        return { wallet: false, read: true, write: false, evm: true, genlayer: true };
+      case INTENTS.INTERACT_CONTRACT:
+        // Reads need no wallet; the write path is a separate, explicitly
+        // confirmed step (never auto-signed), so the intent itself never writes.
+        return { wallet: 'conditional', read: true, write: false, evm: false, genlayer: true };
       default:
         return { wallet: false, read: false, write: false, evm: false, genlayer: false };
     }
@@ -126,8 +147,10 @@
     var actions = [];
     if (ctx.lastDeployment && ctx.lastDeployment.address) {
       actions.push({ id: 'audit_contract', label: 'Audit Contract' });
+      actions.push({ id: 'inspect_contract', label: 'Inspect Contract' });
       actions.push({ id: 'view_contract', label: 'View Contract' });
       if (ctx.lastDeployment.txHash) actions.push({ id: 'view_tx', label: 'View Transaction' });
+      actions.push({ id: 'interact_contract', label: 'Interact with Contract' });
     } else if (ctx.lastAudit) {
       actions.push({ id: 'explain_findings', label: 'Explain Findings' });
       actions.push({ id: 'audit_again', label: 'Audit Again' });
@@ -143,6 +166,7 @@
     detectIntent: detectIntent,
     networkFamily: networkFamily,
     isGenLayerNetwork: isGenLayerNetwork,
+    networkForContract: networkForContract,
     capability: capability,
     buildContext: buildContext,
     planAudit: planAudit,

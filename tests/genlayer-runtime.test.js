@@ -10,9 +10,17 @@ const Engine = require('../public/audit-engine.js');
 
 const TEST_NETWORKS = {
   studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0x' + 'ab'.repeat(20), deployed: true },
-  bradbury:  { id: 'bradbury',  name: 'Bradbury',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com', contract: '', deployed: false }
+  bradbury:  { id: 'bradbury',  name: 'Bradbury Testnet',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com', contract: '0x' + 'cd'.repeat(20), deployed: true }
 };
 const STUDIO_CONTRACT = TEST_NETWORKS.studionet.contract;
+const BRADBURY_CONTRACT = TEST_NETWORKS.bradbury.contract;
+
+// A fixture where Bradbury has NOT deployed an auditor (exercises the honest
+// GENLAYER_AUDITOR_NOT_DEPLOYED guard without touching the real registry).
+const UNDEPLOYED_NETWORKS = {
+  studionet: TEST_NETWORKS.studionet,
+  bradbury: { id: 'bradbury', name: 'Bradbury Testnet', chainId: 4221, rpc: 'https://rpc-bradbury.genlayer.com', contract: '', deployed: false }
+};
 
 function mockSdk() {
   var readClient = {
@@ -45,13 +53,14 @@ function makeAdapter(sdk, netId) {
 
 // ── network registry / pairing ──────────────────────────────────────────────
 
-test('registry: Studionet deployed with a 42-char contract, Bradbury pending', function () {
+test('registry: Studionet + Bradbury both deployed with AuditAI contracts', function () {
   var reg = GenLayerClient.NETWORKS;
   assert.equal(reg.studionet.deployed, true);
   assert.match(reg.studionet.contract, /^0x[0-9a-fA-F]{40}$/);
-  assert.equal(reg.bradbury.deployed, false);
-  assert.equal(reg.bradbury.contract, '');
+  assert.equal(reg.bradbury.deployed, true);
+  assert.equal(reg.bradbury.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
   assert.equal(reg.bradbury.chainId, 4221);
+  assert.equal(reg.bradbury.knownContract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
 });
 
 test('studionet selects the studionet contract', function () {
@@ -62,12 +71,12 @@ test('studionet selects the studionet contract', function () {
   assert.equal(a.isAvailable(), true);
 });
 
-test('bradbury selects the bradbury config (honest: not deployed)', function () {
+test('bradbury selects the bradbury config (AuditAI deployed on 4221)', function () {
   var a = makeAdapter(mockSdk(), 'bradbury');
   assert.equal(a.getNetworkId(), 'bradbury');
   assert.equal(a.getNetwork().chainId, 4221);
-  assert.equal(a.getNetwork().deployed, false);
-  assert.equal(a.getContract(), '');
+  assert.equal(a.getNetwork().deployed, true);
+  assert.equal(a.getContract(), BRADBURY_CONTRACT);
 });
 
 test('contract schema exposes analyze_evidence and get_analysis', async function () {
@@ -94,8 +103,8 @@ test('analyzeEvidence: no account => WALLET_REQUIRED', async function () {
   }, /WALLET_REQUIRED/);
 });
 
-test('analyzeEvidence: bradbury not deployed => GENLAYER_AUDITOR_NOT_DEPLOYED', async function () {
-  var a = makeAdapter(mockSdk(), 'bradbury');
+test('analyzeEvidence: undeployed auditor => GENLAYER_AUDITOR_NOT_DEPLOYED', async function () {
+  var a = GenLayerClient.createAdapter(mockSdk(), { networkId: 'bradbury', networks: UNDEPLOYED_NETWORKS });
   var payload = { version: '5.0.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
   await assert.rejects(function () {
     return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
@@ -152,8 +161,8 @@ test('preflight: studionet passes and reports methods', async function () {
   assert.ok(pf.methods.indexOf('get_analysis') !== -1);
 });
 
-test('preflight: bradbury reports GENLAYER_AUDITOR_NOT_DEPLOYED', async function () {
-  var a = makeAdapter(mockSdk(), 'bradbury');
+test('preflight: undeployed auditor reports GENLAYER_AUDITOR_NOT_DEPLOYED', async function () {
+  var a = GenLayerClient.createAdapter(mockSdk(), { networkId: 'bradbury', networks: UNDEPLOYED_NETWORKS });
   var pf = await a.preflight();
   assert.equal(pf.ok, false);
   assert.equal(pf.error, 'GENLAYER_AUDITOR_NOT_DEPLOYED');

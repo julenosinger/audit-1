@@ -20,6 +20,7 @@
 <script src="genlayer-sdk.bundle.js"></script>
 <script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
+<script src="genlayer-interaction.js"></script>
 <script src="genlayer-auditor.js"></script>
 <script src="audit-engine.js"></script>
 <script src="local-scan.js"></script>
@@ -628,12 +629,12 @@ function onAuditNetworkChange(id) {
 }
 
 // Transaction / deployment network — GENLAYER ONLY. Studionet (61999) is the
-// default; Bradbury remains available but is never forced. No external EVM
-// network can ever resolve here.
+// default; Bradbury (4221) is an operational GenLayer transaction network.
+// No external EVM network can ever resolve here.
 function getTransactionNetwork() {
   if (!window.AuditAIGenLayer) return null;
   var id = window.AuditAIGenLayer.getNetworkId();
-  if (!id || id === 'bradbury') id = 'studionet'; // Phase 7.3: pin default to Studionet
+  if (!id) id = 'studionet';
   return window.AuditAIGenLayer.getNetwork && window.AuditAIGenLayer.NETWORKS
     ? (window.AuditAIGenLayer.NETWORKS[id] || window.AuditAIGenLayer.NETWORKS.studionet || null)
     : null;
@@ -1463,7 +1464,11 @@ function renderNextActionsHtml() {
     explain_findings: { label: 'Explain Findings', fn: "dispatchQuickAction('explain_findings')" },
     audit_again: { label: 'Audit Another', fn: "dispatchQuickAction('audit_contract')" },
     create_genlayer: { label: 'Create GenLayer Contract', fn: "dispatchQuickAction('create_contract')" },
-    copy_solidity: { label: 'Copy Solidity', fn: 'copyContractSource()' }
+    copy_solidity: { label: 'Copy Solidity', fn: 'copyContractSource()' },
+    inspect_contract: { label: 'Inspect Contract', fn: "dispatchQuickAction('inspect_contract')" },
+    interact_contract: { label: 'Interact with Contract', fn: "dispatchQuickAction('interact_contract')" },
+    view_contract: { label: 'View Contract', fn: "dispatchQuickAction('view_contract')" },
+    view_tx: { label: 'View Transaction', fn: "dispatchQuickAction('view_tx')" }
   };
   const buttons = acts.map(function (a) {
     const m = map[a.id];
@@ -1493,43 +1498,95 @@ function getAppContext() {
   });
 }
 
+// Resolve the GenLayer network descriptor (name, networkId, chainId, auditor
+// contract) for a deployment or known contract. Returns null when unknown.
+function resolveGenLayerContext(d) {
+  if (!d || !d.address) return null;
+  const I = window.AuditAIGenLayerInteraction;
+  const known = (I && I.knownContractFor) ? I.knownContractFor(d.address) : null;
+  const isBradbury = (known && known.networkId === 'bradbury') ||
+    d.networkId === 'genlayerBradbury' || d.networkId === 'bradbury' ||
+    String(d.network || '').toLowerCase().indexOf('bradbury') !== -1 ||
+    Number(d.chainId) === 4221;
+  const networkId = isBradbury ? 'genlayerBradbury' : 'genlayerStudionet';
+  const networkName = isBradbury ? 'GenLayer Bradbury Testnet' : 'GenLayer Studionet';
+  const chainId = isBradbury ? 4221 : (d.chainId || 61999);
+  const auditorContract = isBradbury ? '0x119Ac58AF8546Df0B0E55eB24277C756d9458000' : '0xF2c549Bf2Dc106a28354B1444298DD460601856B';
+  const execNetworkId = isBradbury ? 'bradbury' : 'studionet';
+  return { networkId, networkName, chainId, auditorContract, known, isBradbury, execNetworkId };
+}
+
 // GenLayer-specific audit. NEVER uses eth_getCode as an existence proof: a
-// GenLayer Intelligent Contract is inspected via its deployment context and a
-// source-based security review (reusing contract-security.js).
+// GenLayer Intelligent Contract is inspected via its deployment context, its
+// real schema/source (GenLayer SDK), and a source-based security review. The
+// result is classified GENLAYER_SOURCE_REVIEW (never EVM_BYTECODE_AUDIT).
 async function auditGenLayerContract(deployment) {
   const d = deployment || lastDeployment;
   if (!d || !d.address) { appendAIMessage('⚠️ No GenLayer deployment context available.'); return; }
+
+  const ctx = resolveGenLayerContext(d);
+  if (!ctx) { appendAIMessage('⚠️ Unknown GenLayer network context.'); return; }
+  const chainId = ctx.chainId;
+  const storeKey = chainId + ':' + String(d.address).toLowerCase();
+
   showTyping();
   const sec = window.AuditAIContractSecurity;
   let review = null;
   if (sec && d.spec && d.source) { try { review = sec.review(d.spec, d.source); } catch (e) { review = null; } }
+
+  // Real schema/source discovery via the GenLayer SDK (never eth_getCode).
+  const I = window.AuditAIGenLayerInteraction;
+  let inspected = null;
+  try {
+    const client = glClientForNetwork(ctx.execNetworkId);
+    if (I && client && typeof client.getContractSchema === 'function') {
+      inspected = await I.inspectContract(client, { networkId: ctx.execNetworkId, chainId: chainId, address: d.address });
+    }
+  } catch (e) { inspected = null; }
   removeTyping();
 
-  const chainId = d.chainId || 61999;
-  const storeKey = chainId + ':' + String(d.address).toLowerCase();
-  const findings = review ? review.warnings.map(function (w, i) {
+  const warnings = review && review.warnings ? review.warnings.map(function (w, i) {
     return { id: 'src-' + String(i + 1).padStart(3, '0'), severity: w.level === 'HIGH' ? 'MEDIUM' : 'INFO', confidence: 'LOW', category: 'other', title: w.text };
   }) : [];
+
+  const result = (I && I.reviewGenLayerContract) ? I.reviewGenLayerContract({
+    networkId: ctx.networkId,
+    networkName: ctx.networkName,
+    chainId: chainId,
+    address: d.address,
+    txHash: d.txHash || (ctx.known && ctx.known.deploymentTx) || null,
+    source: d.source || (inspected && inspected.code) || null,
+    schema: inspected && inspected.schemaAvailable ? { methods: {} } : null,
+    findings: warnings,
+    risk: 'UNKNOWN',
+    confidence: 'LOW'
+  }) : { auditType: 'GENLAYER_SOURCE_REVIEW', networkId: ctx.networkId, networkName: ctx.networkName, chainId: chainId, address: d.address, risk: 'UNKNOWN', confidence: 'LOW', score: null, findings: warnings };
+
   const payload = {
     version: '8.1.0',
     analysisVersion: '8.1.0',
-    network: 'genlayerStudionet',
-    networkName: 'GenLayer Studionet',
+    network: ctx.networkId,
+    networkName: ctx.networkName,
     chainId: chainId,
-    contract: { address: d.address, chainId: chainId, network: 'genlayerStudionet', contractType: 'GENLAYER', bytecodeAvailable: false },
+    contract: { address: d.address, chainId: chainId, network: ctx.networkId, contractType: 'GENLAYER', bytecodeAvailable: false },
     analysis: { auditType: 'GENLAYER_SOURCE_REVIEW', sourceReview: review, source: d.source || null, contractType: d.contractType || null },
-    findings: findings
+    findings: result.findings
   };
+
   GL_AUDIT_STORE[storeKey] = {
-    address: String(d.address).toLowerCase(), chainId: chainId, networkId: 'genlayerStudionet', networkName: 'GenLayer Studionet',
-    score: null, verdict: 'UNKNOWN', confidence: 'LOW',
-    summary: 'GenLayer intelligent contract — source-based security review.',
-    context: d.source || '', payload: payload, hasBytecode: false, glNetwork: { name: 'Studionet', chainId: 61999, contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B' }
+    address: String(d.address).toLowerCase(), chainId: chainId, networkId: ctx.networkId, networkName: ctx.networkName,
+    score: result.score, verdict: 'UNKNOWN', confidence: 'LOW',
+    summary: 'GenLayer intelligent contract — source/schema-based security review.',
+    context: d.source || '', payload: payload, hasBytecode: false, glNetwork: { name: ctx.networkName, chainId: chainId, contract: ctx.auditorContract }
   };
+
+  const schemaNote = inspected && inspected.schemaAvailable
+    ? '\n**Schema:** ' + inspected.readFunctions.length + ' read / ' + inspected.writeFunctions.length + ' write function(s) discovered from the real contract.'
+    : (inspected && inspected.error ? '\n**Schema:** ' + escHtml(inspected.error) : '');
 
   let msg = '**GenLayer Contract Audit**\n\n' +
     'This is a **GenLayer Intelligent Contract** — EVM bytecode inspection is not applicable and it was **not** classified as missing.\n\n' +
-    'Contract: `' + d.address + '`\nNetwork: **GenLayer Studionet**\nChain ID: **' + chainId + '**\nTransaction: `' + (d.txHash || '—') + '`\n';
+    'Contract: `' + d.address + '`\nNetwork: **' + ctx.networkName + '**\nChain ID: **' + chainId + '**\nTransaction: `' + (d.txHash || (ctx.known && ctx.known.deploymentTx) || '—') + '`' + schemaNote + '\n';
 
   let card = '';
   if (review) {
@@ -1540,26 +1597,260 @@ async function auditGenLayerContract(deployment) {
     card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Security Review (source)</div>' + rows + '</div>' +
       '<div class="rc-findings"><div class="rc-findings-title">Deployment</div>' +
       '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
-      '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div>' +
-      '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
+      '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || (ctx.known && ctx.known.deploymentTx) || '—') + '</b></div>' +
+      '<div class="rc-acs">Network: <b>' + escHtml(ctx.networkName) + '</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
       '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="requestGenLayerAnalysis(\'' + d.address + '\')">Analyze with GenLayer AI</button></div></div></div>';
+  } else {
+    card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Deployment</div>' +
+      '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
+      '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || (ctx.known && ctx.known.deploymentTx) || '—') + '</b></div>' +
+      '<div class="rc-acs">Network: <b>' + escHtml(ctx.networkName) + '</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
+      '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="inspectGenLayerContract(\'' + d.address + '\')">Inspect Contract</button></div></div></div>';
   }
   appendAIMessage(msg + '\n\nAudit type: **GENLAYER_SOURCE_REVIEW** · Risk: **UNKNOWN** · Confidence: **LOW** · Score: **N/A**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
+}
+
+// ── Contract interaction (inspect + read/write) — Phase 7.6 ──────────────────
+function glDeploymentFromAddress(address) {
+  if (address) {
+    const known = window.AuditAIIntentRouter ? window.AuditAIIntentRouter.networkForContract(address) : null;
+    if (known) return { address: address, chainId: known.chainId, networkId: known.networkId, txHash: known.known && known.known.deploymentTx };
+    return { address: address };
+  }
+  return lastDeployment;
+}
+
+// Create a GenLayer client adapter bound to a SPECIFIC network (never reuses the
+// selected-network client for a different network's contract).
+function glClientForNetwork(networkId) {
+  var factory = window.AuditAIGenLayerClient;
+  if (factory && typeof factory.createAdapter === 'function') {
+    try { return factory.createAdapter(null, { networkId: networkId }); } catch (e) { return null; }
+  }
+  return window.AuditAIGenLayer ? window.AuditAIGenLayer.getClient() : null;
+}
+
+function renderFunctionList(title, fns, readOnly) {
+  if (!fns || !fns.length) return '<div class="rc-findings-title">' + title + '</div><div class="rc-finding-desc">(none)</div>';
+  const rows = fns.map(function (f) {
+    const params = (f.params || []).map(function (p) { return escHtml(p.name) + ': ' + escHtml(p.type); }).join(', ');
+    return '<div class="rc-finding-desc">' +
+      '<b>' + escHtml(f.name) + '</b>(' + params + ') → ' + escHtml(f.returns) +
+      (f.payable ? ' <span class="onchain-badge">payable</span>' : '') +
+      '</div>';
+  }).join('');
+  return '<div class="rc-findings-title">' + title + ' (' + fns.length + ')</div>' + rows;
+}
+
+async function inspectGenLayerContract(address) {
+  const d = glDeploymentFromAddress(address);
+  if (!d || !d.address) { appendAIMessage('⚠️ No GenLayer contract context available. Deploy a contract or provide its address.'); return; }
+  const ctx = resolveGenLayerContext(d);
+  if (!ctx) { appendAIMessage('⚠️ Unknown GenLayer network context.'); return; }
+  const client = glClientForNetwork(ctx.execNetworkId);
+  const I = window.AuditAIGenLayerInteraction;
+  if (!I || !client || typeof client.getContractSchema !== 'function') {
+    appendAIMessage('⚠️ **GENLAYER_OPERATION_UNAVAILABLE** — the GenLayer SDK is not available to inspect this contract.');
+    return;
+  }
+  showTyping();
+  let res;
+  try { res = await I.inspectContract(client, { networkId: ctx.execNetworkId, chainId: ctx.chainId, address: d.address }); }
+  catch (e) { res = { ok: false, error: 'GENLAYER_OPERATION_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+  removeTyping();
+
+  const header = '**Contract Inspection**\n\n' +
+    'Network: **' + ctx.networkName + '**\nChain ID: **' + ctx.chainId + '**\n' +
+    'Contract: `' + d.address + '`\n' +
+    'Transaction: `' + (d.txHash || (ctx.known && ctx.known.deploymentTx) || '—') + '`\n';
+
+  if (!res || !res.ok || !res.schemaAvailable) {
+    appendAIMessage(header + '\nStatus: **' + ((res && res.error) || 'SCHEMA_UNAVAILABLE') + '** — the contract was recognized but its schema could not be obtained.\n\n' +
+      (res && res.detail ? 'Detail: ' + escHtml(res.detail) + '\n' : '') +
+      'No functions were invented.');
+    return;
+  }
+
+  const card = '<div class="result-card"><div class="rc-findings">' +
+    '<div class="rc-findings-title">' + escHtml(ctx.networkName) + ' · Chain ID ' + ctx.chainId + '</div>' +
+    '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
+    '<div class="rc-acs">Status: <b>VERIFIED/AVAILABLE</b></div></div>' +
+    '<div class="rc-findings">' + renderFunctionList('READ FUNCTIONS', res.readFunctions, true) + '</div>' +
+    '<div class="rc-findings">' + renderFunctionList('WRITE FUNCTIONS', res.writeFunctions, false) + '</div>' +
+    '<div class="rc-footer"><div class="rc-footer-actions">' +
+    '<button type="button" class="publish-btn llm-btn" onclick="interactGenLayerContract(\'' + d.address + '\')">Interact</button>' +
+    '<button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Contract</button>' +
+    '</div></div></div>';
+
+  let msg = header +
+    '\n**READ FUNCTIONS (' + res.readFunctions.length + '):**\n' +
+    (res.readFunctions.length ? res.readFunctions.map(function (f) { return '• `' + f.name + '` → ' + f.returns; }).join('\n') : '(none)') +
+    '\n\n**WRITE FUNCTIONS (' + res.writeFunctions.length + '):**\n' +
+    (res.writeFunctions.length ? res.writeFunctions.map(function (f) { return '• `' + f.name + '` → ' + f.returns; }).join('\n') : '(none)') +
+    '\n\nEvery function is derived from the real contract schema — none were invented.';
+  appendAIMessage(msg, card);
+}
+
+async function interactGenLayerContract(address) {
+  const d = glDeploymentFromAddress(address);
+  if (!d || !d.address) { appendAIMessage('⚠️ No GenLayer contract context available.'); return; }
+  const ctx = resolveGenLayerContext(d);
+  if (!ctx) { appendAIMessage('⚠️ Unknown GenLayer network context.'); return; }
+  const client = glClientForNetwork(ctx.execNetworkId);
+  const I = window.AuditAIGenLayerInteraction;
+  if (!I || !client) { appendAIMessage('⚠️ **GENLAYER_OPERATION_UNAVAILABLE** — the GenLayer SDK is not available.'); return; }
+  showTyping();
+  let res;
+  try { res = await I.inspectContract(client, { networkId: ctx.execNetworkId, chainId: ctx.chainId, address: d.address }); }
+  catch (e) { res = { ok: false, error: 'GENLAYER_OPERATION_UNAVAILABLE', detail: String((e && e.message) || e) }; }
+  removeTyping();
+
+  if (!res || !res.ok || !res.schemaAvailable) {
+    appendAIMessage('⚠️ **' + ((res && res.error) || 'SCHEMA_UNAVAILABLE') + '** — cannot interact without the real schema.');
+    return;
+  }
+
+  const readFn = res.readFunctions[0] && res.readFunctions[0].name;
+  const writeFn = res.writeFunctions[0] && res.writeFunctions[0].name;
+  let body = '**Contract Interaction**\n\nNetwork: **' + ctx.networkName + '** · Chain ID: **' + ctx.chainId + '**\nContract: `' + d.address + '`\n\n';
+
+  if (readFn) {
+    body += 'Example read (no wallet required): `' + readFn + '`\n';
+  } else {
+    body += 'No read functions were found on the real schema.\n';
+  }
+  if (writeFn) {
+    body += 'Example write (wallet + explicit confirmation required): `' + writeFn + '`\n\nWrites are never executed automatically.';
+  } else {
+    body += '\nNo write functions were found on the real schema.';
+  }
+
+  const card = '<div class="result-card"><div class="rc-findings">' +
+    '<div class="rc-findings-title">' + escHtml(ctx.networkName) + ' · Chain ID ' + ctx.chainId + '</div>' +
+    '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div></div>' +
+    '<div class="rc-findings">' + renderFunctionList('READ FUNCTIONS', res.readFunctions, true) + '</div>' +
+    '<div class="rc-findings">' + renderFunctionList('WRITE FUNCTIONS', res.writeFunctions, false) + '</div>' +
+    '<div class="rc-footer"><div class="rc-footer-actions">' +
+    (readFn ? '<button type="button" class="publish-btn llm-btn" onclick="readGenLayerFunction(\'' + d.address + '\', \'' + readFn + '\')">Read ' + escHtml(readFn) + '</button>' : '') +
+    (writeFn ? '<button type="button" class="publish-btn llm-btn" onclick="writeGenLayerFunction(\'' + d.address + '\', \'' + writeFn + '\')">Execute ' + escHtml(writeFn) + '</button>' : '') +
+    '</div></div></div>';
+  appendAIMessage(body, card);
+}
+
+// Read a GenLayer function with NO wallet (public read).
+async function readGenLayerFunction(address, functionName) {
+  const d = glDeploymentFromAddress(address);
+  const ctx = resolveGenLayerContext(d);
+  const client = glClientForNetwork(ctx.execNetworkId);
+  const I = window.AuditAIGenLayerInteraction;
+  if (!I || !client) { appendAIMessage('⚠️ **GENLAYER_OPERATION_UNAVAILABLE**'); return; }
+  const argsRaw = prompt('Arguments for `' + functionName + '` (comma-separated; empty for none):', '');
+  if (argsRaw === null) { appendAIMessage('Read cancelled.'); return; }
+  let args = [];
+  if (String(argsRaw).trim()) { args = String(argsRaw).split(',').map(function (s) { return s.trim(); }); }
+  showTyping();
+  const res = await I.runRead(client, { networkId: ctx.execNetworkId, chainId: ctx.chainId, address: d.address, functionName: functionName, args: args });
+  removeTyping();
+  if (!res.ok) {
+    appendAIMessage('⚠️ **' + res.error + '** — `' + functionName + '` read failed' + (res.detail ? ' (' + escHtml(res.detail) + ')' : '') + '.');
+    return;
+  }
+  const resultStr = (typeof res.result === 'string') ? res.result : JSON.stringify(res.result);
+  appendAIMessage('**Read result** — `' + functionName + '`\n\nNetwork: **' + (ctx ? ctx.networkName : 'GenLayer') + '**\nContract: `' + d.address + '`\n\nResult:\n```\n' + resultStr + '\n```\nTimestamp: `' + new Date(res.timestamp).toISOString() + '`');
+}
+
+// Write a GenLayer function. NEVER executes automatically: preview → confirm →
+// wallet → network check → submit.
+async function writeGenLayerFunction(address, functionName) {
+  const d = glDeploymentFromAddress(address);
+  const ctx = resolveGenLayerContext(d);
+  const client = glClientForNetwork(ctx.execNetworkId);
+  const I = window.AuditAIGenLayerInteraction;
+  if (!I || !client) { appendAIMessage('⚠️ **GENLAYER_OPERATION_UNAVAILABLE**'); return; }
+
+  const argsRaw = prompt('Arguments for `' + functionName + '` (comma-separated; empty for none):', '');
+  if (argsRaw === null) { appendAIMessage('Write cancelled.'); return; }
+  let args = [];
+  if (String(argsRaw).trim()) { args = String(argsRaw).split(',').map(function (s) { return s.trim(); }); }
+
+  // Preview + explicit confirmation (never auto-sign).
+  const confirm = confirm('Execute `' + functionName + '` on ' + ctx.networkName + ' (chain ' + ctx.chainId + ')?\n\nContract: ' + d.address + '\nArgs: ' + (args.length ? args.join(', ') : '(none)') + '\n\nThis will request your wallet to sign a real transaction.');
+  if (!confirm) { appendAIMessage('⚠️ **BRADBURY_WRITE_REJECTED** — write cancelled by user.'); return; }
+
+  // Wallet safety.
+  if (!walletAddress) {
+    appendAIMessage('⚠️ **WALLET_REQUIRED** — connect a wallet to sign the transaction.');
+    await connectWallet();
+    return;
+  }
+  if (String(walletChainId) !== String(ctx.chainId)) {
+    appendAIMessage('⚠️ **BRADBURY_NETWORK_MISMATCH** — please switch your wallet to **' + ctx.networkName + ' (Chain ID ' + ctx.chainId + ')**. Your wallet is on chain ' + (walletChainId || 'unknown') + '.');
+    return;
+  }
+
+  showTyping();
+  const res = await I.runWrite(client, {
+    networkId: ctx.execNetworkId,
+    chainId: ctx.chainId,
+    address: d.address,
+    functionName: functionName,
+    args: args,
+    wallet: { address: walletAddress, chainId: walletChainId },
+    confirmed: true
+  });
+  removeTyping();
+
+  if (!res.ok) {
+    appendAIMessage('⚠️ **' + res.error + '** — write `' + functionName + '` failed' + (res.detail ? ' (' + escHtml(res.detail) + ')' : '') + '.');
+    return;
+  }
+  appendAIMessage('✅ **SUBMITTED** — `' + functionName + '`\n\nTransaction: `' + res.txHash + '`\nContract: `' + res.contractAddress + '`\nNetwork: **' + ctx.networkName + '** · Chain ID: **' + res.chainId + '**\nStatus: **SUBMITTED**');
+}
+
+function viewContractOnExplorer() {
+  const d = lastDeployment;
+  if (!d || !d.address) { appendAIMessage('⚠️ No deployment context available.'); return; }
+  const ctx = resolveGenLayerContext(d);
+  const explorer = ctx && ctx.isBradbury ? 'https://explorer-bradbury.genlayer.com/' : null;
+  if (!explorer) { appendAIMessage('Contract: `' + d.address + '` — no explorer is available for this network.'); return; }
+  appendAIMessage('Contract: `' + d.address + '`\nExplorer: **' + explorer + '**');
+  try { window.open(explorer, '_blank'); } catch (e) {}
+}
+
+function viewTxOnExplorer() {
+  const d = lastDeployment;
+  if (!d || !d.txHash) { appendAIMessage('⚠️ No deployment transaction available.'); return; }
+  const ctx = resolveGenLayerContext(d);
+  const explorer = ctx && ctx.isBradbury ? 'https://explorer-bradbury.genlayer.com/' : null;
+  if (!explorer) { appendAIMessage('Transaction: `' + d.txHash + '` — no explorer is available for this network.'); return; }
+  appendAIMessage('Transaction: `' + d.txHash + '`\nExplorer: **' + explorer + '**');
+  try { window.open(explorer, '_blank'); } catch (e) {}
 }
 
 // Unified audit handler — used by BOTH the Chat ("audit 0x…") and the
 // "Audit Contract" quick action. Context decides: a GenLayer deployment is
 // audited via the GenLayer pipeline (never eth_getCode); otherwise auto-discovery.
 async function handleAuditIntent(address) {
-  if (address) { await discoverAndAudit(address); return; }
+  if (address) {
+    // A known GenLayer contract (e.g. the Bradbury contract) is audited via the
+    // GenLayer pipeline — never eth_getCode EVM discovery.
+    const known = window.AuditAIIntentRouter ? window.AuditAIIntentRouter.networkForContract(address) : null;
+    if (known && known.family === 'GENLAYER') {
+      appendUserMessage('Audit ' + address);
+      const ctx = resolveGenLayerContext({ address: address, chainId: known.chainId, networkId: known.networkId });
+      if (ctx) { await auditGenLayerContract({ address: address, chainId: ctx.chainId, networkId: ctx.networkId, txHash: known.known && known.known.deploymentTx }); return; }
+    }
+    await discoverAndAudit(address); return;
+  }
   const ctx = getAppContext();
   const plan = window.AuditAIIntentRouter.planAudit(ctx);
   if (plan.mode === 'genlayer' && plan.deployment) {
     appendUserMessage('Audit Contract');
     const d = plan.deployment;
+    const glCtx = resolveGenLayerContext(d) || { networkName: 'GenLayer Studionet', chainId: d.chainId || 61999 };
     const card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Recent Deployment Detected</div>' +
       '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
-      '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + (d.chainId || 61999) + '</b></div>' +
+      '<div class="rc-acs">Network: <b>' + escHtml(glCtx.networkName) + '</b> · Chain ID: <b>' + glCtx.chainId + '</b></div>' +
       '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div></div>' +
       '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Now</button></div></div></div>';
     appendAIMessage('A **recent deployment** is available — I can audit it directly without asking for the address again.', card);
@@ -1591,6 +1882,20 @@ async function dispatchQuickAction(action) {
       return;
     case 'safe_to_approve':
       assessApproval();
+      return;
+    case 'inspect_contract':
+      appendUserMessage('Inspect Contract');
+      await inspectGenLayerContract(null);
+      return;
+    case 'interact_contract':
+      appendUserMessage('Interact with Contract');
+      await interactGenLayerContract(null);
+      return;
+    case 'view_contract':
+      viewContractOnExplorer();
+      return;
+    case 'view_tx':
+      viewTxOnExplorer();
       return;
     default:
       appendAIMessage('⚠️ Unknown action.');
@@ -1745,6 +2050,14 @@ async function handleInput() {
     case 'AUDIT_CONTRACT':
       document.getElementById('sendBtn').disabled = false;
       await handleAuditIntent(intent.address);
+      return;
+    case 'INSPECT_CONTRACT':
+      document.getElementById('sendBtn').disabled = false;
+      await inspectGenLayerContract(intent.address);
+      return;
+    case 'INTERACT_CONTRACT':
+      document.getElementById('sendBtn').disabled = false;
+      await interactGenLayerContract(intent.address);
       return;
   }
 
@@ -2369,7 +2682,7 @@ async function deployBuiltContract() {
       address: res.contractAddress,
       txHash: res.hash,
       network: net ? net.name : 'Studionet',
-      networkId: 'genlayerStudionet',
+      networkId: net && net.id === 'bradbury' ? 'genlayerBradbury' : 'genlayerStudionet',
       chainId: net ? net.chainId : 61999,
       contractType: build.spec.type,
       source: build.source,

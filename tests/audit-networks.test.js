@@ -50,7 +50,8 @@ test('registry: Ethereum / Studionet / Bradbury with correct chain ids', functio
   assert.equal(reg.genlayerStudionet.chainId, 61999);
   assert.equal(reg.genlayerStudionet.name, 'GenLayer Studionet');
   assert.equal(reg.genlayerBradbury.chainId, 4221);
-  assert.equal(reg.genlayerBradbury.name, 'GenLayer Bradbury');
+  assert.equal(reg.genlayerBradbury.name, 'GenLayer Bradbury Testnet');
+  assert.equal(reg.genlayerBradbury.explorer, 'https://explorer-bradbury.genlayer.com/');
 });
 
 test('registry: no duplicate chain ids', function () {
@@ -73,8 +74,8 @@ test('registry: every network has an RPC (never invented — matches project con
 test('registry: GenLayer audit networks map onto GenLayer execution network ids', function () {
   assert.equal(Networks.GENLAYER_NETWORK_MAP.genlayerStudionet, 'studionet');
   assert.equal(Networks.GENLAYER_NETWORK_MAP.genlayerBradbury, 'bradbury');
-  // The GenLayer execution registry stays separate and honest for Bradbury.
-  assert.equal(GenLayerClient.NETWORKS.bradbury.deployed, false);
+  // Both GenLayer execution networks carry a deployed AuditAI contract.
+  assert.equal(GenLayerClient.NETWORKS.bradbury.deployed, true);
   assert.equal(GenLayerClient.NETWORKS.studionet.deployed, true);
 });
 

@@ -25,14 +25,49 @@
   'use strict';
 
   // ── Network registry (single source of truth) ──────────────────────────────
-  // Each entry pairs a network with its AuditAI contract. Studionet is the
-  // confirmed deployment; Bradbury is NOT yet deployed (contract must be set
-  // only after it has been verified on chain 4221).
+  // Each entry pairs a network with its AuditAI auditor contract. Studionet and
+  // Bradbury both have a verified AuditAI deployment. The selected network's
+  // chain and contract are always used together — never cross-paired.
   var NETWORKS = {
-    studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B', deployed: true },
-    bradbury:  { id: 'bradbury',  name: 'Bradbury',  chainId: 4221,  rpc: 'https://rpc-bradbury.genlayer.com', contract: '', deployed: false }
+    studionet: {
+      id: 'studionet', name: 'Studionet', chainId: 61999,
+      rpc: 'https://studio.genlayer.com/api',
+      contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B', deployed: true,
+      currency: 'GEN'
+    },
+    bradbury: {
+      id: 'bradbury', name: 'Bradbury Testnet', chainId: 4221,
+      rpc: 'https://rpc-bradbury.genlayer.com',
+      explorer: 'https://explorer-bradbury.genlayer.com/',
+      contract: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000', deployed: true,
+      currency: 'GEN',
+      knownContract: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000',
+      knownDeploymentTx: '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc'
+    }
   };
   var DEFAULT_NETWORK_ID = 'studionet';
+
+  // Known/operational GenLayer contracts (single source of truth). Each entry
+  // pairs a real contract address with its deployment network + chain id so the
+  // app can recognize it and interact via the GenLayer SDK (never eth_getCode).
+  var KNOWN_CONTRACTS = {
+    '0x119ac58af8546df0b0e55eb24277c756d9458000': {
+      networkId: 'bradbury',
+      network: 'bradbury',
+      name: 'Bradbury Testnet',
+      chainId: 4221,
+      address: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000',
+      deploymentTx: '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc'
+    },
+    '0xf2c549bf2dc106a28354b1444298dd460601856b': {
+      networkId: 'studionet',
+      network: 'studionet',
+      name: 'Studionet',
+      chainId: 61999,
+      address: '0xF2c549Bf2Dc106a28354B1444298DD460601856B',
+      deploymentTx: null
+    }
+  };
   // SDK chain object key per network id (genlayer-js exposes studionet /
   // testnetBradbury, etc).
   var SDK_CHAIN_KEY = { studionet: 'studionet', bradbury: 'testnetBradbury' };
@@ -40,6 +75,43 @@
   function getSdk() {
     return (typeof window !== 'undefined' && window.GenLayerSDK) ||
       (typeof globalThis !== 'undefined' && globalThis.GenLayerSDK);
+  }
+
+  function normalizeAddr(addr) {
+    return (typeof addr === 'string') ? addr.trim().toLowerCase() : '';
+  }
+
+  // Look up a known GenLayer contract by address (case-insensitive). Returns the
+  // registered descriptor (with the canonical checksummed address) or null.
+  function knownContractFor(addr) {
+    var key = normalizeAddr(addr);
+    if (!key) return null;
+    var c = KNOWN_CONTRACTS[key];
+    return c ? Object.assign({}, c) : null;
+  }
+
+  // Network + contract pairing guard. Every operation must carry networkId +
+  // chainId + contractAddress as an inseparable context. Never cross-pair a
+  // Studionet contract with Bradbury (or vice-versa).
+  function assertContractNetworkPair(opts) {
+    opts = opts || {};
+    var networkId = opts.networkId || null;
+    var chainId = opts.chainId;
+    var address = opts.address || null;
+
+    var net = networkId ? NETWORKS[networkId] : null;
+    if (!net) return { ok: false, error: 'UNKNOWN_NETWORK', networkId: networkId, chainId: chainId, address: address };
+
+    if (chainId !== undefined && chainId !== null && Number(chainId) !== net.chainId) {
+      return { ok: false, error: 'CONTRACT_NETWORK_MISMATCH', networkId: networkId, chainId: chainId, address: address, expectedChainId: net.chainId };
+    }
+
+    var known = address ? knownContractFor(address) : null;
+    if (known && known.networkId !== networkId) {
+      return { ok: false, error: 'CONTRACT_NETWORK_MISMATCH', networkId: networkId, chainId: net.chainId, address: address, expectedNetworkId: known.networkId };
+    }
+
+    return { ok: true, networkId: networkId, chainId: net.chainId, address: address, known: known || null };
   }
 
   // Map a raw SDK/wallet error to a canonical, UI-facing error code. Kept at
@@ -175,10 +247,69 @@
       return c.getContractSchema(address);
     }
 
+    // Fetch the REAL GenLayer contract source code (never eth_getCode). GenLayer
+    // Intelligent Contracts are inspected via gen_getContractCode.
+    async function getContractCode(address) {
+      var c = ensureRead();
+      if (!c) throw new Error('SDK_UNAVAILABLE');
+      if (typeof c.getContractCode !== 'function') throw new Error('SDK_UNAVAILABLE');
+      return c.getContractCode(address);
+    }
+
     async function read(address, functionName, args) {
       var c = ensureRead();
       if (!c) throw new Error('SDK_UNAVAILABLE');
       return c.readContract({ address: address, functionName: functionName, args: args || [], jsonSafeReturn: true });
+    }
+
+    // Read-only simulation of a write (no signature, no transaction).
+    async function simulateWriteContract(address, functionName, args) {
+      var c = ensureRead();
+      if (!c) throw new Error('SDK_UNAVAILABLE');
+      if (typeof c.simulateWriteContract !== 'function') throw new Error('SDK_UNAVAILABLE');
+      return c.simulateWriteContract({ address: address, functionName: functionName, args: args || [], jsonSafeReturn: true });
+    }
+
+    // Submit a REAL write transaction. Requires a wallet account; returns the
+    // REAL transaction hash (never fabricated).
+    async function writeContract(address, functionName, args, opts) {
+      opts = opts || {};
+      if (!available()) throw new Error('SDK_UNAVAILABLE');
+      var account = opts.account;
+      if (!account) throw new Error('WALLET_REQUIRED');
+      var wc;
+      try { wc = sdk.createClient({ chain: sdkChain(), account: account }); }
+      catch (e) { throw new Error(toErrorCode(e)); }
+      var tx;
+      try {
+        tx = await wc.writeContract({ address: address, functionName: functionName, args: args || [], value: BigInt(0) });
+      } catch (e) { throw new Error(toErrorCode(e)); }
+      var hash = (tx && typeof tx === 'object' && tx.hash !== undefined) ? tx.hash
+        : (tx && typeof tx === 'object' && tx.txId !== undefined) ? tx.txId
+        : (typeof tx === 'string' ? tx : null);
+      if (!hash) throw new Error('NO_TX_HASH');
+      return hash;
+    }
+
+    // Wait for a real transaction to finalize; returns the receipt.
+    async function waitForTransactionReceipt(hash, opts) {
+      opts = opts || {};
+      var c = ensureRead();
+      if (!c) throw new Error('SDK_UNAVAILABLE');
+      return c.waitForTransactionReceipt({
+        hash: hash,
+        status: 'FINALIZED',
+        interval: (opts.interval || 2000),
+        retries: (opts.retries || 90)
+      });
+    }
+
+    // Fetch a real transaction by hash (never synthesizes one).
+    async function getTransaction(hash) {
+      var c = ensureRead();
+      if (!c) throw new Error('SDK_UNAVAILABLE');
+      if (typeof c.getTransaction !== 'function') throw new Error('SDK_UNAVAILABLE');
+      return c.getTransaction({ hash: hash });
     }
 
     async function getAnalysis(auditorAddr, contractAddr) {
@@ -364,7 +495,12 @@
       getContract: getContract,
       getReadClient: getReadClient,
       getContractSchema: getContractSchema,
+      getContractCode: getContractCode,
       read: read,
+      simulateWriteContract: simulateWriteContract,
+      writeContract: writeContract,
+      waitForTransactionReceipt: waitForTransactionReceipt,
+      getTransaction: getTransaction,
       getAnalysis: getAnalysis,
       preflight: preflight,
       analyzeEvidence: analyzeEvidence,
@@ -397,6 +533,9 @@
     extractContractAddress: extractContractAddress,
     NETWORKS: NETWORKS,
     DEFAULT_NETWORK_ID: DEFAULT_NETWORK_ID,
-    SDK_CHAIN_KEY: SDK_CHAIN_KEY
+    SDK_CHAIN_KEY: SDK_CHAIN_KEY,
+    KNOWN_CONTRACTS: KNOWN_CONTRACTS,
+    knownContractFor: knownContractFor,
+    assertContractNetworkPair: assertContractNetworkPair
   };
 });
