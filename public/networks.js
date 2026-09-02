@@ -104,6 +104,14 @@
     return null;
   }
 
+  // Network family: 'GENLAYER' (intelligent contracts / transaction network)
+  // vs 'EVM' (read-only audit networks). Derived from the single source of truth.
+  function getFamily(id) {
+    if (GENLAYER_NETWORK_MAP[id]) return 'GENLAYER';
+    if (NETWORKS[id]) return 'EVM';
+    return 'UNKNOWN';
+  }
+
   // ── Address validation / normalization ─────────────────────────────────────
   function isValidAddress(addr) {
     return typeof addr === 'string' && /^0x[0-9a-fA-F]{40}$/.test(addr.trim());
@@ -419,6 +427,7 @@
     getNetwork: getNetwork,
     networkIds: networkIds,
     networkByChainId: networkByChainId,
+    getFamily: getFamily,
     isValidAddress: isValidAddress,
     normalizeAddress: normalizeAddress,
     hexToInt: hexToInt,

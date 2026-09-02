@@ -12,6 +12,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <script src="networks.js"></script>
+<script src="intent-router.js"></script>
 <script src="contract-templates.js"></script>
 <script src="contract-security.js"></script>
 <script src="contract-studio.js"></script>
@@ -363,13 +364,13 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <button class="sidebar-btn" onclick="clearChat()">
         <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></span> Clear Chat
       </button>
-      <button class="sidebar-btn" onclick="sendQuick('Scan a contract address')">
+      <button class="sidebar-btn" onclick="dispatchQuickAction('audit_contract')">
         <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span> Audit Contract
       </button>
-      <button class="sidebar-btn" onclick="scanPortfolio()">
+      <button class="sidebar-btn" onclick="dispatchQuickAction('my_portfolio')">
         <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span> My Portfolio
       </button>
-      <button class="sidebar-btn" onclick="checkApprovals()">
+      <button class="sidebar-btn" onclick="dispatchQuickAction('check_approvals')">
         <span class="sidebar-btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span> Check Approvals
       </button>
       <button class="sidebar-btn" onclick="sendQuick('Compare two contracts')">
@@ -404,12 +405,12 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 
     <!-- Quick prompts shown after first message -->
     <div class="quick-prompts" id="quickPrompts" style="display:none">
-      <div class="qp" onclick="sendQuick('Audit another contract')">Audit contract</div>
-      <div class="qp" onclick="sendQuick('Create an ERC-20 token called MyToken with symbol MTK and 1 million initial supply')">Create contract</div>
-      <div class="qp" onclick="scanPortfolio()">My portfolio</div>
-      <div class="qp" onclick="checkApprovals()">Check approvals</div>
-      <div class="qp" onclick="sendQuick('Explain the last finding in detail')">Explain findings</div>
-      <div class="qp" onclick="sendQuick('Is it safe to approve this contract?')">Safe to approve?</div>
+      <div class="qp" onclick="dispatchQuickAction('audit_contract')">Audit contract</div>
+      <div class="qp" onclick="dispatchQuickAction('create_contract')">Create contract</div>
+      <div class="qp" onclick="dispatchQuickAction('my_portfolio')">My portfolio</div>
+      <div class="qp" onclick="dispatchQuickAction('check_approvals')">Check approvals</div>
+      <div class="qp" onclick="dispatchQuickAction('explain_findings')">Explain findings</div>
+      <div class="qp" onclick="dispatchQuickAction('safe_to_approve')">Safe to approve?</div>
     </div>
 
     <!-- Input -->
@@ -521,6 +522,13 @@ let lastAuditResult = null;
 let lastAuditAddress = null;
 let lastAuditChain = null;
 let conversationHistory = [];
+
+// Phase 7.4: contextual state used by the Intent Router / Context Engine.
+// Populated only with real data returned by the app flows; never fabricated.
+let lastDeployment = null;
+let lastApprovalContext = null;
+let lastPortfolio = null;
+let currentIntent = null;
 
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
@@ -1444,6 +1452,156 @@ function renderAuditResult(address, networkId, result, net) {
   appendAIMessage(header + '\n\n' + body, cardHtml);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTENT ROUTER + CONTEXT ENGINE (Phase 7.4)
+// ═══════════════════════════════════════════════════════════════════════════════
+function getAppContext() {
+  return window.AuditAIIntentRouter.buildContext({
+    walletAddress: walletAddress,
+    walletChainId: walletChainId,
+    auditNetworkId: auditNetworkId,
+    currentIntent: currentIntent,
+    lastAuditResult: lastAuditResult,
+    lastAuditAddress: lastAuditAddress,
+    lastAuditChain: lastAuditChain,
+    lastDeployment: lastDeployment,
+    pendingBuild: pendingBuild,
+    lastApprovalContext: lastApprovalContext,
+    lastPortfolio: lastPortfolio
+  });
+}
+
+// GenLayer-specific audit. NEVER uses eth_getCode as an existence proof: a
+// GenLayer Intelligent Contract is inspected via its deployment context and a
+// source-based security review (reusing contract-security.js).
+async function auditGenLayerContract(deployment) {
+  const d = deployment || lastDeployment;
+  if (!d || !d.address) { appendAIMessage('⚠️ No GenLayer deployment context available.'); return; }
+  showTyping();
+  const sec = window.AuditAIContractSecurity;
+  let review = null;
+  if (sec && d.spec && d.source) { try { review = sec.review(d.spec, d.source); } catch (e) { review = null; } }
+  removeTyping();
+
+  const chainId = d.chainId || 61999;
+  const storeKey = chainId + ':' + String(d.address).toLowerCase();
+  const payload = {
+    version: '8.1.0',
+    analysisVersion: '8.1.0',
+    network: 'genlayerStudionet',
+    networkName: 'GenLayer Studionet',
+    chainId: chainId,
+    contract: { address: d.address, chainId: chainId, network: 'genlayerStudionet', contractType: 'GENLAYER', bytecodeAvailable: false },
+    analysis: { sourceReview: review, source: d.source || null, contractType: d.contractType || null },
+    findings: review ? review.warnings.map(function (w) { return { id: 'src-' + w.level, severity: w.level === 'HIGH' ? 'MEDIUM' : 'INFO', confidence: 'LOW', category: 'other', title: w.text }; }) : []
+  };
+  GL_AUDIT_STORE[storeKey] = {
+    address: String(d.address).toLowerCase(), chainId: chainId, networkId: 'genlayerStudionet', networkName: 'GenLayer Studionet',
+    score: 100, verdict: 'UNKNOWN', confidence: 'LOW',
+    summary: 'GenLayer intelligent contract — source-based security review.',
+    context: d.source || '', payload: payload, hasBytecode: false, glNetwork: { name: 'Studionet', chainId: 61999, contract: '0xF2c549Bf2Dc106a28354B1444298DD460601856B' }
+  };
+
+  let msg = '**GenLayer Contract Audit**\n\n' +
+    'This is a **GenLayer Intelligent Contract** — EVM bytecode inspection is not applicable and it was **not** classified as missing.\n\n' +
+    'Contract: `' + d.address + '`\nNetwork: **GenLayer Studionet**\nChain ID: **' + chainId + '**\nTransaction: `' + (d.txHash || '—') + '`\n';
+
+  let card = '';
+  if (review) {
+    const rows = ['supply', 'accessControl', 'upgradeability', 'externalCalls', 'reentrancy', 'tokenOperations', 'storage', 'structure']
+      .filter(function (k) { return review.categories[k]; })
+      .map(function (k) { return '<div class="rc-finding-desc">' + escHtml(k) + ': <b>' + escHtml(review.categories[k].status) + '</b> — ' + escHtml(review.categories[k].text) + '</div>'; }).join('');
+    msg += '\n**Security Review (source):**\n' + rows.replace(/<[^>]+>/g, '');
+    card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Security Review (source)</div>' + rows + '</div>' +
+      '<div class="rc-findings"><div class="rc-findings-title">Deployment</div>' +
+      '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
+      '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div>' +
+      '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
+      '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="requestGenLayerAnalysis(\'' + d.address + '\')">Analyze with GenLayer AI</button></div></div></div>';
+  }
+  appendAIMessage(msg + '\n\nRisk: **UNKNOWN** · Confidence: **LOW**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
+}
+
+async function dispatchQuickAction(action) {
+  const ctx = getAppContext();
+  currentIntent = action;
+  switch (action) {
+    case 'audit_contract': {
+      const plan = window.AuditAIIntentRouter.planAudit(ctx);
+      if (plan.mode === 'genlayer' && plan.deployment) {
+        appendUserMessage('Audit Contract');
+        const d = plan.deployment;
+        const card = '<div class="result-card"><div class="rc-findings"><div class="rc-findings-title">Recent Deployment Detected</div>' +
+          '<div class="rc-acs">Contract: <b>' + escHtml(d.address) + '</b></div>' +
+          '<div class="rc-acs">Network: <b>GenLayer Studionet</b> · Chain ID: <b>' + (d.chainId || 61999) + '</b></div>' +
+          '<div class="rc-acs">Transaction: <b>' + escHtml(d.txHash || '—') + '</b></div></div>' +
+          '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Now</button></div></div></div>';
+        appendAIMessage('A **recent deployment** is available — I can audit it directly without asking for the address again.', card);
+        return;
+      }
+      if (plan.mode === 'discover' && plan.address) { await discoverAndAudit(plan.address); return; }
+      appendUserMessage('Audit Contract');
+      appendAIMessage('Please provide a contract address to audit — paste a `0x…` address and I will discover its network and run the local audit.');
+      return;
+    }
+    case 'create_contract':
+      appendUserMessage('Create Contract');
+      await handleCreateContract('');
+      return;
+    case 'my_portfolio':
+      await scanPortfolio();
+      return;
+    case 'check_approvals':
+      await checkApprovals();
+      return;
+    case 'explain_findings':
+      explainFindings();
+      return;
+    case 'safe_to_approve':
+      assessApproval();
+      return;
+    default:
+      appendAIMessage('⚠️ Unknown action.');
+  }
+}
+
+function explainFindings() {
+  appendUserMessage('Explain the last finding in detail');
+  if (!lastAuditResult || !lastAuditResult.findings || !lastAuditResult.findings.length) {
+    appendAIMessage('There is **no recent audit** to explain. Please audit a contract first — then I can explain each finding in detail.');
+    return;
+  }
+  const fs = lastAuditResult.findings;
+  let msg = 'Findings from the last audit of `' + (lastAuditAddress || '').slice(0, 10) + '…`:\n\n';
+  fs.slice(0, 6).forEach(function (f) {
+    msg += '**' + f.title + '** (' + f.severity + ', ' + f.confidence + ')\n' +
+      '• Why it matters: ' + (f.description || '—') + '\n' +
+      '• Evidence: ' + ((f.evidence || []).map(function (e) { return e.text; }).join('; ') || 'none') + '\n' +
+      '• Detected: ' + (f.category || 'unknown') + '\n' +
+      '• Not proven: static analysis cannot confirm exploitability\n' +
+      '• Next step: ' + (f.recommendation || 'manual review') + '\n\n';
+  });
+  msg += '*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable · PARTIAL ≠ Confirmed*';
+  appendAIMessage(msg);
+}
+
+function assessApproval() {
+  appendUserMessage('Is it safe to approve this contract?');
+  if (!lastApprovalContext && !lastAuditResult) {
+    appendAIMessage('I need **transaction context** before assessing approval safety.\n\nPlease provide: **contract**, **token**, **spender**, **amount**, and **network**. I will not sign anything and will not answer SAFE without evidence.');
+    return;
+  }
+  let msg = '**Approval safety assessment**\n\n';
+  if (lastAuditResult) {
+    const risky = (lastAuditResult.findings || []).filter(function (f) { return f.severity === 'HIGH' || f.severity === 'CRITICAL'; }).length;
+    msg += 'Based on the last audit (`' + (lastAuditAddress || '').slice(0, 10) + '…`):\n' +
+      '• Risk level: **' + (lastAuditResult.risk ? lastAuditResult.risk.level : 'UNKNOWN') + '**\n' +
+      '• Notable findings: **' + risky + '**\n';
+  }
+  msg += '\nAssessment: **UNKNOWN** (insufficient on-chain context to conclude SAFE).\nReason: no live transaction was decoded; I will never sign automatically.\n\nProvide the spender/token/amount to refine this.';
+  appendAIMessage(msg);
+}
+
 async function auditAddressClaude(address, networkId, net) {
   const chainName = net ? net.name : (networkId || 'Ethereum');
   const chainId = net ? net.chainId : null;
@@ -1562,6 +1720,14 @@ async function handleInput() {
   if (intent.isApprovals) { document.getElementById('sendBtn').disabled = false; await checkApprovals(); return; }
   if (intent.isCompare)   { document.getElementById('sendBtn').disabled = false; await compareContracts(text, intent.networkId); return; }
   if (intent.isCreate)    { document.getElementById('sendBtn').disabled = false; await handleCreateContract(text); return; }
+
+  // Phase 7.4: route EXPLAIN_FINDINGS / ASSESS_APPROVAL through the same
+  // handlers as the quick actions (shared Intent Router).
+  if (window.AuditAIIntentRouter) {
+    const routed = window.AuditAIIntentRouter.detectIntent(text, !!intent.address);
+    if (routed === 'EXPLAIN_FINDINGS') { document.getElementById('sendBtn').disabled = false; explainFindings(); return; }
+    if (routed === 'ASSESS_APPROVAL') { document.getElementById('sendBtn').disabled = false; assessApproval(); return; }
+  }
 
   if (intent.isAudit) {
     document.getElementById('sendBtn').disabled = false;
@@ -2185,6 +2351,18 @@ async function deployBuiltContract() {
       }
     });
     const card = buildDeployedCard(build, net, res);
+    // Phase 7.4: preserve the real deployment context for the GenLayer audit flow.
+    lastDeployment = {
+      address: res.contractAddress,
+      txHash: res.hash,
+      network: net ? net.name : 'Studionet',
+      networkId: 'genlayerStudionet',
+      chainId: net ? net.chainId : 61999,
+      contractType: build.spec.type,
+      source: build.source,
+      spec: build.spec,
+      deploymentTimestamp: Date.now()
+    };
     appendAIMessage('🎉 **Deployment complete.**\n\nContract: `' + res.contractAddress + '`\nTransaction: `' + res.hash + '`\nNetwork: **' + net.name + '**\nChain ID: **' + net.chainId + '**', card);
   } catch (e) {
     showDeploymentError(String((e && e.message) || e), net);
@@ -2202,7 +2380,7 @@ function buildDeployedCard(build, net, res) {
       <div class="rc-acs">Network: <b>${escHtml(auditNetName)}</b>${net ? ' · Chain ID: <b>' + net.chainId + '</b>' : ''}</div>
     </div>
     <div class="rc-footer"><span class="rc-footer-left">Create → Deploy → Audit</span>
-      <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="sendQuick('Audit ${res.contractAddress} on ${auditNetName}')">Audit Contract</button></div>
+      <div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="auditGenLayerContract(lastDeployment)">Audit Contract</button></div>
     </div>
   </div>`;
 }
