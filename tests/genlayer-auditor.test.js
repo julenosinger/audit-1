@@ -135,11 +135,16 @@ test('analyze: network error => FAILED (local preserved)', async function () {
   assert.equal(res.local, local);
 });
 
-test('analyze: timeout => TIMEOUT (local preserved)', async function () {
-  var client = { analyzeEvidence: function () { return new Promise(function () {}); } };
+test('analyze: NO artificial timeout — a slow client that resolves is awaited', async function () {
+  var client = { analyzeEvidence: function () {
+    return new Promise(function (resolve) {
+      setTimeout(function () { resolve({ verdict: 'NEEDS_REVIEW', confidence: 'LOW', findings: [] }); }, 50);
+    });
+  } };
   var local = Engine.analyze('f1');
-  var res = await Auditor.analyze(client, local, { timeoutMs: 20 });
-  assert.equal(res.status, 'TIMEOUT');
+  var res = await Auditor.analyze(client, local, { timeoutMs: 20 }); // timeoutMs is ignored (real lifecycle)
+  assert.equal(res.status, 'FINALIZED');
+  assert.ok(res.genlayer);
 });
 
 test('analyze: invalid response => INVALID (local preserved)', async function () {

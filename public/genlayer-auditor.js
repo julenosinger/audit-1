@@ -150,15 +150,6 @@
     };
   }
 
-  function withTimeout(promise, ms) {
-    return new Promise(function (resolve, reject) {
-      var done = false;
-      var t = setTimeout(function () { if (!done) { done = true; resolve('TIMEOUT'); } }, ms);
-      promise.then(function (v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
-        function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
-    });
-  }
-
   function doRequest(client, payload, opts) {
     if (!client) return Promise.resolve(null);
     if (typeof client.analyzeEvidence === 'function') return Promise.resolve(client.analyzeEvidence(payload, opts));
@@ -172,17 +163,20 @@
     }
   }
 
+  // Analyze with REAL transaction lifecycle. There is deliberately NO local
+  // timeout here: GenLayer consensus is asynchronous and may legitimately exceed
+  // any fixed timer (appeals, leader/validator timeouts, finality window). The
+  // client is responsible for polling the real transaction status and only
+  // resolving on a terminal state or an honest RPC failure.
   async function analyze(client, result, opts) {
     opts = opts || {};
     var payload = buildPayload(result);
-    var timeoutMs = opts.timeoutMs || 90000;
     if (!client) {
       emit(opts, 'FAILED', 'GENLAYER_UNAVAILABLE');
       return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null };
     }
     try {
-      var resp = await withTimeout(doRequest(client, payload, opts), timeoutMs);
-      if (resp === 'TIMEOUT') { emit(opts, 'TIMEOUT'); return { status: 'TIMEOUT', payload: payload, local: result, genlayer: null }; }
+      var resp = await doRequest(client, payload, opts);
       if (resp === null) { emit(opts, 'FAILED', 'GENLAYER_UNAVAILABLE'); return { status: 'FAILED', error: 'GENLAYER_UNAVAILABLE', payload: payload, local: result, genlayer: null }; }
       emit(opts, 'VALIDATING');
       var v = validateResponse(resp, payload);

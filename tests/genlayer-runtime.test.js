@@ -7,6 +7,7 @@ const assert = require('node:assert');
 const GenLayerClient = require('../public/genlayer-client.js');
 const Auditor = require('../public/genlayer-auditor.js');
 const Engine = require('../public/audit-engine.js');
+require('../public/genlayer-tx.js');
 
 const TEST_NETWORKS = {
   studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0x' + 'ab'.repeat(20), deployed: true },
@@ -26,6 +27,9 @@ function mockSdk() {
   var readClient = {
     getContractSchema: async function () {
       return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {}, publish_audit: {} } };
+    },
+    getTransaction: async function () {
+      return { statusName: 'FINALIZED', status: 7, txExecutionResultName: 'FINISHED_WITH_RETURN' };
     },
     readContract: async function (args) {
       if (args.functionName === 'get_analysis') {
@@ -133,11 +137,12 @@ test('analyzeEvidence: missing method => METHOD_MISSING', async function () {
   }, /METHOD_MISSING/);
 });
 
-test('analyzeEvidence: NO_ANALYSIS result => NO_RESULT', async function () {
+test('analyzeEvidence: NO_ANALYSIS result => AUDIT_RESULT_PENDING (accepted, recovering)', async function () {
   var sdk = mockSdk();
   sdk.createClient = function (config) {
     var read = {
       getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      getTransaction: async function () { return { statusName: 'ACCEPTED', status: 5, txExecutionResultName: 'FINISHED_WITH_RETURN' }; },
       readContract: async function () { return 'NO_ANALYSIS'; }
     };
     var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
@@ -146,8 +151,8 @@ test('analyzeEvidence: NO_ANALYSIS result => NO_RESULT', async function () {
   var a = GenLayerClient.createAdapter(sdk, { networkId: 'studionet', networks: TEST_NETWORKS });
   var payload = { version: '5.0.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
   await assert.rejects(function () {
-    return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
-  }, /NO_RESULT/);
+    return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20), recoveryRetries: 1 });
+  }, /AUDIT_RESULT_PENDING/);
 });
 
 // ── preflight ────────────────────────────────────────────────────────────────
@@ -191,7 +196,7 @@ test('analyzeEvidence emits onStatus lifecycle and surfaces the real tx hash', a
     account: '0x' + '11'.repeat(20),
     onStatus: function (s, d) { states.push(s); if (s === 'SUBMITTED') txHash = d; }
   });
-  assert.deepEqual(states, ['PREPARING', 'CONNECTING', 'WAITING_WALLET', 'SUBMITTED', 'FINALIZING', 'RETRIEVING', 'RAW_RESULT', 'COMPLETE']);
+  assert.deepEqual(states, ['PREPARING', 'CONNECTING', 'WAITING_WALLET', 'SUBMITTED', 'FINALIZED', 'RETRIEVING', 'RAW_RESULT', 'COMPLETE']);
   assert.equal(txHash, '0xabc123');
 });
 
@@ -212,31 +217,33 @@ test('analyzeEvidence: wallet rejection on write => USER_REJECTED', async functi
   }, /USER_REJECTED/);
 });
 
-test('analyzeEvidence: receipt timeout => TRANSACTION_TIMEOUT', async function () {
+test('analyzeEvidence: RPC failure during status polling => GENLAYER_NETWORK_UNAVAILABLE', async function () {
   var sdk = mockSdk();
   sdk.createClient = function (config) {
-    var read = { getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; }, readContract: async function () { return '{}'; } };
-    var write = {
-      writeContract: async function () { return { hash: '0xabc123' }; },
-      waitForTransactionReceipt: async function () { throw new Error('Timed out waiting for transaction'); }
+    var read = {
+      getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      getTransaction: async function () { throw new Error('fetch failed'); },
+      readContract: async function () { return '{}'; }
     };
+    var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
     return config && config.account ? write : read;
   };
   var a = GenLayerClient.createAdapter(sdk, { networkId: 'studionet', networks: TEST_NETWORKS });
   var payload = { version: '5.0.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
   await assert.rejects(function () {
-    return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
-  }, /TRANSACTION_TIMEOUT/);
+    return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20), pollInterval: 1, maxConsecutiveRpcErrors: 2 });
+  }, /GENLAYER_NETWORK_UNAVAILABLE/);
 });
 
-test('analyzeEvidence: receipt status FAILED => TRANSACTION_FAILED', async function () {
+test('analyzeEvidence: transaction FINISHED_WITH_ERROR => TRANSACTION_FAILED', async function () {
   var sdk = mockSdk();
   sdk.createClient = function (config) {
-    var read = { getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; }, readContract: async function () { return '{}'; } };
-    var write = {
-      writeContract: async function () { return { hash: '0xabc123' }; },
-      waitForTransactionReceipt: async function () { return { status: 'FAILED' }; }
+    var read = {
+      getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      getTransaction: async function () { return { statusName: 'FINALIZED', status: 7, txExecutionResultName: 'FINISHED_WITH_ERROR' }; },
+      readContract: async function () { return '{}'; }
     };
+    var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
     return config && config.account ? write : read;
   };
   var a = GenLayerClient.createAdapter(sdk, { networkId: 'studionet', networks: TEST_NETWORKS });
@@ -244,6 +251,24 @@ test('analyzeEvidence: receipt status FAILED => TRANSACTION_FAILED', async funct
   await assert.rejects(function () {
     return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
   }, /TRANSACTION_FAILED/);
+});
+
+test('analyzeEvidence: transaction CANCELED => TRANSACTION_CANCELED', async function () {
+  var sdk = mockSdk();
+  sdk.createClient = function (config) {
+    var read = {
+      getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      getTransaction: async function () { return { statusName: 'CANCELED', status: 8 }; },
+      readContract: async function () { return '{}'; }
+    };
+    var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };
+    return config && config.account ? write : read;
+  };
+  var a = GenLayerClient.createAdapter(sdk, { networkId: 'studionet', networks: TEST_NETWORKS });
+  var payload = { version: '5.0.0', contract: { address: '0x' + 'cd'.repeat(20) }, findings: [] };
+  await assert.rejects(function () {
+    return a.analyzeEvidence(payload, { account: '0x' + '11'.repeat(20) });
+  }, /TRANSACTION_CANCELED/);
 });
 
 // ── auditor integration ──────────────────────────────────────────────────────
@@ -346,6 +371,7 @@ test('analyzeEvidence: markdown-fenced result is normalized end-to-end', async f
   sdk.createClient = function (config) {
     var read = {
       getContractSchema: async function () { return { ctor: {}, methods: { analyze_evidence: {}, get_analysis: {} } }; },
+      getTransaction: async function () { return { statusName: 'FINALIZED', status: 7, txExecutionResultName: 'FINISHED_WITH_RETURN' }; },
       readContract: async function () { return '```json\n{"verdict":"NEEDS_REVIEW","confidence":"LOW","findings":[]}\n```'; }
     };
     var write = { writeContract: async function () { return { hash: '0xabc123' }; }, waitForTransactionReceipt: async function () { return { status: 'FINALIZED' }; } };

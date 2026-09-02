@@ -77,6 +77,10 @@
       (typeof globalThis !== 'undefined' && globalThis.GenLayerSDK);
   }
 
+  function sleepMs(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
   function normalizeAddr(addr) {
     return (typeof addr === 'string') ? addr.trim().toLowerCase() : '';
   }
@@ -394,26 +398,67 @@
 
       emit(opts, 'SUBMITTED', hash);
 
-      try {
-        var receipt = await wc.waitForTransactionReceipt({
+      // ── Real transaction lifecycle (Phase 7.6.1) ─────────────────────────────
+      // Poll the REAL GenLayer transaction status. There is NO local elapsed-time
+      // timeout: the transaction continues until the chain reports ACCEPTED /
+      // FINALIZED / a real terminal failure. LEADER_TIMEOUT / VALIDATORS_TIMEOUT /
+      // appeal rounds are continuing states — never failures.
+      var txMod = (typeof globalThis !== 'undefined' && globalThis.AuditAIGenLayerTx) ? globalThis.AuditAIGenLayerTx : null;
+      var monitorFn = (txMod && typeof txMod.monitorTransaction === 'function') ? txMod.monitorTransaction : null;
+
+      var outcome;
+      if (monitorFn) {
+        outcome = await monitorFn({
           hash: hash,
-          status: 'FINALIZED',
-          interval: (opts.interval || 2000),
-          retries: (opts.retries || 90)
+          getStatus: function (h) { return c.getTransaction({ hash: h }); },
+          onStatus: function (state, detail) { emit(opts, state, detail); },
+          pollInterval: opts.pollInterval,
+          maxConsecutiveRpcErrors: opts.maxConsecutiveRpcErrors,
+          maxAttempts: opts.maxAttempts
         });
-        if (receipt && receipt.status === 'FAILED') throw new Error('TRANSACTION_FAILED');
-      } catch (e) {
-        if (e && e.message === 'TRANSACTION_FAILED') throw e;
-        throw new Error(toErrorCode(e));
+      } else {
+        // Degraded fallback (genlayer-tx.js not loaded): accept ACCEPTED, but the
+        // SDK receipt waiter also returns on other decided states. Only used in
+        // misconfigured load orders; the canonical path is the monitor above.
+        try {
+          var receipt = await wc.waitForTransactionReceipt({ hash: hash, status: 'ACCEPTED', interval: (opts.interval || 2000), retries: (opts.retries || 180) });
+          outcome = (receipt && receipt.statusName === 'FINALIZED')
+            ? { ok: true, kind: 'FINALIZED', status: 'FINALIZED', tx: receipt, hash: hash }
+            : { ok: true, kind: 'ACCEPTED', status: 'ACCEPTED', tx: receipt, hash: hash };
+          emit(opts, outcome.kind === 'FINALIZED' ? 'FINALIZED' : 'ACCEPTED', hash);
+        } catch (e) {
+          if (e && e.message === 'TRANSACTION_FAILED') throw e;
+          throw new Error(toErrorCode(e));
+        }
       }
 
-      emit(opts, 'FINALIZING', hash);
+      if (!outcome.ok || outcome.kind === 'RPC_UNAVAILABLE') {
+        throw new Error('GENLAYER_NETWORK_UNAVAILABLE');
+      }
+      if (outcome.kind === 'FAILED_TERMINAL') {
+        throw new Error(outcome.status === 'CANCELED' ? 'TRANSACTION_CANCELED' : 'TRANSACTION_UNDETERMINED');
+      }
 
-      var res;
-      try {
-        res = await c.readContract({ address: auditorAddr, functionName: 'get_analysis', args: [payload.contract.address], jsonSafeReturn: true });
-      } catch (e) {
-        throw new Error(toErrorCode(e) === 'GENLAYER_NETWORK_UNAVAILABLE' ? 'GENLAYER_NETWORK_UNAVAILABLE' : 'GENLAYER_ERROR');
+      // ACCEPTED or FINALIZED. If the chain reports the write itself errored,
+      // that is a real application-level failure (not a timeout).
+      if (outcome.tx && String(outcome.tx.txExecutionResultName) === 'FINISHED_WITH_ERROR') {
+        throw new Error('TRANSACTION_FAILED');
+      }
+
+      // Recover the real AuditAI return value. The result may need a moment to
+      // become visible after ACCEPTED, so retry briefly without fabricating it.
+      var res = null, resErr = null;
+      var recoveryAttempts = (opts.recoveryRetries === undefined) ? 5 : opts.recoveryRetries;
+      for (var ri = 0; ri < recoveryAttempts; ri++) {
+        try {
+          res = await c.readContract({ address: auditorAddr, functionName: 'get_analysis', args: [payload.contract.address], jsonSafeReturn: true });
+        } catch (e) { resErr = e; res = null; }
+        if (res !== null && res !== undefined && res !== 'NO_ANALYSIS' && res !== '') break;
+        if (ri < recoveryAttempts - 1) await sleepMs(opts.interval || 2000);
+      }
+
+      if (resErr && (res === null || res === undefined)) {
+        throw new Error(toErrorCode(resErr) === 'GENLAYER_NETWORK_UNAVAILABLE' ? 'GENLAYER_NETWORK_UNAVAILABLE' : 'GENLAYER_ERROR');
       }
 
       emit(opts, 'RETRIEVING', hash);
@@ -421,6 +466,10 @@
 
       var norm = normalizeGenLayerResult(res);
       if (!norm.ok) {
+        // Transaction is ACCEPTED/FINALIZED but the analysis value is not yet
+        // visible. This is a "recovering" state, not a failure — the pending
+        // transaction is persisted and can be re-queried after a refresh.
+        if (norm.error === 'NO_RESULT') throw new Error('AUDIT_RESULT_PENDING');
         var normErr = new Error(norm.error);
         normErr.detail = norm.detail;
         throw normErr;

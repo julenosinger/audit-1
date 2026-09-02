@@ -18,12 +18,14 @@
 <script src="contract-studio.js"></script>
 <script src="contract-builder.js"></script>
 <script src="genlayer-sdk.bundle.js"></script>
+<script src="genlayer-tx.js"></script>
 <script src="genlayer-client.js"></script>
 <script src="genlayer.js"></script>
 <script src="genlayer-interaction.js"></script>
 <script src="genlayer-auditor.js"></script>
 <script src="audit-engine.js"></script>
 <script src="local-scan.js"></script>
+<script src="chat-store.js"></script>
 <style>
 :root {
   --bg:     #050508;
@@ -574,7 +576,8 @@ function stopTask() {
 }
 
 // New chat / clear conversation. Both reset the visible conversation and the
-// in-memory history and return to the welcome screen.
+// in-memory history and return to the welcome screen. Clear Chat removes the
+// persisted session/messages; New Chat creates a fresh session.
 function resetChat() {
   if (taskRunning && taskAbort) { try { taskAbort.abort(); } catch (e) {} }
   conversationHistory = [];
@@ -582,6 +585,11 @@ function resetChat() {
   lastAuditAddress = null;
   lastAuditChain = null;
   pendingBuild = null;
+  var Store = window.AuditAIChatStore;
+  if (Store) {
+    try { Store.clearMessages(); } catch (e) {}
+    try { Store.saveContext({ lastAuditResult: null, lastAuditAddress: null, lastAuditChain: null, lastDeployment: null, pendingTransactions: [] }); } catch (e) {}
+  }
   const msgs = document.getElementById('messages');
   const welcome = document.getElementById('welcomeScreen');
   if (msgs) {
@@ -593,7 +601,13 @@ function resetChat() {
   endTask();
 }
 
-function newChat() { resetChat(); }
+function newChat() {
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.setSession === 'function') {
+    try { Store.setSession({ sessionId: Store.newId('sess'), createdAt: Date.now() }); } catch (e) {}
+  }
+  resetChat();
+}
 
 function clearChat() { resetChat(); }
 
@@ -822,36 +836,65 @@ function hideWelcome() {
   document.getElementById('quickPrompts').style.display = 'flex';
 }
 
-function appendUserMessage(text) {
+function newMsgId() {
+  return 'msg-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function timeStrFrom(ts) {
+  try { return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+  catch (e) { return ''; }
+}
+
+// Persist a message through the single ChatStore (no-op if unavailable). Returns
+// the stored message (with its stable id).
+function persistMessage(msg) {
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.saveMessage === 'function') {
+    try { return Store.saveMessage(msg); } catch (e) {}
+  }
+  return msg;
+}
+
+// Render a stored/new message into the DOM (idempotent by msg.id).
+function appendMsgEl(msg) {
   hideWelcome();
   const msgs = document.getElementById('messages');
   const el = document.createElement('div');
-  el.className = 'msg user';
-  el.innerHTML = `
-    <div class="msg-avatar user">🧑</div>
-    <div class="msg-content">
-      <div class="msg-bubble">${escHtml(text)}</div>
-      <div class="msg-time">${timeStr()}</div>
-    </div>`;
+  el.className = 'msg ' + (msg.role === 'user' ? 'user' : 'ai');
+  if (msg.id) el.dataset.msgId = msg.id;
+  const time = timeStrFrom(msg.timestamp || Date.now());
+  if (msg.role === 'user') {
+    el.innerHTML = `
+      <div class="msg-avatar user">🧑</div>
+      <div class="msg-content">
+        <div class="msg-bubble">${escHtml(msg.content || '')}</div>
+        <div class="msg-time">${time}</div>
+      </div>`;
+  } else {
+    el.innerHTML = `
+      <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+      <div class="msg-content">
+        <div class="msg-bubble">${mdToHtml(msg.content || '')}</div>
+        ${msg.cardHtml ? msg.cardHtml : ''}
+        <div class="msg-time">${time} · forgeContract</div>
+      </div>`;
+  }
   msgs.appendChild(el);
   scrollBottom();
+  return el;
+}
+
+function appendUserMessage(text) {
+  var msg = { id: newMsgId(), role: 'user', content: text, cardHtml: null, timestamp: Date.now(), type: 'user' };
+  msg = persistMessage(msg);
+  appendMsgEl(msg);
   conversationHistory.push({ role: 'user', content: text });
 }
 
 function appendAIMessage(md, cardHtml) {
-  hideWelcome();
-  const msgs = document.getElementById('messages');
-  const el = document.createElement('div');
-  el.className = 'msg ai';
-  el.innerHTML = `
-    <div class="msg-avatar ai"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="var(--green)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-    <div class="msg-content">
-      <div class="msg-bubble">${mdToHtml(md)}</div>
-      ${cardHtml ? cardHtml : ''}
-      <div class="msg-time">${timeStr()} · forgeContract</div>
-    </div>`;
-  msgs.appendChild(el);
-  scrollBottom();
+  var msg = { id: newMsgId(), role: 'assistant', content: md, cardHtml: cardHtml || null, timestamp: Date.now(), type: 'assistant' };
+  msg = persistMessage(msg);
+  appendMsgEl(msg);
   conversationHistory.push({ role: 'assistant', content: md });
 }
 
@@ -882,7 +925,7 @@ function scrollBottom() {
 }
 
 function timeStr() {
-  return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return timeStrFrom(Date.now());
 }
 
 function escHtml(s) {
@@ -1349,6 +1392,7 @@ async function auditAddressLocal(address, networkId, net) {
   lastAuditResult  = result;
   lastAuditAddress = address;
   lastAuditChain   = result.chainId || (net ? net.chainId : null);
+  persistAppContext();
 
   const chainLabel = net ? net.name : (result.networkName || 'Unknown');
   addToHistory(address, chainLabel, result);
@@ -1496,6 +1540,108 @@ function getAppContext() {
     lastApprovalContext: lastApprovalContext,
     lastPortfolio: lastPortfolio
   });
+}
+
+// ── Persistence (Phase 7.6.1) — single ChatStore, no secrets ─────────────────
+function persistAppContext() {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.saveContext !== 'function') return;
+  try {
+    Store.saveContext({
+      lastAuditResult: lastAuditResult,
+      lastAuditAddress: lastAuditAddress,
+      lastAuditChain: lastAuditChain,
+      lastDeployment: lastDeployment,
+      pendingTransactions: pendingAuditTxs()
+    });
+  } catch (e) {}
+}
+
+function pendingAuditTxs() {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.loadTxs !== 'function') return [];
+  try { return Store.loadTxs(); } catch (e) { return []; }
+}
+
+function persistPendingAuditTx(tx) {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.saveTx !== 'function') return;
+  try { Store.saveTx(tx); } catch (e) {}
+}
+
+function clearPendingAuditTx(hash) {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.removeTx !== 'function' || !hash) return;
+  try { Store.removeTx(hash); } catch (e) {}
+}
+
+// Restore the persisted conversation + context before first render. Idempotent:
+// it only runs once and never double-appends messages.
+function restoreAppState() {
+  var Store = window.AuditAIChatStore;
+  if (Store) {
+    try {
+      var ctx = Store.loadContext();
+      if (ctx) {
+        if (ctx.lastAuditResult) lastAuditResult = ctx.lastAuditResult;
+        if (ctx.lastAuditAddress) lastAuditAddress = ctx.lastAuditAddress;
+        if (ctx.lastAuditChain !== undefined) lastAuditChain = ctx.lastAuditChain;
+        if (ctx.lastDeployment) lastDeployment = ctx.lastDeployment;
+      }
+      var msgs = Store.loadMessages();
+      if (msgs && msgs.length) {
+        msgs.forEach(function (m) {
+          appendMsgEl(m);
+          if (m.role === 'user') conversationHistory.push({ role: 'user', content: m.content });
+          else conversationHistory.push({ role: 'assistant', content: m.content });
+        });
+      }
+    } catch (e) {}
+  }
+  resumePendingAudits();
+}
+
+// Re-query and resume any audit transaction that was in flight before a refresh
+// (a refresh must never orphan an on-chain audit).
+function resumePendingAudits() {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.loadTxs !== 'function') return;
+  var txs;
+  try { txs = Store.loadTxs(); } catch (e) { return; }
+  if (!txs || !txs.length) return;
+  txs.forEach(function (tx) {
+    if (tx && tx.operation === 'AUDIT_AI' && tx.status !== 'FINALIZED' && tx.status !== 'CONFIRMED' && tx.status !== 'FAILED') {
+      recoverPendingAudit(tx);
+    }
+  });
+}
+
+async function recoverPendingAudit(tx) {
+  var client = (window.AuditAIGenLayer && window.AuditAIGenLayer.getClient && window.AuditAIGenLayer.getClient()) || null;
+  if (!client || typeof client.getTransaction !== 'function') return;
+  var Tx = window.AuditAIGenLayerTx;
+  if (!Tx || typeof Tx.monitorTransaction !== 'function') return;
+  appendAIMessage('⏳ Resuming GenLayer audit for transaction `' + tx.txHash + '`…');
+  try {
+    var outcome = await Tx.monitorTransaction({
+      hash: tx.txHash,
+      getStatus: function (h) { return client.getTransaction({ hash: h }); },
+      onStatus: function (state) {
+        window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: state, lastStatusAt: Date.now() });
+      },
+      pollInterval: 3000,
+      maxConsecutiveRpcErrors: 5
+    });
+    if (outcome.kind === 'ACCEPTED' || outcome.kind === 'FINALIZED') {
+      window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: outcome.status, acceptedAt: Date.now(), finalizedAt: outcome.kind === 'FINALIZED' ? Date.now() : null });
+      window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
+      appendAIMessage('✅ GenLayer analysis for transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
+    } else if (outcome.kind === 'FAILED_TERMINAL') {
+      window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: outcome.status });
+      window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
+      appendAIMessage('⚠️ GenLayer transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
+    }
+  } catch (e) {}
 }
 
 // Resolve the GenLayer network descriptor (name, networkId, chainId, auditor
@@ -1962,6 +2108,7 @@ Well-known protocols (USDC, Uniswap, Aave) score 80+. Unknown contracts score lo
   lastAuditResult  = result;
   lastAuditAddress = address;
   lastAuditChain   = chainId;
+  persistAppContext();
 
   addToHistory(address, chainName, result);
   sessionCount++;
@@ -2288,11 +2435,22 @@ function setGLAnalysisStatus(addr, status) {
     'FINALIZING':  { text: 'Finalizing…',             cls: 'gl-pending' },
     'RETRIEVING':  { text: 'Retrieving result…',      cls: 'gl-pending' },
     'VALIDATING':  { text: 'Validating result…',      cls: 'gl-pending' },
-    'PENDING':     { text: 'Analyzing with GenLayer…', cls: 'gl-pending' },
+    'PENDING':     { text: 'Waiting for consensus…',  cls: 'gl-pending' },
+    'PROPOSING':   { text: 'Leader proposing…',       cls: 'gl-pending' },
+    'COMMITTING':  { text: 'Validators committing…',  cls: 'gl-pending' },
+    'REVEALING':   { text: 'Validators revealing…',   cls: 'gl-pending' },
+    'LEADER_TIMEOUT': { text: 'Leader timeout — continuing', cls: 'gl-pending' },
+    'VALIDATORS_TIMEOUT': { text: 'Validators timeout — continuing', cls: 'gl-pending' },
+    'APPEAL_COMMITTING': { text: 'Appeal round — committing', cls: 'gl-pending' },
+    'APPEAL_REVEALING': { text: 'Appeal round — revealing', cls: 'gl-pending' },
+    'READY_TO_FINALIZE': { text: 'Ready to finalize', cls: 'gl-pending' },
+    'ACCEPTED':    { text: 'Accepted — waiting for finality', cls: 'gl-finalized' },
     'COMPLETE':    { text: 'Complete',                cls: 'gl-finalized' },
-    'FINALIZED':   { text: 'Complete',                cls: 'gl-finalized' },
+    'FINALIZED':   { text: 'Finalized',               cls: 'gl-finalized' },
+    'CANCELED':    { text: 'Canceled',                cls: 'gl-fail' },
+    'UNDETERMINED': { text: 'Undetermined',           cls: 'gl-fail' },
     'FAILED':      { text: 'Unavailable',             cls: 'gl-fail' },
-    'TIMEOUT':     { text: 'Timed out',               cls: 'gl-fail' },
+    'TIMEOUT':     { text: 'Recovering…',             cls: 'gl-pending' },
     'INVALID':     { text: 'Invalid response',        cls: 'gl-fail' },
     'NOT_REQUESTED': { text: 'Not requested',         cls: '' }
   };
@@ -2322,8 +2480,11 @@ function showGenLayerError(err) {
     'USER_REJECTED': 'the transaction was rejected in your wallet.',
     'INSUFFICIENT_BALANCE': 'your wallet has insufficient balance to pay for the transaction.',
     'TRANSACTION_FAILED': 'the GenLayer transaction failed/reverted.',
-    'TRANSACTION_TIMEOUT': 'the GenLayer transaction timed out waiting for finalization.',
-    'NO_RESULT': 'the contract has no stored analysis yet (the validator may still be executing, or none is running).',
+    'TRANSACTION_CANCELED': 'the GenLayer transaction was canceled by the network.',
+    'TRANSACTION_UNDETERMINED': 'GenLayer could not determine a final consensus result.',
+    'TRANSACTION_TIMEOUT': 'the GenLayer RPC could not be reached; the transaction may still be processing.',
+    'AUDIT_RESULT_PENDING': 'the GenLayer transaction was accepted but its analysis result is still being recovered. Please wait a moment and try again.',
+    'NO_RESULT': 'the transaction was accepted but the analysis result is still being recovered (the validator may still be executing).',
     'INVALID_RESULT_JSON': 'GenLayer returned a result that could not be parsed.',
     'GENLAYER_NETWORK_UNAVAILABLE': 'the ' + netName + ' GenLayer network is unreachable.',
     'SDK_UNAVAILABLE': 'the GenLayer SDK failed to initialize.',
@@ -2402,10 +2563,23 @@ async function requestGenLayerAnalysis(addr) {
     }
 
     const res = await auditor.analyze(client, data.payload, {
-      timeoutMs: 180000,
       account: walletAddress,
       onStatus: function (state, detail) {
-        if (state === 'SUBMITTED') data.glTxHash = detail;
+        if (state === 'SUBMITTED') {
+          data.glTxHash = detail;
+          persistPendingAuditTx({
+            type: 'GENLAYER_AUDIT',
+            operation: 'AUDIT_AI',
+            txHash: detail,
+            networkId: net.id,
+            chainId: net.chainId,
+            contractAddress: net.contract,
+            targetContract: data.address,
+            submittedAt: Date.now(),
+            status: 'SUBMITTED',
+            source: 'genlayer'
+          });
+        }
         if (window.__GENLAYER_DEBUG__) {
           window.__GENLAYER_DEBUG__.status = state;
           if (state === 'RAW_RESULT' && detail) {
@@ -2422,11 +2596,11 @@ async function requestGenLayerAnalysis(addr) {
 
     if (res.status === 'FINALIZED') {
       setGLAnalysisStatus(addr, 'FINALIZED');
+      clearPendingAuditTx(data.glTxHash);
+      persistAppContext();
       showGenLayerResult(addr, res);
-    } else if (res.status === 'TIMEOUT') {
-      setGLAnalysisStatus(addr, 'TIMEOUT');
-      appendAIMessage('⚠️ GenLayer analysis timed out — local analysis remains valid.');
     } else if (res.status === 'INVALID') {
+      clearPendingAuditTx(data.glTxHash);
       setGLAnalysisStatus(addr, 'INVALID');
       if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.validationStatus = 'invalid'; window.__GENLAYER_DEBUG__.errorCode = 'INVALID'; }
       appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
@@ -2467,6 +2641,7 @@ function showGenLayerResult(addr, res) {
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
+restoreAppState();
 renderSidebar();
 updateNavStats();
 updateGLStatus();
@@ -2687,8 +2862,10 @@ async function deployBuiltContract() {
       contractType: build.spec.type,
       source: build.source,
       spec: build.spec,
-      deploymentTimestamp: Date.now()
+      deploymentTimestamp: Date.now(),
+      status: 'FINALIZED'
     };
+    persistAppContext();
     appendAIMessage('🎉 **Deployment complete.**\n\nContract: `' + res.contractAddress + '`\nTransaction: `' + res.hash + '`\nNetwork: **' + net.name + '**\nChain ID: **' + net.chainId + '**', card);
   } catch (e) {
     showDeploymentError(String((e && e.message) || e), net);
