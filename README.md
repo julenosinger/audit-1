@@ -14,7 +14,8 @@ Live: <https://auditai-6di.pages.dev/>
 - **`public/genlayer.js`** — GenLayer bridge: `publish_audit` / `analyze_and_publish`
   with a Studio copy-call fallback.
 - **`contracts/audit_ai.py`** — GenLayer Intelligent Contract that records audit
-  results as immutable on-chain state.
+  results on-chain. Records are mutable, caller-submitted analyses (a later
+  publish overwrites the stored record; not an append-only log).
 - **`functions/api/claude.js`** — optional Anthropic proxy (kept for regression,
   but **not required**; disabled by default via `USE_CLAUDE = false`).
 - **`wrangler.toml`** — Cloudflare Pages project `auditai`.

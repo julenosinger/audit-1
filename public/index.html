@@ -642,15 +642,15 @@ function onAuditNetworkChange(id) {
   if (sel) sel.value = id;
 }
 
-// Transaction / deployment network — GENLAYER ONLY. Studionet (61999) is the
-// default; Bradbury (4221) is an operational GenLayer transaction network.
-// No external EVM network can ever resolve here.
+// Transaction / deployment network — GENLAYER ONLY. Bradbury (4221) is the
+// default (canonical AuditAI at 0x119Ac58A…); Studionet (61999) remains
+// available in the selector. No external EVM network can ever resolve here.
 function getTransactionNetwork() {
   if (!window.AuditAIGenLayer) return null;
   var id = window.AuditAIGenLayer.getNetworkId();
-  if (!id) id = 'studionet';
+  if (!id) id = 'bradbury';
   return window.AuditAIGenLayer.getNetwork && window.AuditAIGenLayer.NETWORKS
-    ? (window.AuditAIGenLayer.NETWORKS[id] || window.AuditAIGenLayer.NETWORKS.studionet || null)
+    ? (window.AuditAIGenLayer.NETWORKS[id] || window.AuditAIGenLayer.NETWORKS.bradbury || null)
     : null;
 }
 function getDeploymentNetwork() { return getTransactionNetwork(); }
@@ -2469,27 +2469,36 @@ async function publishToGenLayer(addr) {
   const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
 
-  if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
-    alert('Set the GenLayer contract address first (top bar).');
+  const net = window.AuditAIGenLayer.getNetwork();
+  if (!net || !window.AuditAIGenLayer.isSet(net.contract)) {
+    alert('Select the GenLayer contract address first (top bar).');
     setGenlayerContractUI();
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  const res = await window.AuditAIGenLayer.publish(addr, data.score, contractVerdict(data.verdict), data.summary);
+  appendAIMessage('⚡ Publishing audit to GenLayer (' + (net ? net.name : '') + ')…');
+  const res = await window.AuditAIGenLayer.publish(addr, data.score, contractVerdict(data.verdict), data.summary, {
+    account: walletAddress || undefined,
+    onStatus: function (state, detail) {
+      if (state === 'SUBMITTED') appendAIMessage('Transaction submitted:\n`' + detail + '`');
+      else if (state === 'ACCEPTED') appendAIMessage('✅ Accepted by GenLayer — waiting for finality…');
+      else if (state === 'FINALIZED') appendAIMessage('✅ Transaction finalized.');
+    }
+  });
 
-  if (res.ok || res.fallback) {
+  if (res.ok && res.onChain) {
     window.AuditAIGenLayer.markPublished(addr);
     markGLButtonPublished(addr);
     renderSidebar();
-    if (res.fallback) {
-      window.AuditAIGenLayer.copyToClipboard(res.calldata);
-      alert('Copied to clipboard. Paste in GenLayer Studio → publish_audit:\n\n' + res.calldata);
-    }
-  } else if (res.needContract) {
-    alert(res.message);
-    setGenlayerContractUI();
+    const explorer = (net && net.id === 'bradbury') ? '\n\n[Explorer ↗](https://explorer-bradbury.genlayer.com/)' : '';
+    appendAIMessage('✅ **Published on-chain.**\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + explorer);
+  } else if (res.fallback) {
+    window.AuditAIGenLayer.copyToClipboard(res.calldata);
+    appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
+  } else if (res.error) {
+    appendAIMessage('⚠️ **' + res.error + '** — not published on-chain.');
   } else {
-    alert(res.message);
+    appendAIMessage('⚠️ Not published on-chain.');
   }
 }
 
@@ -2498,30 +2507,37 @@ async function adjudicateGL(addr) {
   const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
 
-  if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) {
-    alert('Set the GenLayer contract address first (top bar).');
+  const net = window.AuditAIGenLayer.getNetwork();
+  if (!net || !window.AuditAIGenLayer.isSet(net.contract)) {
+    alert('Select the GenLayer contract address first (top bar).');
     setGenlayerContractUI();
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  const res = await window.AuditAIGenLayer.analyzeAndPublish(addr, data.context || data.summary);
+  appendAIMessage('⚡ Adjudicating with GenLayer LLM (' + (net ? net.name : '') + ')…');
+  const res = await window.AuditAIGenLayer.analyzeAndPublish(addr, data.context || data.summary, {
+    account: walletAddress || undefined,
+    onStatus: function (state, detail) {
+      if (state === 'SUBMITTED') appendAIMessage('Transaction submitted:\n`' + detail + '`');
+      else if (state === 'ACCEPTED') appendAIMessage('✅ Accepted by GenLayer — waiting for finality…');
+      else if (state === 'FINALIZED') appendAIMessage('✅ Transaction finalized.');
+    }
+  });
 
-  if (res.ok || res.fallback) {
+  if (res.ok && res.onChain) {
     window.AuditAIGenLayer.markPublished(addr);
     markGLButtonPublished(addr);
     renderSidebar();
-    if (res.fallback) {
-      window.AuditAIGenLayer.copyToClipboard(res.calldata);
-      alert('Copied. Paste in GenLayer Studio → analyze_and_publish:\n\n' + res.calldata);
-    }
-    // Read back the adjudicated result (no-op until genlayer-js is wired).
-    const onchain = await window.AuditAIGenLayer.getAudit(addr);
-    if (onchain && onchain !== 'NO_AUDIT') applyOnChainResult(addr, onchain);
-  } else if (res.needContract) {
-    alert(res.message);
-    setGenlayerContractUI();
+    const explorer = (net && net.id === 'bradbury') ? '\n\n[Explorer ↗](https://explorer-bradbury.genlayer.com/)' : '';
+    appendAIMessage('✅ **Published on-chain.**\n\nTransaction: `' + res.hash + '`' + explorer);
+    applyOnChainResult(addr, res.result);
+  } else if (res.fallback) {
+    window.AuditAIGenLayer.copyToClipboard(res.calldata);
+    appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
+  } else if (res.error) {
+    appendAIMessage('⚠️ **' + res.error + '** — not published on-chain.');
   } else {
-    alert(res.message);
+    appendAIMessage('⚠️ Not published on-chain.');
   }
 }
 

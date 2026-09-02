@@ -200,6 +200,9 @@
     var maxConsecutiveRpcErrors = opts.maxConsecutiveRpcErrors || 30;
     var maxAttempts = opts.maxAttempts || 0; // 0 = unlimited (consensus is unbounded)
     var meta = opts.meta || null;
+    // 'ACCEPTED' (default) resolves as soon as the result is recoverable;
+    // 'FINALIZED' keeps polling through ACCEPTED until finality (on-chain claim).
+    var until = opts.until === 'FINALIZED' ? 'FINALIZED' : 'ACCEPTED';
 
     if (typeof getStatus !== 'function') {
       return { ok: false, kind: 'RPC_UNAVAILABLE', status: 'UNKNOWN', error: 'NO_STATUS_PROVIDER', hash: hash };
@@ -237,7 +240,14 @@
       onStatus(name, { status: name, tx: tx, hash: hash });
       if (meta && meta.txHash) update(meta.txHash, { status: name, lifecycleState: name, lastUpdatedAt: Date.now() });
 
-      if (cls.kind === 'ACCEPTED') return { ok: true, kind: 'ACCEPTED', status: name, accepted: true, finalized: false, tx: tx, hash: hash };
+      if (cls.kind === 'ACCEPTED') {
+        if (until === 'FINALIZED') {
+          // Intermediate step on the way to finality — keep polling.
+          await sleep(pollInterval);
+          continue;
+        }
+        return { ok: true, kind: 'ACCEPTED', status: name, accepted: true, finalized: false, tx: tx, hash: hash };
+      }
       if (cls.kind === 'FINALIZED') return { ok: true, kind: 'FINALIZED', status: name, accepted: true, finalized: true, tx: tx, hash: hash };
       if (cls.kind === 'FAILED_TERMINAL') return { ok: true, kind: 'FAILED_TERMINAL', status: name, accepted: false, finalized: false, tx: tx, hash: hash };
 

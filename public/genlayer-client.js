@@ -45,7 +45,7 @@
       knownDeploymentTx: '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc'
     }
   };
-  var DEFAULT_NETWORK_ID = 'studionet';
+  var DEFAULT_NETWORK_ID = 'bradbury';
 
   // Known/operational GenLayer contracts (single source of truth). Each entry
   // pairs a real contract address with its deployment network + chain id so the

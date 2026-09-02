@@ -14,10 +14,10 @@ const CODE = '0x600060005260206000f3';
 
 beforeEach(function () { Networks.clearCodeCache(); });
 
-// ── GenLayer Studionet is the default transaction/deployment network ─────────
+// ── GenLayer Bradbury is the default transaction/deployment network ──────────
 
-test('GenLayer default transaction network is Studionet', function () {
-  assert.equal(GenLayerClient.DEFAULT_NETWORK_ID, 'studionet');
+test('GenLayer default transaction network is Bradbury', function () {
+  assert.equal(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
 });
 
 test('Studionet chain id is 61999 and AuditAI contract is configured', function () {
@@ -31,7 +31,7 @@ test('Bradbury chain id is 4221; known contract + deployment tx registered', fun
   assert.equal(GenLayerClient.NETWORKS.bradbury.deployed, true); // AuditAI deployed on Bradbury
   assert.equal(GenLayerClient.NETWORKS.bradbury.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
   assert.equal(GenLayerClient.NETWORKS.bradbury.knownDeploymentTx, '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc');
-  assert.notEqual(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
+  assert.equal(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
 });
 
 // ── External EVM networks are read-only audit targets ────────────────────────

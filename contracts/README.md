@@ -1,8 +1,12 @@
 # AuditAI — Intelligent Contract (GenLayer)
 
 `contracts/audit_ai.py` is the on-chain companion to the AuditAI frontend.
-It stores immutable audit records (`score`, `verdict`, `summary`) for any EVM
+It stores mutable audit records (`score`, `verdict`, `summary`) for any EVM
 contract address and makes them queryable later.
+
+> Records are mutable, caller-submitted analyses. A later `publish_audit`,
+> `analyze_and_publish`, or `analyze_evidence` from any caller overwrites the
+> stored record for that address. This is not an append-only audit log.
 
 ## Methods
 

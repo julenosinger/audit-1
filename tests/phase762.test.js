@@ -238,4 +238,27 @@ test('GenLayer audit never exposes eth_getCode', function () {
   assert.equal(a.eth_getCode, undefined);
 });
 
+test('monitor until FINALIZED: ACCEPTED is intermediate, resolves only at FINALIZED', async function () {
+  Tx.resetStates();
+  var seq = ['PENDING', 'ACCEPTED', 'FINALIZED'];
+  var i = 0;
+  var emitted = [];
+  var out = await Tx.monitorTransaction({
+    hash: '0xf',
+    getStatus: async function () { return { statusName: seq[Math.min(i++, seq.length - 1)] }; },
+    sleep: noSleep,
+    until: 'FINALIZED',
+    onStatus: function (s) { emitted.push(s); }
+  });
+  assert.equal(out.kind, 'FINALIZED');
+  assert.equal(out.finalized, true);
+  assert.ok(emitted.indexOf('ACCEPTED') !== -1, 'ACCEPTED emitted as intermediate step');
+  assert.ok(emitted.indexOf('FINALIZED') !== -1);
+});
+
+test('default GenLayer transaction network is Bradbury', function () {
+  assert.equal(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
+  assert.equal(GenLayerClient.NETWORKS.bradbury.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
+});
+
 console.log('\nAll phase762 tests completed.');

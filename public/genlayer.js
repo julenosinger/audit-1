@@ -13,7 +13,7 @@
 
   var PUBLISHED_KEY = 'auditai.genlayer.published';
   var NETWORK_KEY = 'auditai.genlayer.network';
-  var DEFAULT_NETWORK_ID = 'studionet';
+  var DEFAULT_NETWORK_ID = 'bradbury';
 
   // ── GenLayer networks (single source of truth in genlayer-client.js) ───────
   // Network + contract pairing lives in the adapter (window.AuditAIGenLayerClient.NETWORKS).
@@ -76,25 +76,16 @@
     return !!getPublished()[String(contractAddr).toLowerCase()];
   }
 
-  // ── genlayer-js (optional) ─────────────────────────────────────────────────
-  // TODO: if/when genlayer-js is available via a confirmed CDN/bundle, load it
-  // here and implement the real write/view calls below.
-  //   npm: genlayer-js   →  import { GenLayerClient } from 'genlayer-js'
+  // ── genlayer-js (bundled) ──────────────────────────────────────────────────
+  // The real client is the adapter in public/genlayer-client.js (wired to the
+  // official genlayer-js SDK bundled into public/genlayer-sdk.bundle.js).
   var _client = null;
   var _clientNetwork = null;
 
-  function loadClient() {
-    if (_client) return Promise.resolve(_client);
-    if (window.genlayer) { _client = window.genlayer; return Promise.resolve(_client); }
-    // No confirmed CDN yet. Return a rejected promise so callers use the
-    // Studio fallback instead of crashing.
-    return Promise.reject(new Error('genlayer-js not available'));
-  }
-
   // Synchronous accessor for the GenLayer client adapter (null if not wired).
-  // Creates the bundled adapter (public/genlayer-client.js) bound to the
-  // currently selected network, and caches it by network id so switching
-  // networks recreates a correctly-paired adapter.
+  // Creates the bundled adapter bound to the currently selected network, and
+  // caches it by network id so switching networks recreates a correctly-paired
+  // adapter.
   function getClient() {
     var netId = getNetworkId();
     if (_client && _clientNetwork === netId) return _client;
@@ -109,72 +100,134 @@
   }
 
   // ── public API ─────────────────────────────────────────────────────────────
-  // publish(contractAddr, score, verdict, summary) -> Promise<{ok, message, calldata?}>
-  function publish(contractAddr, score, verdict, summary) {
-    var target = getContract();
-    if (!isSet(target)) {
-      return Promise.resolve({
-        ok: false,
-        needContract: true,
-        message: 'No GenLayer contract set. Click "Set GenLayer contract address" in the top bar first.'
+  // Each write submits the correct method via the bundled genlayer-js client,
+  // waits for FINALIZED, reads the contract state, and only then reports it as
+  // on-chain. Without a wallet/SDK it falls back to a Studio copy-call that is
+  // explicitly OFF-CHAIN (never marked on-chain).
+
+  function fallbackResult(target, method, contractAddr, args, message) {
+    var lines = [method + '('];
+    for (var i = 0; i < args.length; i++) {
+      var v = String(args[i] === null || args[i] === undefined ? '' : args[i])
+        .replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      lines.push('  "' + v + '"' + (i < args.length - 1 ? ',' : ''));
+    }
+    lines.push(')');
+    return {
+      ok: false,
+      fallback: true,
+      offChain: true,
+      contract: target,
+      message: message,
+      calldata: lines.join('\n')
+    };
+  }
+
+  // Poll a submitted transaction until the chain reports FINALIZED (via the
+  // single GenLayerTx engine). ACCEPTED is kept only as an intermediate step.
+  function waitFinalized(client, hash, opts) {
+    opts = opts || {};
+    var Tx = window.AuditAIGenLayerTx;
+    if (Tx && typeof Tx.monitorTransaction === 'function' && typeof client.getTransaction === 'function') {
+      return Tx.monitorTransaction({
+        hash: hash,
+        getStatus: function (h) { return client.getTransaction(h); },
+        onStatus: function (state, detail) { if (typeof opts.onStatus === 'function') opts.onStatus(state, detail); },
+        until: 'FINALIZED',
+        pollInterval: opts.pollInterval,
+        maxConsecutiveRpcErrors: opts.maxConsecutiveRpcErrors
+      }).then(function (outcome) {
+        if (outcome.kind === 'FAILED_TERMINAL') { throw new Error(outcome.status); }
+        if (!outcome.ok) { throw new Error('GENLAYER_NETWORK_UNAVAILABLE'); }
+        return outcome;
       });
     }
-
-    return loadClient().then(function (client) {
-      // TODO: real write once the client is wired:
-      //   return client.write(target, 'publish_audit', [contractAddr, String(score), verdict, summary]);
-      throw new Error('genlayer-js publish not wired yet');
-    }).catch(function () {
-      return Promise.resolve({
-        ok: false,
-        fallback: true,
-        contract: target,
-        message: 'Open GenLayer Studio and call publish_audit on ' + short(target),
-        calldata: 'publish_audit(\n  "' + contractAddr + '",\n  "' + score + '",\n  "' + verdict + '",\n  "' + String(summary).replace(/"/g, '\\"') + '"\n)'
-      });
+    // No engine available — degrade to the adapter receipt waiter (best-effort).
+    return client.waitForTransactionReceipt(hash, { status: 'FINALIZED' }).then(function (receipt) {
+      if (receipt && receipt.status === 'FAILED') throw new Error('TRANSACTION_FAILED');
+      return { kind: 'FINALIZED', status: 'FINALIZED', tx: receipt, hash: hash };
     });
+  }
+
+  // publish(contractAddr, score, verdict, findings, opts) -> Promise
+  //   opts: { account, onStatus, pollInterval, maxConsecutiveRpcErrors }
+  //   resolves { ok:true, hash, onChain, result } only after FINALIZED + read.
+  function publish(contractAddr, score, verdict, findings, opts) {
+    opts = opts || {};
+    var target = getContract();
+    if (!isSet(target)) {
+      return Promise.resolve({ ok: false, needContract: true, message: 'No GenLayer contract set. Click "Set GenLayer contract address" in the top bar first.' });
+    }
+    var client = getClient();
+    var account = opts.account;
+    var args = [contractAddr, String(score), String(verdict), findings];
+    if (!client || typeof client.writeContract !== 'function' || !account) {
+      return Promise.resolve(fallbackResult(target, 'publish_audit', contractAddr, args, 'No wallet connected — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.'));
+    }
+    return client.writeContract(target, 'publish_audit', args, { account: account })
+      .then(function (hash) {
+        if (typeof opts.onStatus === 'function') opts.onStatus('SUBMITTED', hash);
+        return waitFinalized(client, hash, opts).then(function () {
+          return client.read(target, 'get_audit', [contractAddr]).then(function (result) {
+            var onChain = (typeof result === 'string' && result && result !== 'NO_AUDIT');
+            return { ok: true, hash: hash, onChain: onChain, result: result, contract: target };
+          });
+        });
+      })
+      .catch(function (e) {
+        var code = (e && e.message) || 'GENLAYER_ERROR';
+        if (code === 'USER_REJECTED') {
+          return fallbackResult(target, 'publish_audit', contractAddr, args, 'Signature canceled — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.');
+        }
+        return { ok: false, error: code, contract: target };
+      });
   }
 
   // getOnChain(contractAddr) -> Promise<string|null>  (format "{score}|{verdict}|{summary}")
   function getOnChain(contractAddr) {
     var target = getContract();
     if (!isSet(target)) return Promise.resolve(null);
-
-    return loadClient().then(function (client) {
-      // TODO: real view once wired:
-      //   return client.view(target, 'get_audit', [contractAddr]);
-      return null;
-    }).catch(function () { return null; });
+    var client = getClient();
+    if (!client || typeof client.read !== 'function') return Promise.resolve(null);
+    return client.read(target, 'get_audit', [contractAddr])
+      .then(function (result) {
+        return (typeof result === 'string' && result && result !== 'NO_AUDIT') ? result : null;
+      })
+      .catch(function () { return null; });
   }
 
-  // analyzeAndPublish(contractAddr, context) -> Promise<{ok, fallback, calldata, message}>
-  // Calls the GenLayer-native LLM method analyze_and_publish. Falls back to
-  // Studio instructions (copy calldata) when genlayer-js is not wired.
-  function analyzeAndPublish(contractAddr, context) {
+  // analyzeAndPublish(contractAddr, context, opts) -> Promise
+  //   Adjudicates via the GenLayer LLM, waits FINALIZED, then reads get_audit.
+  function analyzeAndPublish(contractAddr, context, opts) {
+    opts = opts || {};
     var target = getContract();
     if (!isSet(target)) {
-      return Promise.resolve({
-        ok: false,
-        needContract: true,
-        message: 'No GenLayer contract set. Click the top-bar pill first.'
-      });
+      return Promise.resolve({ ok: false, needContract: true, message: 'No GenLayer contract set. Click the top-bar pill first.' });
     }
-
-    return loadClient().then(function (client) {
-      // TODO: real write once genlayer-js client is wired:
-      //   return client.write(target, 'analyze_and_publish', [contractAddr, String(context).slice(0, 8000)]);
-      throw new Error('genlayer-js analyze not wired yet');
-    }).catch(function () {
-      var snippet = String(context || '').slice(0, 8000)
-        .replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-      return Promise.resolve({
-        ok: false,
-        fallback: true,
-        contract: target,
-        message: 'Open GenLayer Studio and call analyze_and_publish on ' + short(target),
-        calldata: 'analyze_and_publish(\n  "' + contractAddr + '",\n  "' + snippet + '"\n)'
+    var snippet = String(context || '').slice(0, 8000);
+    var client = getClient();
+    var account = opts.account;
+    var args = [contractAddr, snippet];
+    if (!client || typeof client.writeContract !== 'function' || !account) {
+      return Promise.resolve(fallbackResult(target, 'analyze_and_publish', contractAddr, args, 'No wallet connected — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.'));
+    }
+    return client.writeContract(target, 'analyze_and_publish', args, { account: account })
+      .then(function (hash) {
+        if (typeof opts.onStatus === 'function') opts.onStatus('SUBMITTED', hash);
+        return waitFinalized(client, hash, opts).then(function () {
+          return client.read(target, 'get_audit', [contractAddr]).then(function (result) {
+            var onChain = (typeof result === 'string' && result && result !== 'NO_AUDIT');
+            return { ok: true, hash: hash, onChain: onChain, result: result, contract: target };
+          });
+        });
+      })
+      .catch(function (e) {
+        var code = (e && e.message) || 'GENLAYER_ERROR';
+        if (code === 'USER_REJECTED') {
+          return fallbackResult(target, 'analyze_and_publish', contractAddr, args, 'Signature canceled — the result was NOT published on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.');
+        }
+        return { ok: false, error: code, contract: target };
       });
-    });
   }
 
   // getAudit(contractAddr) -> Promise<string|null>  (alias of getOnChain)

@@ -8,7 +8,11 @@ VALID_VERDICTS = ("SAFE", "WARNING", "DANGER")
 
 
 class AuditAI(gl.Contract):
-    """Immutable on-chain registry for smart-contract security audits.
+    """On-chain registry for smart-contract security audits.
+
+    Records are mutable, caller-submitted analyses. A later `publish_audit`,
+    `analyze_and_publish`, or `analyze_evidence` from any caller overwrites the
+    stored record for that address. This is not an append-only audit log.
 
     Deterministic path: `publish_audit` stores a result that was already
     computed off-chain (e.g. by AuditAI's Claude/ethers frontend). No LLM here,
