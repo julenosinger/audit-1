@@ -537,10 +537,10 @@ let lastAuditAddress = null;
 let lastAuditChain = null;
 let conversationHistory = [];
 
-// Session model (Phase 7.8): every chat owns a unique sessionId whose messages
+// Session model (Phase 7.8.1): every chat owns a unique sessionId whose messages
 // and context are persisted in ChatStore (session-scoped). activeSessionId is
-// the chat currently visible in this tab. Startup ALWAYS creates a fresh chat;
-// previous chats + transactions stay persisted but are not auto-restored.
+// the chat currently visible in this tab. The last open chat is remembered and
+// restored on reload AND reopen; only New Chat (or an invalid id) starts fresh.
 let activeSessionId = null;
 let histMenuOpen = null;
 
@@ -554,6 +554,7 @@ let currentIntent = null;
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
 const LEGACY_SESSION_ID = 'legacy';
+const ACTIVE_SESSION_TAB_KEY = 'forgecontract.chat.activeSessionId.v1';
 const GL_AUDIT_STORE = {};
 const AUDIT_NETWORK_KEY = 'auditai.audit.network';
 
@@ -594,13 +595,13 @@ function stopTask() {
   appendAIMessage('⏹ **Task stopped.**');
 }
 
-// New chat / clear conversation. resetChat() only resets the TRANSIENT,
-// in-memory UI state (it never deletes persisted sessions or transactions).
-// Clear Chat additionally clears the ACTIVE session's messages; New Chat
-// creates a brand-new session and leaves every previous session + transaction
-// record intact.
+// New chat / clear conversation / switch session. resetChat() only resets the
+// TRANSIENT in-memory UI state — it NEVER deletes persisted sessions or
+// transactions and NEVER aborts a running blockchain operation (that is the
+// exclusive job of the explicit "Stop Task" button). Clear Chat additionally
+// clears the ACTIVE session's messages; New Chat creates a brand-new session and
+// leaves every previous session + transaction record intact.
 function resetChat() {
-  if (taskRunning && taskAbort) { try { taskAbort.abort(); } catch (e) {} }
   conversationHistory = [];
   lastAuditResult = null;
   lastAuditAddress = null;
@@ -621,10 +622,67 @@ function resetChat() {
   endTask();
 }
 
+// ── active-session id persistence (reload + reopen restore the last chat) ─────
+function rememberActiveSession(id) {
+  if (!id) return;
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.setActiveSessionId === 'function') {
+    try { Store.setActiveSessionId(id); } catch (e) {}
+  }
+  try { sessionStorage.setItem(ACTIVE_SESSION_TAB_KEY, String(id)); } catch (e) {}
+}
+function recallActiveSession() {
+  try {
+    var tab = sessionStorage.getItem(ACTIVE_SESSION_TAB_KEY);
+    if (tab) return tab;
+  } catch (e) {}
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.getActiveSessionId === 'function') {
+    try { return Store.getActiveSessionId(); } catch (e) {}
+  }
+  return null;
+}
+
+// Load the ACTIVE session's context + messages and paint them into the chat.
+function hydrateActiveChat() {
+  var Store = window.AuditAIChatStore;
+  if (!Store || !activeSessionId) return;
+  try {
+    var ctx = Store.loadSessionContext(activeSessionId);
+    if (ctx) {
+      if (ctx.lastAuditResult) lastAuditResult = ctx.lastAuditResult;
+      if (ctx.lastAuditAddress) lastAuditAddress = ctx.lastAuditAddress;
+      if (ctx.lastAuditChain !== undefined) lastAuditChain = ctx.lastAuditChain;
+      if (ctx.lastDeployment) lastDeployment = ctx.lastDeployment;
+    }
+    var msgs = Store.loadSessionMessages(activeSessionId);
+    if (msgs && msgs.length) {
+      msgs.forEach(function (m) {
+        appendMsgEl(m);
+        if (m.role === 'user') conversationHistory.push({ role: 'user', content: m.content });
+        else conversationHistory.push({ role: 'assistant', content: m.content });
+      });
+    }
+  } catch (e) {}
+}
+
+// Explicitly open an existing session (e.g. from the Recents list). Rehydrates
+// that session's persisted transcript; never re-runs an audit.
+function switchToSession(sessionId) {
+  if (!sessionId) return;
+  resetChat();
+  activeSessionId = sessionId;
+  rememberActiveSession(sessionId);
+  hydrateActiveChat();
+}
+
 function newChat() {
   var Store = window.AuditAIChatStore;
   if (Store && typeof Store.createSession === 'function') {
-    try { activeSessionId = Store.createSession().sessionId; } catch (e) {}
+    try {
+      activeSessionId = Store.createSession().sessionId;
+      rememberActiveSession(activeSessionId);
+    } catch (e) {}
   }
   resetChat();
 }
@@ -756,7 +814,7 @@ function saveHistory(h) {
 function addToHistory(addr, chain, result) {
   let h = getHistory();
   h = h.filter(x => !(x.address === addr.toLowerCase() && x.chain === chain));
-  h.unshift({ address: addr.toLowerCase(), chain, score: result.score, verdict: result.verdict, ts: Date.now() });
+  h.unshift({ address: addr.toLowerCase(), chain, score: result.score, verdict: result.verdict, ts: Date.now(), sessionId: activeSessionId || undefined });
   if (h.length > 30) h = h.slice(0, 30);
   saveHistory(h);
   renderSidebar();
@@ -799,6 +857,23 @@ function renameHistoryItem(addr, chain) {
   renderSidebar();
 }
 function openHistoryItem(addr, chain) {
+  // Recents are a bridge back to the SESSION that produced that audit — they
+  // rehydrate the persisted transcript and never re-run the scan.
+  const item = findHistItem(addr, chain);
+  if (item && item.sessionId) {
+    const Store = window.AuditAIChatStore;
+    if (Store && typeof Store.getSessionRecord === 'function') {
+      try {
+        if (Store.getSessionRecord(item.sessionId)) {
+          closeHistMenu();
+          switchToSession(item.sessionId);
+          return;
+        }
+      } catch (e) {}
+    }
+  }
+  // Fallback only: no persisted session → re-run the audit (single case).
+  closeHistMenu();
   sendQuick('Audit ' + addr + ' on ' + chain);
 }
 function closeHistMenu() {
@@ -1714,14 +1789,31 @@ function clearPendingAuditTx(hash) {
   try { Store.removeTx(hash); } catch (e) {}
 }
 
-// Application boot (Phase 7.8): ALWAYS open a clean new chat. Previous chats
-// and transactions stay persisted but are never auto-restored into the visible
-// chat. Pending transactions are recovered in the background and remain
-// associated with their origin session.
+// Application boot (Phase 7.8.1): restore the last open chat. If a valid
+// activeSessionId exists (and its session record still exists), rehydrate that
+// chat (reload AND reopen both restore it). Otherwise create a fresh session.
+// Pending transactions are recovered in the background and remain associated
+// with their origin session.
 function bootApp() {
   var Store = window.AuditAIChatStore;
-  if (Store && typeof Store.createSession === 'function') {
-    try { activeSessionId = Store.createSession().sessionId; } catch (e) {}
+  var id = recallActiveSession();
+  var restored = false;
+  if (Store && id && typeof Store.getSessionRecord === 'function') {
+    try {
+      if (Store.getSessionRecord(id)) {
+        activeSessionId = id;
+        hydrateActiveChat();
+        restored = true;
+      }
+    } catch (e) {}
+  }
+  if (!restored) {
+    if (Store && typeof Store.createSession === 'function') {
+      try {
+        activeSessionId = Store.createSession().sessionId;
+        rememberActiveSession(activeSessionId);
+      } catch (e) {}
+    }
   }
   resumePendingAudits();
 }

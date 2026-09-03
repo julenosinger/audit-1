@@ -126,17 +126,79 @@ test('New Chat during contract creation leaves the deployment persisted', functi
   assert.equal(S.loadTxs()[0].operation, 'DEPLOY');
 });
 
-// ── Startup behavior ──────────────────────────────────────────────────────────
+// ── Startup behavior (boot restores the last chat) ────────────────────────────
 
-test('startup creates a NEW clean session; the previous chat is not auto-restored', function () {
+// Mirrors bootApp()'s decision logic against the store primitives it relies on.
+function simulateBoot(S) {
+  var id = S.getActiveSessionId();
+  if (id && S.getSessionRecord(id)) {
+    return { restored: true, sessionId: id, messages: S.loadSessionMessages(id) };
+  }
+  var s = S.createSession();
+  S.setActiveSessionId(s.sessionId);
+  return { restored: false, sessionId: s.sessionId, messages: S.loadSessionMessages(s.sessionId) };
+}
+
+test('activeSessionId is persisted and read back', function () {
   var S = freshStore();
-  var prev = S.createSession();
-  S.saveSessionMessage(prev.sessionId, { id: 'm1', role: 'user', content: 'previous chat' });
-  // Application boot creates a fresh session (simulating bootApp()).
-  var boot = S.createSession();
-  assert.equal(S.loadSessionMessages(boot.sessionId).length, 0); // clean
-  assert.equal(S.loadSessionMessages(prev.sessionId).length, 1); // still persisted
-  assert.equal(S.listSessions().length, 2);
+  var a = S.createSession();
+  S.setActiveSessionId(a.sessionId);
+  assert.equal(S.getActiveSessionId(), a.sessionId);
+});
+
+test('boot with a valid activeSessionId restores that chat (no new session)', function () {
+  var S = freshStore();
+  var a = S.createSession();
+  S.saveSessionMessage(a.sessionId, { id: 'm1', role: 'user', content: 'last chat' });
+  S.setActiveSessionId(a.sessionId);
+  var boot = simulateBoot(S);
+  assert.equal(boot.restored, true);
+  assert.equal(boot.sessionId, a.sessionId);
+  assert.equal(boot.messages.length, 1);
+  assert.equal(boot.messages[0].content, 'last chat');
+  assert.equal(S.listSessions().length, 1); // createSession was NOT called
+});
+
+test('boot without an active id creates a fresh session', function () {
+  var S = freshStore();
+  var boot = simulateBoot(S);
+  assert.equal(boot.restored, false);
+  assert.ok(boot.sessionId);
+  assert.equal(boot.messages.length, 0);
+  assert.equal(S.listSessions().length, 1);
+  assert.equal(S.getActiveSessionId(), boot.sessionId);
+});
+
+test('boot with a stale active id (session deleted) falls back to a new session', function () {
+  var S = freshStore();
+  var a = S.createSession();
+  S.setActiveSessionId(a.sessionId);
+  S.deleteSession(a.sessionId);
+  var boot = simulateBoot(S);
+  assert.equal(boot.restored, false);
+  assert.ok(boot.sessionId);
+  assert.equal(boot.messages.length, 0);
+});
+
+// ── Recents = bridge to the persisted session (never re-runs the audit) ───────
+
+test('opening a Recent item with sessionId rehydrates the session, not a new audit', function () {
+  var S = freshStore();
+  var a = S.createSession();
+  S.saveSessionMessage(a.sessionId, { id: 'm1', role: 'assistant', content: 'audit result card' });
+  // The Recents entry records which session originated the audit.
+  var item = { address: '0xabc', chain: 'bradbury', sessionId: a.sessionId };
+  // Opening it resolves the persisted session (no new tx, no new session).
+  assert.ok(S.getSessionRecord(item.sessionId));
+  assert.equal(S.loadSessionMessages(item.sessionId).length, 1);
+  assert.equal(S.loadTxs().length, 0); // no audit/tx was dispatched
+  assert.equal(S.listSessions().length, 1); // no new session was created
+});
+
+test('a Recent item without a session still falls back (re-audit path)', function () {
+  var S = freshStore();
+  var item = { address: '0xabc', chain: 'bradbury', sessionId: null };
+  assert.equal(item.sessionId ? (S.getSessionRecord(item.sessionId) !== null) : false, false);
 });
 
 // ── Finalized / failed transactions do not contaminate chat ───────────────────

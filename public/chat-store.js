@@ -22,6 +22,7 @@
   var CONTEXT_KEY = 'forgecontract.chat.context.v1';
   var TX_KEY = 'forgecontract.chat.txs.v1';
   var SESSIONS_KEY = 'forgecontract.chat.sessions.v2';
+  var ACTIVE_SESSION_KEY = 'forgecontract.chat.activeSessionId.v1';
 
   var _storage = null;
 
@@ -283,12 +284,17 @@
     return s.context;
   }
 
+  // The id of the chat currently open (persisted so reload + reopen restore it).
+  function getActiveSessionId() { return read(ACTIVE_SESSION_KEY, null); }
+  function setActiveSessionId(id) { write(ACTIVE_SESSION_KEY, id); }
+
   return {
     MESSAGES_KEY: MESSAGES_KEY,
     SESSION_KEY: SESSION_KEY,
     CONTEXT_KEY: CONTEXT_KEY,
     TX_KEY: TX_KEY,
     SESSIONS_KEY: SESSIONS_KEY,
+    ACTIVE_SESSION_KEY: ACTIVE_SESSION_KEY,
     CONTEXT_ALLOWED: CONTEXT_ALLOWED,
     setStorage: setStorage,
     newId: newId,
@@ -317,6 +323,8 @@
     saveSessionMessage: saveSessionMessage,
     clearSessionMessages: clearSessionMessages,
     loadSessionContext: loadSessionContext,
-    saveSessionContext: saveSessionContext
+    saveSessionContext: saveSessionContext,
+    getActiveSessionId: getActiveSessionId,
+    setActiveSessionId: setActiveSessionId
   };
 });
