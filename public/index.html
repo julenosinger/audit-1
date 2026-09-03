@@ -811,16 +811,25 @@ function getHistory() {
 function saveHistory(h) {
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); } catch {}
 }
-function addToHistory(addr, chain, result) {
+function addToHistory(addr, chain, result, sessionId) {
   let h = getHistory();
   h = h.filter(x => !(x.address === addr.toLowerCase() && x.chain === chain));
-  h.unshift({ address: addr.toLowerCase(), chain, score: result.score, verdict: result.verdict, ts: Date.now(), sessionId: activeSessionId || undefined });
+  h.unshift({
+    address: addr.toLowerCase(),
+    chain,
+    score: (result && result.score !== undefined) ? result.score : null,
+    verdict: (result && result.verdict) || null,
+    auditType: (result && result.auditType) || null,
+    ts: Date.now(),
+    sessionId: sessionId || activeSessionId || undefined
+  });
   if (h.length > 30) h = h.slice(0, 30);
   saveHistory(h);
   renderSidebar();
   updateNavStats();
 }
 function scoreColor(s) {
+  if (s === null || s === undefined) return 'var(--muted)';
   return s >= 75 ? 'var(--green)' : s >= 45 ? 'var(--yellow)' : 'var(--red)';
 }
 function findHistItem(addr, chain) {
@@ -911,13 +920,16 @@ function renderSidebar() {
     const stale = Date.now() - item.ts > REPORT_TTL;
     const onchain = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(item.address);
     const title = item.label ? escHtml(item.label) : (item.address.slice(0, 10) + '…' + item.address.slice(-5));
+    const scoreDisplay = (item.score === null || item.score === undefined) ? '—' : item.score;
+    const scoreCol = scoreColor(item.score);
+    const auditTag = item.auditType === 'GENLAYER_SOURCE_REVIEW' ? ' · GenLayer review' : '';
     return `<div class="hist-entry${item.pinned ? ' pinned' : ''}">
-      <div class="hist-score-dot" style="background:${scoreColor(item.score)}"></div>
+      <div class="hist-score-dot" style="background:${scoreCol}"></div>
       <div class="hist-entry-text" onclick="openHistoryItem('${item.address}','${item.chain}')">
         <div class="hist-entry-addr">${item.pinned ? '<span class="pin-dot">📌</span> ' : ''}${title}${onchain ? ' <span class="onchain-badge">ON-CHAIN</span>' : ''}</div>
-        <div class="hist-entry-meta">${item.chain}${stale ? ' · stale' : ''}</div>
+        <div class="hist-entry-meta">${item.chain}${auditTag}${stale ? ' · stale' : ''}</div>
       </div>
-      <span class="hist-entry-score" style="color:${scoreColor(item.score)}">${item.score}</span>
+      <span class="hist-entry-score" style="color:${scoreCol}">${scoreDisplay}</span>
       <button class="hist-kebab" onclick="toggleHistMenu(event,'${item.address}','${item.chain}')" title="More options">⋯</button>
     </div>`;
   }).join('');
@@ -2014,6 +2026,9 @@ function resolveGenLayerContext(d) {
 async function auditGenLayerContract(deployment) {
   const d = deployment || lastDeployment;
   if (!d || !d.address) { appendAIMessage('⚠️ No GenLayer deployment context available.'); return; }
+  // Capture operation ownership: the result persists to the session that
+  // initiated the audit, even if the user switches chats mid-inspection.
+  const opSessionId = activeSessionId;
 
   const ctx = resolveGenLayerContext(d);
   if (!ctx) { appendAIMessage('⚠️ Unknown GenLayer network context.'); return; }
@@ -2071,6 +2086,15 @@ async function auditGenLayerContract(deployment) {
     context: d.source || '', payload: payload, hasBytecode: false, glNetwork: { name: ctx.networkName, chainId: chainId, contract: ctx.auditorContract }
   };
 
+  // Persist through the SAME pipeline used by normal audits (never invent a
+  // numeric score; UNKNOWN stays UNKNOWN). The audit belongs to opSessionId.
+  lastAuditResult = result;
+  lastAuditAddress = d.address;
+  lastAuditChain = chainId;
+  persistAppContext(opSessionId);
+  sessionCount++;
+  addToHistory(d.address, ctx.networkName, result, opSessionId);
+
   const schemaNote = inspected && inspected.schemaAvailable
     ? '\n**Schema:** ' + inspected.readFunctions.length + ' read / ' + inspected.writeFunctions.length + ' write function(s) discovered from the real contract.'
     : (inspected && inspected.error ? '\n**Schema:** ' + escHtml(inspected.error) : '');
@@ -2098,7 +2122,7 @@ async function auditGenLayerContract(deployment) {
       '<div class="rc-acs">Network: <b>' + escHtml(ctx.networkName) + '</b> · Chain ID: <b>' + chainId + '</b></div></div>' +
       '<div class="rc-footer"><div class="rc-footer-actions"><button type="button" class="publish-btn llm-btn" onclick="inspectGenLayerContract(\'' + d.address + '\')">Inspect Contract</button></div></div></div>';
   }
-  appendAIMessage(msg + '\n\nAudit type: **GENLAYER_SOURCE_REVIEW** · Risk: **UNKNOWN** · Confidence: **LOW** · Score: **N/A**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
+  appendAIMessageScoped(opSessionId, msg + '\n\nAudit type: **GENLAYER_SOURCE_REVIEW** · Risk: **UNKNOWN** · Confidence: **LOW** · Score: **N/A**\n\n*Capability ≠ Vulnerability · UNKNOWN ≠ Vulnerable*', card);
 }
 
 // ── Contract interaction (inspect + read/write) — Phase 7.6 ──────────────────
