@@ -537,10 +537,11 @@ let lastAuditAddress = null;
 let lastAuditChain = null;
 let conversationHistory = [];
 
-// Session model (Grok-like): sessionStorage holds only the id of the chat open
-// in THIS tab. Reload (F5) keeps the same tab session → same chat; a brand-new
-// visit has no sessionStorage id → empty panel, but the store is untouched.
-let chatResumed = false;
+// Session model (Phase 7.8): every chat owns a unique sessionId whose messages
+// and context are persisted in ChatStore (session-scoped). activeSessionId is
+// the chat currently visible in this tab. Startup ALWAYS creates a fresh chat;
+// previous chats + transactions stay persisted but are not auto-restored.
+let activeSessionId = null;
 let histMenuOpen = null;
 
 // Phase 7.4: contextual state used by the Intent Router / Context Engine.
@@ -552,7 +553,7 @@ let currentIntent = null;
 
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
-const SESSION_CHAT_KEY = 'auditai.currentChatId';
+const LEGACY_SESSION_ID = 'legacy';
 const GL_AUDIT_STORE = {};
 const AUDIT_NETWORK_KEY = 'auditai.audit.network';
 
@@ -593,22 +594,22 @@ function stopTask() {
   appendAIMessage('⏹ **Task stopped.**');
 }
 
-// New chat / clear conversation. Both reset the visible conversation and the
-// in-memory history and return to the welcome screen. Clear Chat removes the
-// persisted session/messages; New Chat creates a fresh session.
+// New chat / clear conversation. resetChat() only resets the TRANSIENT,
+// in-memory UI state (it never deletes persisted sessions or transactions).
+// Clear Chat additionally clears the ACTIVE session's messages; New Chat
+// creates a brand-new session and leaves every previous session + transaction
+// record intact.
 function resetChat() {
   if (taskRunning && taskAbort) { try { taskAbort.abort(); } catch (e) {} }
   conversationHistory = [];
   lastAuditResult = null;
   lastAuditAddress = null;
   lastAuditChain = null;
+  lastDeployment = null;
+  lastApprovalContext = null;
+  lastPortfolio = null;
+  currentIntent = null;
   pendingBuild = null;
-  chatResumed = false;
-  var Store = window.AuditAIChatStore;
-  if (Store) {
-    try { Store.clearMessages(); } catch (e) {}
-    try { Store.saveContext({ lastAuditResult: null, lastAuditAddress: null, lastAuditChain: null, lastDeployment: null, pendingTransactions: [] }); } catch (e) {}
-  }
   const msgs = document.getElementById('messages');
   const welcome = document.getElementById('welcomeScreen');
   if (msgs) {
@@ -620,47 +621,21 @@ function resetChat() {
   endTask();
 }
 
-// ── sessionStorage helpers (the ONLY per-tab state we keep) ────────────────────
-function getCurrentChatId() {
-  try { return sessionStorage.getItem(SESSION_CHAT_KEY); } catch (e) { return null; }
-}
-function setCurrentChatId(id) {
-  try { sessionStorage.setItem(SESSION_CHAT_KEY, String(id)); } catch (e) {}
-}
-function currentStoreSessionId() {
-  var Store = window.AuditAIChatStore;
-  if (!Store || typeof Store.getSession !== 'function') return null;
-  try { var s = Store.getSession(); return (s && s.sessionId) || null; } catch (e) { return null; }
-}
-
-// Mark that THIS tab owns a chat. On a fresh visit (no restored chat) this also
-// drops stale persisted messages so the new chat starts clean — history, audits,
-// pins, txs, network and contract keys are never touched.
-function ensureCurrentChat() {
-  if (!chatResumed) {
-    var Store = window.AuditAIChatStore;
-    if (Store && typeof Store.clearMessages === 'function') {
-      try { Store.clearMessages(); } catch (e) {}
-    }
-    chatResumed = true;
-  }
-  var sid = currentStoreSessionId();
-  if (sid) setCurrentChatId(sid);
-}
-
 function newChat() {
   var Store = window.AuditAIChatStore;
-  if (Store && typeof Store.setSession === 'function') {
-    try {
-      var sid = Store.newId('sess');
-      Store.setSession({ sessionId: sid, createdAt: Date.now() });
-      setCurrentChatId(sid);
-    } catch (e) {}
+  if (Store && typeof Store.createSession === 'function') {
+    try { activeSessionId = Store.createSession().sessionId; } catch (e) {}
   }
   resetChat();
 }
 
-function clearChat() { resetChat(); }
+function clearChat() {
+  var Store = window.AuditAIChatStore;
+  if (Store && typeof Store.clearSessionMessages === 'function' && activeSessionId) {
+    try { Store.clearSessionMessages(activeSessionId); } catch (e) {}
+  }
+  resetChat();
+}
 
 // Phase 7.3: explicit separation of network concerns.
 //   auditNetwork     — read-only network for contract discovery/local audit
@@ -824,7 +799,6 @@ function renameHistoryItem(addr, chain) {
   renderSidebar();
 }
 function openHistoryItem(addr, chain) {
-  ensureCurrentChat();
   sendQuick('Audit ' + addr + ' on ' + chain);
 }
 function closeHistMenu() {
@@ -962,14 +936,37 @@ function timeStrFrom(ts) {
   catch (e) { return ''; }
 }
 
-// Persist a message through the single ChatStore (no-op if unavailable). Returns
-// the stored message (with its stable id).
-function persistMessage(msg) {
+// Persist a message into a SPECIFIC session (defaults to the active chat).
+// No-op if no session is set. Returns the stored message (with its stable id).
+function persistMessage(msg, sessionId) {
+  sessionId = sessionId || activeSessionId;
+  if (!sessionId) return msg;
   var Store = window.AuditAIChatStore;
-  if (Store && typeof Store.saveMessage === 'function') {
-    try { return Store.saveMessage(msg); } catch (e) {}
+  if (Store && typeof Store.saveSessionMessage === 'function') {
+    try { return Store.saveSessionMessage(sessionId, msg); } catch (e) {}
   }
   return msg;
+}
+
+// Append a message to a SPECIFIC session. It is always persisted to that
+// session, but only rendered into the DOM when that session is the currently
+// active chat. This is the operation-ownership guard that prevents a stale
+// async callback (e.g. a GenLayer transaction started in Chat A) from writing
+// into Chat B after the user switched chats.
+function appendScopedMessage(sessionId, role, content, cardHtml) {
+  var msg = { id: newMsgId(), role: role, content: content, cardHtml: cardHtml || null, timestamp: Date.now(), type: role };
+  msg = persistMessage(msg, sessionId);
+  if (sessionId === activeSessionId) {
+    appendMsgEl(msg);
+    conversationHistory.push({ role: role, content: content });
+  }
+  return msg;
+}
+function appendAIMessageScoped(sessionId, md, cardHtml) {
+  return appendScopedMessage(sessionId, 'assistant', md, cardHtml);
+}
+function appendUserMessageScoped(sessionId, text) {
+  return appendScopedMessage(sessionId, 'user', text, null);
 }
 
 // Build the inner HTML for a message (avatar + bubble + card + time).
@@ -1023,7 +1020,6 @@ function upsertMessage(msg) {
 }
 
 function appendUserMessage(text) {
-  ensureCurrentChat();
   var msg = { id: newMsgId(), role: 'user', content: text, cardHtml: null, timestamp: Date.now(), type: 'user' };
   msg = persistMessage(msg);
   appendMsgEl(msg);
@@ -1681,12 +1677,16 @@ function getAppContext() {
   });
 }
 
-// ── Persistence (Phase 7.6.1) — single ChatStore, no secrets ─────────────────
-function persistAppContext() {
+// ── Persistence (Phase 7.6.1 → 7.8) — session-scoped context, no secrets ─────
+// Context is now stored PER-SESSION. The global transaction registry (txs) is
+// separate and unaffected by chat/session changes.
+function persistAppContext(sessionId) {
+  sessionId = sessionId || activeSessionId;
+  if (!sessionId) return;
   var Store = window.AuditAIChatStore;
-  if (!Store || typeof Store.saveContext !== 'function') return;
+  if (!Store || typeof Store.saveSessionContext !== 'function') return;
   try {
-    Store.saveContext({
+    Store.saveSessionContext(sessionId, {
       lastAuditResult: lastAuditResult,
       lastAuditAddress: lastAuditAddress,
       lastAuditChain: lastAuditChain,
@@ -1714,39 +1714,14 @@ function clearPendingAuditTx(hash) {
   try { Store.removeTx(hash); } catch (e) {}
 }
 
-// Restore the persisted conversation + context before first render. Idempotent:
-// it only runs once and never double-appends messages.
-//
-// Grok-like session split: we only PAINT persisted messages when this tab still
-// owns its chat (sessionStorage.currentChatId matches the store session id —
-// i.e. an F5 reload). A brand-new visit has no sessionStorage id, so the panel
-// stays empty (New Chat) while history/audits/txs remain in the store.
-function restoreAppState() {
+// Application boot (Phase 7.8): ALWAYS open a clean new chat. Previous chats
+// and transactions stay persisted but are never auto-restored into the visible
+// chat. Pending transactions are recovered in the background and remain
+// associated with their origin session.
+function bootApp() {
   var Store = window.AuditAIChatStore;
-  if (Store) {
-    try {
-      var ctx = Store.loadContext();
-      if (ctx) {
-        if (ctx.lastAuditResult) lastAuditResult = ctx.lastAuditResult;
-        if (ctx.lastAuditAddress) lastAuditAddress = ctx.lastAuditAddress;
-        if (ctx.lastAuditChain !== undefined) lastAuditChain = ctx.lastAuditChain;
-        if (ctx.lastDeployment) lastDeployment = ctx.lastDeployment;
-      }
-      var sid = getCurrentChatId();
-      var storeSid = currentStoreSessionId();
-      if (sid && storeSid && sid === storeSid) {
-        chatResumed = true;
-        var msgs = Store.loadMessages();
-        if (msgs && msgs.length) {
-          msgs.forEach(function (m) {
-            appendMsgEl(m);
-            if (m.role === 'user') conversationHistory.push({ role: 'user', content: m.content });
-            else conversationHistory.push({ role: 'assistant', content: m.content });
-          });
-        }
-      }
-      // else: new visit → leave the panel empty; persisted data stays put.
-    } catch (e) {}
+  if (Store && typeof Store.createSession === 'function') {
+    try { activeSessionId = Store.createSession().sessionId; } catch (e) {}
   }
   resumePendingAudits();
 }
@@ -1772,8 +1747,13 @@ async function recoverPendingTx(tx) {
   var Tx = window.AuditAIGenLayerTx;
   if (!Tx || typeof Tx.monitorTransaction !== 'function') return;
 
+  // A recovered transaction belongs to its ORIGIN session — never to the newly
+  // created active chat. Progress is written back to that session only.
+  var originSessionId = tx.sessionId || LEGACY_SESSION_ID;
+  GL_TX_SESSION[tx.txHash] = originSessionId;
+
   var isDeploy = tx.operation === 'DEPLOY';
-  appendAIMessage('↻ Reconnected to transaction\n\nTransaction:\n`' + tx.txHash + '`\n\nCurrent state:\n**' + (tx.status || 'UNKNOWN') + '**');
+  appendAIMessageScoped(originSessionId, '↻ Reconnected to transaction\n\nTransaction:\n`' + tx.txHash + '`\n\nCurrent state:\n**' + (tx.status || 'UNKNOWN') + '**');
 
   try {
     var outcome = await Tx.monitorTransaction({
@@ -1791,6 +1771,7 @@ async function recoverPendingTx(tx) {
         chainId: tx.chainId,
         contractAddress: tx.contractAddress || null,
         submittedAt: tx.submittedAt,
+        sessionId: originSessionId,
         source: 'genlayer'
       }
     });
@@ -1809,15 +1790,15 @@ async function recoverPendingTx(tx) {
             status: outcome.status,
             deploymentTimestamp: Date.now()
           };
-          persistAppContext();
-          appendAIMessage('✅ Deployment recovered.\n\nContract:\n`' + contractAddr + '`\n\nStatus: **' + outcome.status + '**');
+          persistAppContext(originSessionId);
+          appendAIMessageScoped(originSessionId, '✅ Deployment recovered.\n\nContract:\n`' + contractAddr + '`\n\nStatus: **' + outcome.status + '**');
         }
       }
       window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
     } else if (outcome.kind === 'FAILED_TERMINAL') {
       window.AuditAIChatStore && window.AuditAIChatStore.updateTx(tx.txHash, { status: outcome.status });
       window.AuditAIChatStore && window.AuditAIChatStore.removeTx(tx.txHash);
-      appendAIMessage('⚠️ Transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
+      appendAIMessageScoped(originSessionId, '⚠️ Transaction `' + tx.txHash + '` reached **' + outcome.status + '**.');
     }
   } catch (e) {}
 }
@@ -1827,6 +1808,7 @@ async function recoverPendingTx(tx) {
 // subscription updates the progress message (in place) and the card badge.
 var GL_TX_TO_ADDR = {};   // txHash -> contract address (audit)
 var GL_TX_TO_BUILD = {};  // txHash -> { build, net } (deploy)
+var GL_TX_SESSION = {};   // txHash -> originSessionId (operation ownership)
 
 function explorerUrlFor(networkId) {
   var V = window.AuditAIGenLayerVerify;
@@ -1872,32 +1854,37 @@ function renderTxProgressContent(state) {
   return parts.join('\n');
 }
 
-// Upsert the progress message (stable id `transaction-progress:{txHash}`).
-function upsertTxMessage(txHash, content, cardHtml) {
+// Upsert the progress message (stable id `transaction-progress:{txHash}`) into
+// the ORIGIN session of the transaction. It only touches the DOM when that
+// session is the active chat.
+function upsertTxMessage(sessionId, txHash, content, cardHtml) {
   var id = (window.AuditAIGenLayerTx && window.AuditAIGenLayerTx.progressKey) ? window.AuditAIGenLayerTx.progressKey(txHash) : ('transaction-progress:' + txHash);
   var ts = Date.now();
   var Store = window.AuditAIChatStore;
-  if (Store && typeof Store.loadMessages === 'function') {
+  if (Store && typeof Store.loadSessionMessages === 'function' && sessionId) {
     try {
-      var msgs = Store.loadMessages();
+      var msgs = Store.loadSessionMessages(sessionId);
       for (var i = 0; i < msgs.length; i++) { if (msgs[i] && msgs[i].id === id) { ts = msgs[i].timestamp; break; } }
     } catch (e) {}
   }
-  var msg = persistMessage({ id: id, role: 'assistant', content: content, cardHtml: cardHtml || null, timestamp: ts, type: 'assistant' });
-  upsertMessage(msg);
+  var msg = persistMessage({ id: id, role: 'assistant', content: content, cardHtml: cardHtml || null, timestamp: ts, type: 'assistant' }, sessionId);
+  if (sessionId === activeSessionId) upsertMessage(msg);
 }
 
 // Single subscription: engine state → persist + chat (in place) + card.
+// The transaction is always written to the GLOBAL registry (with its origin
+// sessionId), while its progress message is written to the origin session only.
 function syncEngineState(state) {
   if (!state || !state.txHash) return;
+  var sessionId = GL_TX_SESSION[state.txHash] || state.sessionId || activeSessionId;
   var Store = window.AuditAIChatStore;
   if (Store && typeof Store.saveTx === 'function') {
-    try { Store.saveTx({ type: state.operation === 'DEPLOY' ? 'GENLAYER_DEPLOY' : 'GENLAYER_AUDIT', operation: state.operation, txHash: state.txHash, networkId: state.networkId, chainId: state.chainId, contractAddress: state.contractAddress || null, submittedAt: state.submittedAt, status: state.status, lastUpdatedAt: state.lastUpdatedAt, acceptedAt: state.acceptedAt, finalizedAt: state.finalizedAt, source: 'genlayer' }); } catch (e) {}
+    try { Store.saveTx({ type: state.operation === 'DEPLOY' ? 'GENLAYER_DEPLOY' : 'GENLAYER_AUDIT', operation: state.operation, txHash: state.txHash, networkId: state.networkId, chainId: state.chainId, contractAddress: state.contractAddress || null, submittedAt: state.submittedAt, status: state.status, lastUpdatedAt: state.lastUpdatedAt, acceptedAt: state.acceptedAt, finalizedAt: state.finalizedAt, sessionId: sessionId, source: 'genlayer' }); } catch (e) {}
   }
 
   var cardHtml = explorerLinkHtml(state.txHash, state.networkId);
   var content = renderTxProgressContent(state);
-  upsertTxMessage(state.txHash, content, cardHtml);
+  upsertTxMessage(sessionId, state.txHash, content, cardHtml);
 
   var addr = GL_TX_TO_ADDR[state.txHash];
   if (addr) setGLAnalysisStatus(addr, state.status);
@@ -2623,6 +2610,7 @@ async function publishToGenLayer(addr) {
   if (!window.AuditAIGenLayer) return;
   const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
+  const opSessionId = activeSessionId;
 
   const net = window.AuditAIGenLayer.getNetwork();
   if (!net || !window.AuditAIGenLayer.isSet(net.contract)) {
@@ -2631,13 +2619,13 @@ async function publishToGenLayer(addr) {
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  appendAIMessage('⚡ Publishing audit to GenLayer (' + (net ? net.name : '') + ')…');
+  appendAIMessageScoped(opSessionId, '⚡ Publishing audit to GenLayer (' + (net ? net.name : '') + ')…');
   const res = await window.AuditAIGenLayer.publish(addr, data.score, contractVerdict(data.verdict), data.summary, {
     account: walletAddress || undefined,
     onStatus: function (state, detail) {
-      if (state === 'SUBMITTED') appendAIMessage('Transaction submitted:\n`' + detail + '`');
-      else if (state === 'ACCEPTED') appendAIMessage('✅ Accepted by GenLayer — waiting for finality…');
-      else if (state === 'FINALIZED') appendAIMessage('✅ Transaction finalized.');
+      if (state === 'SUBMITTED') appendAIMessageScoped(opSessionId, 'Transaction submitted:\n`' + detail + '`');
+      else if (state === 'ACCEPTED') appendAIMessageScoped(opSessionId, '✅ Accepted by GenLayer — waiting for finality…');
+      else if (state === 'FINALIZED') appendAIMessageScoped(opSessionId, '✅ Transaction finalized.');
     }
   });
 
@@ -2646,16 +2634,16 @@ async function publishToGenLayer(addr) {
     markGLButtonPublished(addr);
     renderSidebar();
     const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
-    appendAIMessage('✅ **ON-CHAIN VERIFIED** — audit record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
+    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN VERIFIED** — audit record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
   } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
-    appendAIMessage('⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state does not match the submitted record.\n\nTransaction: `' + res.hash + '`\n\nFields mismatched: ' + (res.mismatchFields && res.mismatchFields.length ? res.mismatchFields.join(', ') : 'unknown') + '\n\nNot marked on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state does not match the submitted record.\n\nTransaction: `' + res.hash + '`\n\nFields mismatched: ' + (res.mismatchFields && res.mismatchFields.length ? res.mismatchFields.join(', ') : 'unknown') + '\n\nNot marked on-chain.');
   } else if (res.fallback) {
     window.AuditAIGenLayer.copyToClipboard(res.calldata);
-    appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
+    appendAIMessageScoped(opSessionId, '⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
   } else if (res.error) {
-    appendAIMessage('⚠️ **' + res.error + '** — not published on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ **' + res.error + '** — not published on-chain.');
   } else {
-    appendAIMessage('⚠️ Not published on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ Not published on-chain.');
   }
 }
 
@@ -2663,6 +2651,7 @@ async function adjudicateGL(addr) {
   if (!window.AuditAIGenLayer) return;
   const data = findGLStore(addr);
   if (!data) { alert('No audit result available for this address.'); return; }
+  const opSessionId = activeSessionId;
 
   const net = window.AuditAIGenLayer.getNetwork();
   if (!net || !window.AuditAIGenLayer.isSet(net.contract)) {
@@ -2671,13 +2660,13 @@ async function adjudicateGL(addr) {
     if (!window.AuditAIGenLayer.isSet(window.AuditAIGenLayer.getContract())) return;
   }
 
-  appendAIMessage('⚡ Adjudicating with GenLayer LLM (' + (net ? net.name : '') + ')…');
+  appendAIMessageScoped(opSessionId, '⚡ Adjudicating with GenLayer LLM (' + (net ? net.name : '') + ')…');
   const res = await window.AuditAIGenLayer.analyzeAndPublish(addr, data.context || data.summary, {
     account: walletAddress || undefined,
     onStatus: function (state, detail) {
-      if (state === 'SUBMITTED') appendAIMessage('Transaction submitted:\n`' + detail + '`');
-      else if (state === 'ACCEPTED') appendAIMessage('✅ Accepted by GenLayer — waiting for finality…');
-      else if (state === 'FINALIZED') appendAIMessage('✅ Transaction finalized.');
+      if (state === 'SUBMITTED') appendAIMessageScoped(opSessionId, 'Transaction submitted:\n`' + detail + '`');
+      else if (state === 'ACCEPTED') appendAIMessageScoped(opSessionId, '✅ Accepted by GenLayer — waiting for finality…');
+      else if (state === 'FINALIZED') appendAIMessageScoped(opSessionId, '✅ Transaction finalized.');
     }
   });
 
@@ -2686,17 +2675,17 @@ async function adjudicateGL(addr) {
     markGLButtonPublished(addr);
     renderSidebar();
     const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
-    appendAIMessage('✅ **ON-CHAIN VERIFIED** — adjudicated record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
+    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN VERIFIED** — adjudicated record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
     applyOnChainResult(addr, res.result);
   } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
-    appendAIMessage('⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state could not be verified as a valid published record.\n\nTransaction: `' + res.hash + '`\n\nNot marked on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state could not be verified as a valid published record.\n\nTransaction: `' + res.hash + '`\n\nNot marked on-chain.');
   } else if (res.fallback) {
     window.AuditAIGenLayer.copyToClipboard(res.calldata);
-    appendAIMessage('⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
+    appendAIMessageScoped(opSessionId, '⚠️ **Off-chain — not published to GenLayer.**\n\n' + res.message + '\n\nCall to copy into GenLayer Studio:\n```\n' + res.calldata + '\n```');
   } else if (res.error) {
-    appendAIMessage('⚠️ **' + res.error + '** — not published on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ **' + res.error + '** — not published on-chain.');
   } else {
-    appendAIMessage('⚠️ Not published on-chain.');
+    appendAIMessageScoped(opSessionId, '⚠️ Not published on-chain.');
   }
 }
 
@@ -2762,7 +2751,7 @@ function setGLAnalyzeBusy(addr, busy) {
   });
 }
 
-function showGenLayerError(err) {
+function showGenLayerError(err, sessionId) {
   const base = String(err || '').split(':')[0];
   const net = window.AuditAIGenLayer ? window.AuditAIGenLayer.getNetwork() : null;
   const netName = net ? net.name : 'the selected network';
@@ -2789,13 +2778,16 @@ function showGenLayerError(err) {
     'UNKNOWN_NETWORK': 'the selected GenLayer network is unknown.',
     'SCHEMA_UNAVAILABLE': 'the contract schema could not be read.'
   };
-  appendAIMessage('⚠️ **' + base + '** — ' + (map[base] || (err + '.')) + ' Local analysis remains valid.');
+  appendAIMessageScoped(sessionId || activeSessionId, '⚠️ **' + base + '** — ' + (map[base] || (err + '.')) + ' Local analysis remains valid.');
 }
 
 async function requestGenLayerAnalysis(addr) {
   const lower = String(addr).toLowerCase();
   const data = findGLStore(addr);
   if (!data || !data.payload) { alert('No local analysis available for this address.'); return; }
+  // Capture operation ownership: all async results must return to THIS chat,
+  // even if the user creates a new chat while consensus is running.
+  const opSessionId = activeSessionId;
 
   if (GL_INFLIGHT[lower]) { appendAIMessage('⏳ GenLayer analysis already in progress for this contract — please wait.'); return; }
 
@@ -2852,7 +2844,7 @@ async function requestGenLayerAnalysis(addr) {
     if (!pf.ok) {
       setGLAnalysisStatus(addr, 'FAILED');
       if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.status = 'FAILED'; window.__GENLAYER_DEBUG__.errorCode = pf.error; }
-      showGenLayerError(pf.error);
+      showGenLayerError(pf.error, opSessionId);
       return;
     }
 
@@ -2862,6 +2854,7 @@ async function requestGenLayerAnalysis(addr) {
         if (state === 'SUBMITTED') {
           data.glTxHash = detail;
           GL_TX_TO_ADDR[detail] = addr;
+          GL_TX_SESSION[detail] = opSessionId;
           persistPendingAuditTx({
             type: 'GENLAYER_AUDIT',
             operation: 'AUDIT_AI',
@@ -2872,6 +2865,7 @@ async function requestGenLayerAnalysis(addr) {
             targetContract: data.address,
             submittedAt: Date.now(),
             status: 'SUBMITTED',
+            sessionId: opSessionId,
             source: 'genlayer'
           });
         }
@@ -2892,18 +2886,18 @@ async function requestGenLayerAnalysis(addr) {
     if (res.status === 'FINALIZED') {
       setGLAnalysisStatus(addr, 'FINALIZED');
       clearPendingAuditTx(data.glTxHash);
-      persistAppContext();
-      showGenLayerResult(addr, res);
+      persistAppContext(opSessionId);
+      showGenLayerResult(addr, res, opSessionId);
     } else if (res.status === 'INVALID') {
       clearPendingAuditTx(data.glTxHash);
       setGLAnalysisStatus(addr, 'INVALID');
       if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.validationStatus = 'invalid'; window.__GENLAYER_DEBUG__.errorCode = 'INVALID'; }
-      appendAIMessage('⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
+      appendAIMessageScoped(opSessionId, '⚠️ GenLayer returned an invalid result (kept local analysis):\n' + (res.errors || []).join('\n'));
     } else {
       setGLAnalysisStatus(addr, 'FAILED');
       if (window.__GENLAYER_DEBUG__) { window.__GENLAYER_DEBUG__.status = 'FAILED'; window.__GENLAYER_DEBUG__.errorCode = res.error; window.__GENLAYER_DEBUG__.errorDetail = res.detail || null; }
       console.error('[GenLayer] error:', res.error, res.detail || '');
-      showGenLayerError(res.error);
+      showGenLayerError(res.error, opSessionId);
     }
   } finally {
     setGLAnalyzeBusy(addr, false);
@@ -2911,7 +2905,7 @@ async function requestGenLayerAnalysis(addr) {
   }
 }
 
-function showGenLayerResult(addr, res) {
+function showGenLayerResult(addr, res, sessionId) {
   const gl = res.genlayer;
   const merged = res.merged && res.merged.final;
   const data = findGLStore(addr);
@@ -2932,12 +2926,12 @@ function showGenLayerResult(addr, res) {
     });
   }
   if (merged) msg += '\nFinal risk: **' + merged.risk + '** (' + merged.status + ')';
-  appendAIMessage(msg);
+  appendAIMessageScoped(sessionId || activeSessionId, msg);
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 initTxEngine();
-restoreAppState();
+bootApp();
 renderSidebar();
 updateNavStats();
 updateGLStatus();
@@ -3094,6 +3088,9 @@ function copyContractSource() {
 async function deployBuiltContract() {
   if (!pendingBuild) { appendAIMessage('No pending contract to deploy.'); return; }
   const build = pendingBuild;
+  // Capture operation ownership: the deployment's result must return to THIS
+  // chat even if the user starts a new chat while consensus is running.
+  const opSessionId = activeSessionId;
   if (DEPLOY_BUSY[build.id]) { appendAIMessage('⏳ Deployment already in progress — please wait.'); return; }
 
   // Capability check FIRST — never simulate an unsupported deployment.
@@ -3145,6 +3142,7 @@ async function deployBuiltContract() {
       onStatus: function (state, detail) {
         if (state === 'SUBMITTED') {
           GL_TX_TO_BUILD[detail] = { build: build, net: net };
+          GL_TX_SESSION[detail] = opSessionId;
         }
       }
     });
@@ -3163,11 +3161,11 @@ async function deployBuiltContract() {
       status: status
     };
     clearPendingAuditTx(res.hash);
-    persistAppContext();
+    persistAppContext(opSessionId);
     const card = buildDeployedCard(build, net, res, status);
-    appendAIMessage(renderDeploymentFinal(build, net, res, status), card);
+    appendAIMessageScoped(opSessionId, renderDeploymentFinal(build, net, res, status), card);
   } catch (e) {
-    showDeploymentError(String((e && e.message) || e), net);
+    showDeploymentError(String((e && e.message) || e), net, opSessionId);
   } finally {
     DEPLOY_BUSY[build.id] = false;
   }
@@ -3200,7 +3198,7 @@ function buildDeployedCard(build, net, res, status) {
   </div>`;
 }
 
-function showDeploymentError(code, net) {
+function showDeploymentError(code, net, sessionId) {
   const netName = net ? net.name : 'the selected network';
   const base = String(code || '').split(':')[0];
   const map = {
@@ -3221,7 +3219,7 @@ function showDeploymentError(code, net) {
   };
   const label = base === 'TRANSACTION_TIMEOUT' ? 'DEPLOYMENT_RPC_UNAVAILABLE' : (base === 'TRANSACTION_FAILED' ? 'DEPLOYMENT_FAILED' : base);
   const suffix = (base === 'TRANSACTION_TIMEOUT') ? 'The transaction may still be processing on-chain.' : 'No deployment was recorded.';
-  appendAIMessage('⚠️ **' + label + '** — ' + (map[base] || (base + '.')) + ' ' + suffix);
+  appendAIMessageScoped(sessionId || activeSessionId, '⚠️ **' + label + '** — ' + (map[base] || (base + '.')) + ' ' + suffix);
 }
 </script>
 </body>

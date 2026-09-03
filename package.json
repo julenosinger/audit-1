@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "esbuild src/genlayer-sdk.js --bundle --format=iife --target=es2020 --outfile=public/genlayer-sdk.bundle.js",
-    "test": "node tests/audit-engine.test.js && node tests/audit-engine.cfg.test.js && node tests/audit-engine.dataflow.test.js && node tests/audit-engine.interprocedural.test.js && node tests/audit-engine.privilege.test.js && node tests/genlayer-auditor.test.js && node tests/genlayer-runtime.test.js && node tests/audit-networks.test.js && node tests/audit-proxy.test.js && node tests/contract-builder.test.js && node tests/audit-discovery.test.js && node tests/contract-studio.test.js && node tests/phase73-policy.test.js && node tests/intent-router.test.js && node tests/phase75-security.test.js && node tests/phase76-bradbury.test.js && node tests/phase761.test.js && node tests/phase762.test.js && node tests/phase77.test.js"
+    "test": "node tests/audit-engine.test.js && node tests/audit-engine.cfg.test.js && node tests/audit-engine.dataflow.test.js && node tests/audit-engine.interprocedural.test.js && node tests/audit-engine.privilege.test.js && node tests/genlayer-auditor.test.js && node tests/genlayer-runtime.test.js && node tests/audit-networks.test.js && node tests/audit-proxy.test.js && node tests/contract-builder.test.js && node tests/audit-discovery.test.js && node tests/contract-studio.test.js && node tests/phase73-policy.test.js && node tests/intent-router.test.js && node tests/phase75-security.test.js && node tests/phase76-bradbury.test.js && node tests/phase761.test.js && node tests/phase762.test.js && node tests/phase77.test.js && node tests/phase78-chat-isolation.test.js"
   },
   "repository": {
     "type": "git",

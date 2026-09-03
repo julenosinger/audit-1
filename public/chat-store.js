@@ -21,6 +21,7 @@
   var SESSION_KEY = 'forgecontract.chat.session.v1';
   var CONTEXT_KEY = 'forgecontract.chat.context.v1';
   var TX_KEY = 'forgecontract.chat.txs.v1';
+  var SESSIONS_KEY = 'forgecontract.chat.sessions.v2';
 
   var _storage = null;
 
@@ -170,11 +171,124 @@
     write(TX_KEY, list);
   }
 
+  // ── Session-scoped messages + context (Phase 7.8, v2, additive) ─────────────
+  // Sessions are persisted under SESSIONS_KEY. Each session owns its own
+  // messages + context. The global transaction registry (TX_KEY) stays global:
+  // a blockchain transaction never depends on a chat's lifetime.
+  //
+  // The v1 keys (MESSAGES_KEY / SESSION_KEY / CONTEXT_KEY) are left untouched for
+  // backward compatibility and are migrated LOSSLESSLY into a legacy session the
+  // first time the v2 store is initialized. Nothing here deletes v1 data.
+
+  function sessionsList() {
+    migrateLegacyV1();
+    return read(SESSIONS_KEY, []) || [];
+  }
+  function writeSessions(list) { write(SESSIONS_KEY, list); }
+
+  // One-time, lossless, idempotent migration: if v2 has never been written and
+  // legacy v1 data exists, preserve it as a `legacy` session. Never removes the
+  // v1 keys and never runs twice.
+  function migrateLegacyV1() {
+    if (read(SESSIONS_KEY, null) !== null) return; // v2 already initialized
+    var msgs = read(MESSAGES_KEY, null);
+    var ctx = read(CONTEXT_KEY, null);
+    var sess = read(SESSION_KEY, null);
+    var list = [];
+    if (msgs !== null || ctx !== null || sess !== null) {
+      list.push({
+        sessionId: (sess && sess.sessionId) || newId('legacy'),
+        createdAt: (sess && sess.createdAt) || Date.now(),
+        updatedAt: (sess && sess.updatedAt) || Date.now(),
+        legacy: true,
+        messages: (Array.isArray(msgs) ? msgs : []).map(sanitizeMessage),
+        context: sanitizeContext(ctx || {})
+      });
+    }
+    writeSessions(list);
+  }
+
+  function findSessionIndex(list, id) {
+    for (var i = 0; i < list.length; i++) { if (list[i] && list[i].sessionId === id) return i; }
+    return -1;
+  }
+
+  function createSession() {
+    migrateLegacyV1();
+    var rec = { sessionId: newId('sess'), createdAt: Date.now(), updatedAt: Date.now(), messages: [], context: {} };
+    var list = read(SESSIONS_KEY, []) || [];
+    list.push(rec);
+    writeSessions(list);
+    return rec;
+  }
+
+  function listSessions() { return sessionsList(); }
+
+  function getSessionRecord(sessionId) {
+    var list = sessionsList();
+    var i = findSessionIndex(list, sessionId);
+    return i >= 0 ? list[i] : null;
+  }
+
+  // Removes ONLY one session's messages + context. Transaction records are
+  // untouched (they are global).
+  function deleteSession(sessionId) {
+    var list = sessionsList().filter(function (s) { return s && s.sessionId !== sessionId; });
+    writeSessions(list);
+  }
+
+  function loadSessionMessages(sessionId) {
+    var s = getSessionRecord(sessionId);
+    return s ? (s.messages || []) : [];
+  }
+
+  function saveSessionMessage(sessionId, msg) {
+    var m = sanitizeMessage(msg);
+    var list = sessionsList();
+    var i = findSessionIndex(list, sessionId);
+    var s;
+    if (i >= 0) s = list[i];
+    else { s = { sessionId: sessionId, createdAt: Date.now(), updatedAt: Date.now(), messages: [], context: {} }; list.push(s); }
+    var mi = findIndex(s.messages || [], m.id);
+    if (mi >= 0) s.messages[mi] = m; else s.messages.push(m);
+    s.updatedAt = Date.now();
+    writeSessions(list);
+    return m;
+  }
+
+  function clearSessionMessages(sessionId) {
+    var list = sessionsList();
+    var i = findSessionIndex(list, sessionId);
+    if (i < 0) return;
+    list[i].messages = [];
+    list[i].updatedAt = Date.now();
+    writeSessions(list);
+  }
+
+  function loadSessionContext(sessionId) {
+    var s = getSessionRecord(sessionId);
+    return s ? sanitizeContext(s.context || {}) : {};
+  }
+
+  function saveSessionContext(sessionId, ctx) {
+    var clean = sanitizeContext(ctx);
+    var list = sessionsList();
+    var i = findSessionIndex(list, sessionId);
+    var s;
+    if (i >= 0) s = list[i];
+    else { s = { sessionId: sessionId, createdAt: Date.now(), updatedAt: Date.now(), messages: [], context: {} }; list.push(s); }
+    s.context = Object.assign({}, s.context || {}, clean);
+    s.updatedAt = Date.now();
+    writeSessions(list);
+    return s.context;
+  }
+
   return {
     MESSAGES_KEY: MESSAGES_KEY,
     SESSION_KEY: SESSION_KEY,
     CONTEXT_KEY: CONTEXT_KEY,
     TX_KEY: TX_KEY,
+    SESSIONS_KEY: SESSIONS_KEY,
     CONTEXT_ALLOWED: CONTEXT_ALLOWED,
     setStorage: setStorage,
     newId: newId,
@@ -193,6 +307,16 @@
     saveTx: saveTx,
     loadTxs: loadTxs,
     updateTx: updateTx,
-    removeTx: removeTx
+    removeTx: removeTx,
+    migrateLegacyV1: migrateLegacyV1,
+    createSession: createSession,
+    listSessions: listSessions,
+    getSessionRecord: getSessionRecord,
+    deleteSession: deleteSession,
+    loadSessionMessages: loadSessionMessages,
+    saveSessionMessage: saveSessionMessage,
+    clearSessionMessages: clearSessionMessages,
+    loadSessionContext: loadSessionContext,
+    saveSessionContext: saveSessionContext
   };
 });
