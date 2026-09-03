@@ -95,6 +95,16 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .hist-entry-addr{font-family:var(--mono);font-size:11px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hist-entry-meta{font-family:var(--mono);font-size:9px;color:var(--muted2)}
 .hist-entry-score{font-family:var(--mono);font-size:11px;font-weight:600}
+.hist-entry.pinned{background:rgba(0,255,136,.05)}
+.pin-dot{font-size:9px}
+.hist-kebab{width:22px;height:22px;border:none;background:transparent;color:var(--muted);font-family:var(--mono);font-size:14px;line-height:1;cursor:pointer;border-radius:5px;flex-shrink:0;display:none;align-items:center;justify-content:center;padding:0}
+.hist-entry:hover .hist-kebab{display:flex}
+.hist-kebab:hover{background:var(--surf3);color:var(--text)}
+.hist-menu{position:fixed;z-index:10000;min-width:150px;background:var(--surf2);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.5);padding:4px;animation:msgIn .12s ease}
+.hist-menu-item{display:block;width:100%;padding:8px 10px;border:none;background:transparent;color:var(--text);font-family:var(--sans);font-size:13px;text-align:left;cursor:pointer;border-radius:6px}
+.hist-menu-item:hover{background:var(--surf3)}
+.hist-menu-item.danger{color:var(--red)}
+.hist-menu-item.danger:hover{background:rgba(255,59,59,.1)}
 
 /* ── MAIN CHAT AREA ── */
 .chat-area{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
@@ -527,6 +537,12 @@ let lastAuditAddress = null;
 let lastAuditChain = null;
 let conversationHistory = [];
 
+// Session model (Grok-like): sessionStorage holds only the id of the chat open
+// in THIS tab. Reload (F5) keeps the same tab session → same chat; a brand-new
+// visit has no sessionStorage id → empty panel, but the store is untouched.
+let chatResumed = false;
+let histMenuOpen = null;
+
 // Phase 7.4: contextual state used by the Intent Router / Context Engine.
 // Populated only with real data returned by the app flows; never fabricated.
 let lastDeployment = null;
@@ -536,6 +552,7 @@ let currentIntent = null;
 
 const HISTORY_KEY = 'auditai_history_v3';
 const REPORT_TTL  = 48 * 60 * 60 * 1000;
+const SESSION_CHAT_KEY = 'auditai.currentChatId';
 const GL_AUDIT_STORE = {};
 const AUDIT_NETWORK_KEY = 'auditai.audit.network';
 
@@ -586,6 +603,7 @@ function resetChat() {
   lastAuditAddress = null;
   lastAuditChain = null;
   pendingBuild = null;
+  chatResumed = false;
   var Store = window.AuditAIChatStore;
   if (Store) {
     try { Store.clearMessages(); } catch (e) {}
@@ -602,10 +620,42 @@ function resetChat() {
   endTask();
 }
 
+// ── sessionStorage helpers (the ONLY per-tab state we keep) ────────────────────
+function getCurrentChatId() {
+  try { return sessionStorage.getItem(SESSION_CHAT_KEY); } catch (e) { return null; }
+}
+function setCurrentChatId(id) {
+  try { sessionStorage.setItem(SESSION_CHAT_KEY, String(id)); } catch (e) {}
+}
+function currentStoreSessionId() {
+  var Store = window.AuditAIChatStore;
+  if (!Store || typeof Store.getSession !== 'function') return null;
+  try { var s = Store.getSession(); return (s && s.sessionId) || null; } catch (e) { return null; }
+}
+
+// Mark that THIS tab owns a chat. On a fresh visit (no restored chat) this also
+// drops stale persisted messages so the new chat starts clean — history, audits,
+// pins, txs, network and contract keys are never touched.
+function ensureCurrentChat() {
+  if (!chatResumed) {
+    var Store = window.AuditAIChatStore;
+    if (Store && typeof Store.clearMessages === 'function') {
+      try { Store.clearMessages(); } catch (e) {}
+    }
+    chatResumed = true;
+  }
+  var sid = currentStoreSessionId();
+  if (sid) setCurrentChatId(sid);
+}
+
 function newChat() {
   var Store = window.AuditAIChatStore;
   if (Store && typeof Store.setSession === 'function') {
-    try { Store.setSession({ sessionId: Store.newId('sess'), createdAt: Date.now() }); } catch (e) {}
+    try {
+      var sid = Store.newId('sess');
+      Store.setSession({ sessionId: sid, createdAt: Date.now() });
+      setCurrentChatId(sid);
+    } catch (e) {}
   }
   resetChat();
 }
@@ -740,20 +790,86 @@ function addToHistory(addr, chain, result) {
 function scoreColor(s) {
   return s >= 75 ? 'var(--green)' : s >= 45 ? 'var(--yellow)' : 'var(--red)';
 }
+function findHistItem(addr, chain) {
+  const lower = String(addr).toLowerCase();
+  const h = getHistory();
+  for (let i = 0; i < h.length; i++) { if (h[i] && h[i].address === lower && h[i].chain === chain) return h[i]; }
+  return null;
+}
+function histItemKey(addr, chain) { return String(addr).toLowerCase() + '::' + chain; }
+function togglePinHistory(addr, chain) {
+  let h = getHistory();
+  const item = h.find(x => x.address === addr.toLowerCase() && x.chain === chain);
+  if (item) item.pinned = !item.pinned;
+  saveHistory(h);
+  closeHistMenu();
+  renderSidebar();
+}
+function deleteHistoryItem(addr, chain) {
+  let h = getHistory().filter(x => !(x.address === addr.toLowerCase() && x.chain === chain));
+  saveHistory(h);
+  closeHistMenu();
+  renderSidebar();
+  updateNavStats();
+}
+function renameHistoryItem(addr, chain) {
+  let h = getHistory();
+  const item = h.find(x => x.address === addr.toLowerCase() && x.chain === chain);
+  if (!item) { closeHistMenu(); return; }
+  const name = prompt('Rename this item:', item.label || (item.address.slice(0, 10) + '…' + item.address.slice(-5)));
+  if (name === null) { closeHistMenu(); return; }
+  const trimmed = String(name).trim();
+  if (trimmed) { item.label = trimmed; saveHistory(h); }
+  closeHistMenu();
+  renderSidebar();
+}
+function openHistoryItem(addr, chain) {
+  ensureCurrentChat();
+  sendQuick('Audit ' + addr + ' on ' + chain);
+}
+function closeHistMenu() {
+  if (histMenuOpen && histMenuOpen.el) { try { histMenuOpen.el.remove(); } catch (e) {} }
+  histMenuOpen = null;
+}
+function toggleHistMenu(e, addr, chain) {
+  if (e) { e.stopPropagation(); }
+  if (histMenuOpen && histMenuOpen.key === histItemKey(addr, chain)) { closeHistMenu(); return; }
+  closeHistMenu();
+  const item = findHistItem(addr, chain);
+  const pinned = !!(item && item.pinned);
+  const menu = document.createElement('div');
+  menu.className = 'hist-menu';
+  menu.innerHTML =
+    '<button class="hist-menu-item" onclick="togglePinHistory(\'' + addr + '\',\'' + chain + '\')">' + (pinned ? '📌 Unpin' : '📌 Pin') + '</button>' +
+    '<button class="hist-menu-item" onclick="renameHistoryItem(\'' + addr + '\',\'' + chain + '\')">✏️ Rename</button>' +
+    '<button class="hist-menu-item danger" onclick="deleteHistoryItem(\'' + addr + '\',\'' + chain + '\')">🗑 Delete</button>';
+  document.body.appendChild(menu);
+  const btn = e && e.currentTarget ? e.currentTarget : null;
+  const r = btn ? btn.getBoundingClientRect() : { bottom: 80, left: 40 };
+  menu.style.top = Math.min(r.bottom + 4, window.innerHeight - 120) + 'px';
+  menu.style.left = Math.min(r.left, window.innerWidth - 190) + 'px';
+  histMenuOpen = { el: menu, key: histItemKey(addr, chain) };
+}
 function renderSidebar() {
   const h = getHistory();
   const el = document.getElementById('sidebarHist');
   if (!h.length) { el.innerHTML = '<div style="font-family:var(--mono);font-size:10px;color:var(--muted2);padding:6px 10px">No audits yet</div>'; return; }
-  el.innerHTML = h.slice(0, 15).map(item => {
+  const sorted = h.slice().sort((a, b) => {
+    if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+    return (b.ts || 0) - (a.ts || 0);
+  });
+  el.innerHTML = sorted.slice(0, 15).map(item => {
     const stale = Date.now() - item.ts > REPORT_TTL;
     const onchain = window.AuditAIGenLayer && window.AuditAIGenLayer.isPublished(item.address);
-    return `<div class="hist-entry" onclick="sendQuick('Audit ${item.address} on ${item.chain}')">
+    const title = item.label ? escHtml(item.label) : (item.address.slice(0, 10) + '…' + item.address.slice(-5));
+    return `<div class="hist-entry${item.pinned ? ' pinned' : ''}">
       <div class="hist-score-dot" style="background:${scoreColor(item.score)}"></div>
-      <div class="hist-entry-text">
-        <div class="hist-entry-addr">${item.address.slice(0,10)}…${item.address.slice(-5)}${onchain ? ' <span class="onchain-badge">ON-CHAIN</span>' : ''}</div>
+      <div class="hist-entry-text" onclick="openHistoryItem('${item.address}','${item.chain}')">
+        <div class="hist-entry-addr">${item.pinned ? '<span class="pin-dot">📌</span> ' : ''}${title}${onchain ? ' <span class="onchain-badge">ON-CHAIN</span>' : ''}</div>
         <div class="hist-entry-meta">${item.chain}${stale ? ' · stale' : ''}</div>
       </div>
       <span class="hist-entry-score" style="color:${scoreColor(item.score)}">${item.score}</span>
+      <button class="hist-kebab" onclick="toggleHistMenu(event,'${item.address}','${item.chain}')" title="More options">⋯</button>
     </div>`;
   }).join('');
 }
@@ -907,6 +1023,7 @@ function upsertMessage(msg) {
 }
 
 function appendUserMessage(text) {
+  ensureCurrentChat();
   var msg = { id: newMsgId(), role: 'user', content: text, cardHtml: null, timestamp: Date.now(), type: 'user' };
   msg = persistMessage(msg);
   appendMsgEl(msg);
@@ -1599,6 +1716,11 @@ function clearPendingAuditTx(hash) {
 
 // Restore the persisted conversation + context before first render. Idempotent:
 // it only runs once and never double-appends messages.
+//
+// Grok-like session split: we only PAINT persisted messages when this tab still
+// owns its chat (sessionStorage.currentChatId matches the store session id —
+// i.e. an F5 reload). A brand-new visit has no sessionStorage id, so the panel
+// stays empty (New Chat) while history/audits/txs remain in the store.
 function restoreAppState() {
   var Store = window.AuditAIChatStore;
   if (Store) {
@@ -1610,14 +1732,20 @@ function restoreAppState() {
         if (ctx.lastAuditChain !== undefined) lastAuditChain = ctx.lastAuditChain;
         if (ctx.lastDeployment) lastDeployment = ctx.lastDeployment;
       }
-      var msgs = Store.loadMessages();
-      if (msgs && msgs.length) {
-        msgs.forEach(function (m) {
-          appendMsgEl(m);
-          if (m.role === 'user') conversationHistory.push({ role: 'user', content: m.content });
-          else conversationHistory.push({ role: 'assistant', content: m.content });
-        });
+      var sid = getCurrentChatId();
+      var storeSid = currentStoreSessionId();
+      if (sid && storeSid && sid === storeSid) {
+        chatResumed = true;
+        var msgs = Store.loadMessages();
+        if (msgs && msgs.length) {
+          msgs.forEach(function (m) {
+            appendMsgEl(m);
+            if (m.role === 'user') conversationHistory.push({ role: 'user', content: m.content });
+            else conversationHistory.push({ role: 'assistant', content: m.content });
+          });
+        }
       }
+      // else: new visit → leave the panel empty; persisted data stays put.
     } catch (e) {}
   }
   resumePendingAudits();
@@ -2420,8 +2548,16 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     closeModal();
     closeAboutModal();
+    closeHistMenu();
     ta.blur();
   }
+});
+
+// Close the history ⋯ menu on any click outside it (and outside its kebab).
+document.addEventListener('click', e => {
+  if (!histMenuOpen) return;
+  if (e.target && e.target.closest && (e.target.closest('.hist-menu') || e.target.closest('.hist-kebab'))) return;
+  closeHistMenu();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
