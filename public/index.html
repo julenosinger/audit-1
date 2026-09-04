@@ -27,6 +27,8 @@
 <script src="audit-engine.js"></script>
 <script src="local-scan.js"></script>
 <script src="chat-store.js"></script>
+<script src="nemotron-client.js"></script>
+<script src="nemotron-chat.js"></script>
 <style>
 :root {
   --bg:     #050508;
@@ -754,6 +756,11 @@ function findGLStore(addr) {
 // LLM flag — default OFF. Local scan (zero LLM) is the primary path. GenLayer
 // LLM is only reachable via the explicit "Adjudicate" button on a result card.
 const USE_CLAUDE = false;
+
+// Nemotron 3.5 Lightning conversational layer (Phase 8). Enabled by default;
+// when the secure proxy/NVIDIA is unavailable, Chat falls back to the existing
+// deterministic Intent Router + glossary (never a hard dependency).
+const NEMOTRON_ENABLED = true;
 
 // Public read-only RPCs for the EVM chains we can scan locally. Not used for
 // GenLayer (see public/genlayer.js NETWORKS). Arc Testnet has no public RPC here.
@@ -2540,6 +2547,153 @@ async function compareContracts(text, networkId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// NEMOTRON (Phase 8) — conversational intelligence layer
+// ═══════════════════════════════════════════════════════════════════════════════
+// Nemotron is the conversational/orchestration layer. It NEVER controls the
+// wallet, never signs, and never submits transactions. Deterministic engines and
+// the GenLayer lifecycle remain authoritative. This block only builds the
+// controlled context + state providers and renders session-safely.
+
+function buildNemotronContext() {
+  const txNet = (window.AuditAIGenLayer && window.AuditAIGenLayer.getNetwork) ? window.AuditAIGenLayer.getNetwork() : null;
+  const auditNet = (window.AuditAINetworks && window.AuditAINetworks.getNetwork) ? window.AuditAINetworks.getNetwork(auditNetworkId) : null;
+  return {
+    app: { name: 'forgeContract' },
+    network: {
+      audit: auditNet ? { id: auditNet.chainId, name: auditNet.name } : null,
+      transaction: txNet ? { id: txNet.chainId, name: txNet.name } : null
+    },
+    wallet: {
+      connected: !!walletAddress,
+      address: walletAddress ? walletAddress.toLowerCase() : null,
+      chainId: walletChainId || null
+    },
+    activeChat: { sessionId: activeSessionId },
+    lastAudit: lastAuditResult ? {
+      available: true,
+      address: lastAuditAddress,
+      score: (typeof lastAuditResult.score === 'number') ? lastAuditResult.score : null,
+      verdict: lastAuditResult.verdict || null,
+      findingCount: (lastAuditResult.findings || []).length
+    } : { available: false },
+    lastDeployment: lastDeployment ? {
+      available: true,
+      address: lastDeployment.address,
+      networkId: lastDeployment.networkId || lastDeployment.network || null
+    } : { available: false },
+    pendingTransactionCount: pendingAuditTxs().length
+  };
+}
+
+// Real state providers for the read-only tools. Every value is real app/chain
+// state — never fabricated. A tool that cannot reach real data reports
+// "unavailable" instead of inventing a value.
+function buildNemotronState() {
+  return {
+    getWallet: function () {
+      return walletAddress ? { address: walletAddress.toLowerCase(), chainId: walletChainId } : null;
+    },
+    getNetwork: function () {
+      const net = (window.AuditAIGenLayer && window.AuditAIGenLayer.getNetwork) ? window.AuditAIGenLayer.getNetwork() : null;
+      return net ? { id: net.chainId, name: net.name } : null;
+    },
+    getLastAudit: function () {
+      if (!lastAuditResult) return null;
+      return {
+        address: lastAuditAddress,
+        chainId: lastAuditChain,
+        score: (typeof lastAuditResult.score === 'number') ? lastAuditResult.score : null,
+        verdict: lastAuditResult.verdict || null,
+        findings: (lastAuditResult.findings || []).slice(0, 12)
+      };
+    },
+    getHistory: function () { try { return getHistory(); } catch (e) { return []; } },
+    loadTxs: function () { return pendingAuditTxs(); },
+    getTxState: function (hash) {
+      return (window.AuditAIGenLayerTx && window.AuditAIGenLayerTx.state) ? window.AuditAIGenLayerTx.state(hash) : null;
+    },
+    getDeployment: function () { return lastDeployment; },
+    getPortfolio: function () { return lastPortfolio; },
+    getBalance: async function () {
+      if (!walletAddress) return null;
+      const Networks = window.AuditAINetworks;
+      if (!Networks || typeof Networks.jsonRpc !== 'function') return null;
+      const net = Networks.getNetwork(auditNetworkId);
+      if (!net || !net.rpc) return null;
+      try {
+        const hex = await Networks.jsonRpc(net.rpc, 'eth_getBalance', [walletAddress, 'latest']);
+        const wei = Networks.hexToInt ? Networks.hexToInt(hex) : parseInt(String(hex).replace(/^0x/i, ''), 16);
+        if (wei === null || wei === undefined || isNaN(wei)) return null;
+        const decimals = (net.nativeCurrency && net.nativeCurrency.decimals) || 18;
+        const symbol = (net.nativeCurrency && net.nativeCurrency.symbol) || 'ETH';
+        const formatted = (wei / Math.pow(10, decimals)).toFixed(4);
+        return { balance: String(wei), formatted: formatted, symbol: symbol };
+      } catch (e) { return null; }
+    }
+  };
+}
+
+// Dispatch a Nemotron-recognized intent back into the existing deterministic
+// handlers (the single brain). Returns true when a handler ran.
+async function dispatchReroute(intentName, text, address) {
+  switch (intentName) {
+    case 'AUDIT_CONTRACT': await handleAuditIntent(address); return true;
+    case 'CREATE_CONTRACT': await handleCreateContract(text); return true;
+    case 'INSPECT_CONTRACT': await inspectGenLayerContract(address); return true;
+    case 'INTERACT_CONTRACT': await interactGenLayerContract(address); return true;
+    case 'CHECK_APPROVALS': await checkApprovals(); return true;
+    case 'ASSESS_APPROVAL': assessApproval(); return true;
+    case 'VIEW_PORTFOLIO': await scanPortfolio(); return true;
+    case 'EXPLAIN_FINDINGS': explainFindings(); return true;
+  }
+  return false;
+}
+
+// Run the Nemotron path for a free-form message. Returns true when the AI
+// produced an answer (message / tool result / reroute); false when unavailable
+// (so the caller falls back to the deterministic glossary). Session-safe: the
+// origin session id is captured BEFORE any await.
+async function handleNemotronMessage(text) {
+  if (!NEMOTRON_ENABLED) return false;
+  const Chat = window.AuditAINemotronChat;
+  if (!Chat || typeof Chat.handleMessage !== 'function') return false;
+
+  const originSessionId = activeSessionId;
+  const ctx = buildNemotronContext();
+  const history = conversationHistory.slice(-10).map(function (m) { return { role: m.role, content: m.content }; });
+
+  showTyping();
+  let res = null;
+  try {
+    res = await Chat.handleMessage(text, ctx, history, { sessionId: originSessionId, state: buildNemotronState() });
+  } catch (e) { res = null; }
+  removeTyping();
+
+  if (!res) return false;
+
+  // Nemotron unavailable / invalid → let the caller run the deterministic fallback.
+  if (!res.ok) return false;
+
+  // Nemotron recognized a deterministic intent the regex router missed.
+  if (res.reroute) {
+    if (res.message) appendAIMessageScoped(originSessionId, res.message);
+    // Session guard: never dispatch an async handler into a chat the user
+    // switched away from while the AI was answering.
+    if (originSessionId !== activeSessionId) return true;
+    const params = (res.intent && res.intent.parameters) || {};
+    const addr = params.address || params.contract || params.target || null;
+    return dispatchReroute(res.reroute, text, addr);
+  }
+
+  let md = res.message || '';
+  if (md && !res.tool && res.source === 'nemotron') {
+    md = '**AI** — ' + md;
+  }
+  appendAIMessageScoped(originSessionId, md);
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // HANDLE INPUT
 // ═══════════════════════════════════════════════════════════════════════════════
 async function handleInput() {
@@ -2578,8 +2732,12 @@ async function handleInput() {
       return;
   }
 
-  // General question — local glossary (default) or Claude (flag)
+  // General question — Nemotron first (Phase 8), then deterministic glossary.
   if (!USE_CLAUDE) {
+    if (NEMOTRON_ENABLED) {
+      const handled = await handleNemotronMessage(text);
+      if (handled) { document.getElementById('sendBtn').disabled = false; return; }
+    }
     removeTyping();
     const local = window.AuditAILocalScan && window.AuditAILocalScan.glossary(text);
     if (local) {

@@ -26,7 +26,31 @@ and reads the contract state before showing an on-chain badge; the Studio
 copy-call fallback (no wallet / no SDK) is explicitly **off-chain**.
 - **`functions/api/claude.js`** — optional Anthropic proxy (kept for regression,
   but **not required**; disabled by default via `USE_CLAUDE = false`).
+- **`functions/api/chat.js`** — secure proxy for the Nemotron conversational layer
+  (Phase 8). Reads the `NVIDIA_API_KEY` Cloudflare Secret server-side; the browser
+  only ever calls `/api/chat`.
+- **`public/nemotron-client.js` / `public/nemotron-chat.js`** — Nemotron 3.5
+  Lightning conversational intelligence: normalization, validation, allowlisted
+  read-only tools, and the deterministic Intent Router fallback. No API key, no
+  wallet access, no transaction execution.
 - **`wrangler.toml`** — Cloudflare Pages project `auditai`.
+
+## Nemotron (Phase 8)
+
+The Chat uses NVIDIA **Nemotron 3.5 Lightning** as its conversational/orchestration
+layer (via `public/nemotron-client.js` → `functions/api/chat.js` → NVIDIA).
+Nemotron never controls the wallet, never signs, never submits transactions, and
+never fabricates blockchain data — the deterministic engines, the Intent Router,
+and the GenLayer lifecycle remain authoritative. If NVIDIA is unavailable, the
+Chat falls back to the existing deterministic router + glossary.
+
+### NVIDIA_API_KEY (secret, server-side only)
+
+- **Production**: set `NVIDIA_API_KEY` as a Cloudflare Secret on the `auditai`
+  Pages project (Settings → Variables and Secrets → Secrets). The browser never
+  receives it.
+- **Local**: `npx wrangler pages dev public` and create a git-ignored
+  `.dev.vars` file containing `NVIDIA_API_KEY=...`.
 
 ## LLM
 

@@ -12,6 +12,9 @@ pages_build_output_dir = "public"
 #   ANTHROPIC_MODEL     default: claude-sonnet-4-20250514
 #   ANTHROPIC_API_URL   default: https://api.anthropic.com/v1/messages
 #   ANTHROPIC_VERSION   default: 2023-06-01
+#
+# Phase 8 (Nemotron) secret — set NVIDIA_API_KEY as a Secret (never in frontend):
+#   NVIDIA_API_KEY      (required for AI chat; the /api/chat proxy reads it)
 
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
