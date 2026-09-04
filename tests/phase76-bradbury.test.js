@@ -9,9 +9,9 @@ const GenLayerClient = require('../public/genlayer-client.js');
 const Interaction = require('../public/genlayer-interaction.js');
 const Router = require('../public/intent-router.js');
 
-const BRADBURY_ADDR = '0x119Ac58AF8546Df0B0E55eB24277C756d9458000';
+const BRADBURY_ADDR = '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76';
 const BRADBURY_ADDR_LOWER = BRADBURY_ADDR.toLowerCase();
-const BRADBURY_TX = '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc';
+const BRADBURY_TX = '';
 
 const TEST_NETWORKS = {
   studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0x' + 'ab'.repeat(20), deployed: true },
@@ -309,7 +309,7 @@ test('buildContext carries a Bradbury deployment through (activeContract)', func
 // ── 30. nextActions ──────────────────────────────────────────────────────────
 
 test('nextActions after Bradbury deployment suggests only real actions', function () {
-  var ctx = Router.buildContext({ lastDeployment: { address: BRADBURY_ADDR, txHash: BRADBURY_TX, networkId: 'genlayerBradbury' } });
+  var ctx = Router.buildContext({ lastDeployment: { address: BRADBURY_ADDR, txHash: '0x' + 'ab'.repeat(32), networkId: 'genlayerBradbury' } });
   var ids = Router.nextActions(ctx).map(function (a) { return a.id; });
   assert.ok(ids.indexOf('audit_contract') !== -1);
   assert.ok(ids.indexOf('inspect_contract') !== -1);

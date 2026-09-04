@@ -39,10 +39,11 @@
       id: 'bradbury', name: 'Bradbury Testnet', chainId: 4221,
       rpc: 'https://rpc-bradbury.genlayer.com',
       explorer: 'https://explorer-bradbury.genlayer.com/',
-      contract: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000', deployed: true,
+      // v2 AuditAI (contracts/audit_ai_v2.py) — fresh Bradbury deployment.
+      contract: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76', deployed: true,
       currency: 'GEN',
-      knownContract: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000',
-      knownDeploymentTx: '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc'
+      knownContract: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76',
+      knownDeploymentTx: ''
     }
   };
   var DEFAULT_NETWORK_ID = 'bradbury';
@@ -51,13 +52,13 @@
   // pairs a real contract address with its deployment network + chain id so the
   // app can recognize it and interact via the GenLayer SDK (never eth_getCode).
   var KNOWN_CONTRACTS = {
-    '0x119ac58af8546df0b0e55eb24277c756d9458000': {
+    '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76': {
       networkId: 'bradbury',
       network: 'bradbury',
       name: 'Bradbury Testnet',
       chainId: 4221,
-      address: '0x119Ac58AF8546Df0B0E55eB24277C756d9458000',
-      deploymentTx: '0x79b33023be587678e6419526462209168598a1b5b20279dc45ef904b5561cabc'
+      address: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76',
+      deploymentTx: ''
     },
     '0xf2c549bf2dc106a28354b1444298dd460601856b': {
       networkId: 'studionet',
@@ -475,6 +476,120 @@
       return norm.value;
     }
 
+    // ── v2 verified analysis (analyze_verified) ───────────────────────────────
+    // Full lifecycle: verify schema → write analyze_verified(target, chain_id,
+    // block_number) → wait FINALIZED → read latest_id → read get_record. The
+    // caller passes only pointers; the validators fetch the code/block and the
+    // record comes back bound to that fetch. Returns { hash, id, record }.
+    async function analyzeVerified(target, chainId, blockNumber, opts) {
+      opts = opts || {};
+      emit(opts, 'PREPARING');
+      if (!available()) throw new Error('SDK_UNAVAILABLE');
+      var n = network();
+      if (!n) throw new Error('UNKNOWN_NETWORK');
+      if (!n.deployed) throw new Error('GENLAYER_AUDITOR_NOT_DEPLOYED');
+      var auditorAddr = opts.contractAddress || n.contract;
+      if (!auditorAddr) throw new Error('GENLAYER_AUDITOR_NOT_DEPLOYED');
+      if (opts.contractAddress && n.contract && String(opts.contractAddress).toLowerCase() !== String(n.contract).toLowerCase()) {
+        throw new Error('NETWORK_CONTRACT_MISMATCH');
+      }
+
+      emit(opts, 'CONNECTING', { contract: auditorAddr });
+      var c = ensureRead();
+      var sch;
+      try { sch = await c.getContractSchema(auditorAddr); }
+      catch (e) {
+        throw new Error(toErrorCode(e) === 'GENLAYER_NETWORK_UNAVAILABLE' ? 'GENLAYER_NETWORK_UNAVAILABLE' : 'CONTRACT_UNAVAILABLE');
+      }
+      if (!sch || !sch.methods) throw new Error('SCHEMA_UNAVAILABLE');
+      if (!sch.methods['analyze_verified']) throw new Error('METHOD_MISSING: analyze_verified');
+      if (!sch.methods['latest_id']) throw new Error('METHOD_MISSING: latest_id');
+      if (!sch.methods['get_record']) throw new Error('METHOD_MISSING: get_record');
+
+      var account = opts.account;
+      emit(opts, 'WAITING_WALLET');
+      if (!account) throw new Error('WALLET_REQUIRED');
+
+      var wc;
+      try { wc = sdk.createClient({ chain: sdkChain(), account: account }); }
+      catch (e) { throw new Error(toErrorCode(e)); }
+
+      var tx;
+      try {
+        tx = await wc.writeContract({
+          address: auditorAddr,
+          functionName: 'analyze_verified',
+          args: [target, String(chainId), String(blockNumber)],
+          value: BigInt(0)
+        });
+      } catch (e) { throw new Error(toErrorCode(e)); }
+
+      var hash = (tx && typeof tx === 'object' && tx.hash !== undefined) ? tx.hash : (typeof tx === 'string' ? tx : null);
+      if (!hash) throw new Error('NO_TX_HASH');
+
+      emit(opts, 'SUBMITTED', hash);
+
+      var txEngine = (typeof globalThis !== 'undefined' && globalThis.AuditAIGenLayerTx) ? globalThis.AuditAIGenLayerTx : null;
+      if (!txEngine || typeof txEngine.monitorTransaction !== 'function') {
+        throw new Error('SDK_UNAVAILABLE');
+      }
+
+      var outcome = await txEngine.monitorTransaction({
+        hash: hash,
+        getStatus: function (h) { return c.getTransaction({ hash: h }); },
+        onStatus: function (state, detail) { emit(opts, state, detail); },
+        until: 'FINALIZED',
+        pollInterval: opts.pollInterval,
+        maxConsecutiveRpcErrors: opts.maxConsecutiveRpcErrors,
+        maxAttempts: opts.maxAttempts,
+        meta: {
+          txHash: hash,
+          operation: 'AUDIT_AI',
+          networkId: networkId,
+          chainId: n.chainId,
+          contractAddress: auditorAddr,
+          submittedAt: Date.now(),
+          source: 'genlayer'
+        }
+      });
+
+      if (!outcome.ok || outcome.kind === 'RPC_UNAVAILABLE') {
+        throw new Error('GENLAYER_NETWORK_UNAVAILABLE');
+      }
+      if (outcome.kind === 'FAILED_TERMINAL') {
+        throw new Error(outcome.status === 'CANCELED' ? 'TRANSACTION_CANCELED' : 'TRANSACTION_UNDETERMINED');
+      }
+      if (outcome.tx && String(outcome.tx.txExecutionResultName) === 'FINISHED_WITH_ERROR') {
+        throw new Error('TRANSACTION_FAILED');
+      }
+
+      // Recover the record id created by the write, then read the record.
+      var rid = null;
+      var recoveryAttempts = (opts.recoveryRetries === undefined) ? 5 : opts.recoveryRetries;
+      for (var ri = 0; ri < recoveryAttempts; ri++) {
+        try {
+          var v = await c.readContract({ address: auditorAddr, functionName: 'latest_id', args: [target], jsonSafeReturn: true });
+          rid = (typeof v === 'string') ? v : null;
+        } catch (e) { rid = null; }
+        if (rid) break;
+        if (ri < recoveryAttempts - 1) await sleepMs(opts.interval || 2000);
+      }
+      if (!rid) throw new Error('AUDIT_RESULT_PENDING');
+
+      var rawRecord = null;
+      try {
+        rawRecord = await c.readContract({ address: auditorAddr, functionName: 'get_record', args: [rid], jsonSafeReturn: true });
+      } catch (e) { rawRecord = null; }
+      if (!rawRecord || rawRecord === 'NO_RECORD') throw new Error('AUDIT_RESULT_PENDING');
+
+      var record = null;
+      try { record = JSON.parse(rawRecord); }
+      catch (e) { record = { raw: rawRecord }; }
+
+      emit(opts, 'COMPLETE', { id: rid, record: record });
+      return { hash: hash, id: rid, record: record, raw: rawRecord };
+    }
+
     // ── Contract deployment (Phase 7 Contract Builder) ───────────────────────
     // Deploys a new contract on the selected GenLayer network via the SDK, then
     // tracks the REAL transaction through the single GenLayerTx engine until
@@ -569,6 +684,7 @@
       getAnalysis: getAnalysis,
       preflight: preflight,
       analyzeEvidence: analyzeEvidence,
+      analyzeVerified: analyzeVerified,
       deployContract: deployContract
     };
   }

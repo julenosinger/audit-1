@@ -87,6 +87,23 @@
     return { score: parts[0], verdict: parts[1], summary: parts.slice(2).join('|') };
   }
 
+  // Parse a v2 record (get_record JSON). Accepts an already-parsed object or a
+  // JSON string. Returns null when the record is absent/unparseable.
+  function parseRecord(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw === 'object') return raw;
+    if (typeof raw === 'string') {
+      var t = raw.trim();
+      if (!t || t === 'NO_RECORD' || t === 'NO_AUDIT') return null;
+      try { return JSON.parse(t); } catch (e) { return null; }
+    }
+    return null;
+  }
+
+  function isHex64(s) {
+    return typeof s === 'string' && /^0x[0-9a-fA-F]{64}$/.test(s.trim());
+  }
+
   function _check(cond, field, matched, mismatch) {
     if (cond) matched.push(field); else mismatch.push(field);
   }
@@ -141,7 +158,29 @@
     };
   }
 
-  // ── Centralized verification entry point ───────────────────────────────────
+  // analyze_verified produces a record bound to code/block the validators
+  // fetched. The badge requires BOTH a code_hash and a block_hash present in the
+  // record read back — never a comparison of frontend findings to the LLM.
+  function verifyAnalyzeVerified(expected, state) {
+    var matched = [], mismatch = [];
+    var rec = parseRecord(state.record);
+    if (!rec) return { status: STATUS.VERIFICATION_PENDING, matched: matched, mismatch: mismatch };
+
+    _check(isHex64(rec.code_hash), 'code_hash', matched, mismatch);
+    _check(isHex64(rec.block_hash), 'block_hash', matched, mismatch);
+    if (expected && expected.target && rec.target !== undefined) {
+      _check(normalizeAddr(rec.target) === normalizeAddr(expected.target), 'target', matched, mismatch);
+    }
+    if (expected && expected.chainId !== undefined && rec.chain_id !== undefined) {
+      _check(String(rec.chain_id) === String(expected.chainId), 'chain_id', matched, mismatch);
+    }
+
+    return {
+      status: mismatch.length === 0 ? STATUS.VERIFIED_ON_CHAIN : STATUS.VERIFICATION_FAILED,
+      matched: matched,
+      mismatch: mismatch
+    };
+  }
   // opts: { action, txHash, contractAddress, networkId, chainId, submittedBy, expected, state }
   //   action: 'publish_audit' | 'analyze_and_publish' | 'analyze_evidence'
   //   expected: { score, verdict, findings, submittedBy }
@@ -167,7 +206,8 @@
     };
 
     // No contract state read at all → cannot verify.
-    if (state.getAudit === undefined || state.getAudit === null) {
+    if ((state.getAudit === undefined || state.getAudit === null) &&
+        (state.record === undefined || state.record === null)) {
       return result;
     }
 
@@ -176,6 +216,8 @@
       v = verifyPublishAudit(expected, state);
     } else if (action === 'analyze_and_publish') {
       v = verifyAnalyzeAndPublish(expected, state);
+    } else if (action === 'analyze_verified') {
+      v = verifyAnalyzeVerified(expected, state);
     } else {
       result.status = STATUS.VERIFICATION_FAILED;
       result.mismatchFields = ['unknown_action:' + action];
@@ -201,6 +243,7 @@
     normalizeScore: normalizeScore,
     normalizeVerdict: normalizeVerdict,
     parseGetAudit: parseGetAudit,
+    parseRecord: parseRecord,
     verifyFinalizedOnChainState: verifyFinalizedOnChainState
   };
 });

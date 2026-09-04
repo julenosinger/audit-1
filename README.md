@@ -11,14 +11,16 @@ Live: <https://forgecontract.xyz/> (mirror: <https://auditai-6di.pages.dev/>)
 - **`public/index.html`** — single-page app (UI + `ethers.js` EVM scanner + chat).
 - **`public/local-scan.js`** — local EVM scanner (zero LLM): bytecode heuristics,
   portfolio scan, ERC-20 approval checks, static glossary.
-- **`public/genlayer.js`** — GenLayer bridge: `publish_audit` / `analyze_and_publish`
-  with a Studio copy-call fallback.
-- **`contracts/audit_ai.py`** — GenLayer Intelligent Contract that records audit
-  results on-chain. Records are mutable, caller-submitted analyses (a later
-  publish overwrites the stored record; not an append-only log).
+- **`public/genlayer.js`** — GenLayer bridge: `analyze_verified` / `publish_audit` /
+  `analyze_and_publish` with a Studio copy-call fallback.
+- **`contracts/audit_ai_v2.py`** — GenLayer Intelligent Contract that records audit
+  results on-chain. Records are append-only and keyed by id: `analyze_verified`
+  has the validators fetch the code/block themselves and binds the record to that
+  fetch (`code_hash` / `block_hash` / `chain_id` / `block_number`); the legacy
+  methods produce `caller_supplied` records. See [`contracts/README.md`](contracts/README.md).
 
-The default GenLayer transaction network is **Bradbury** (AuditAI
-`0x119Ac58AF8546Df0B0E55eB24277C756d9458000`, chainId 4221); Studionet stays
+The default GenLayer transaction network is **Bradbury** (AuditAI v2
+`0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76`, chainId 4221); Studionet stays
 available in the selector. On-chain publish/adjudicate waits for **FINALIZED**
 and reads the contract state before showing an on-chain badge; the Studio
 copy-call fallback (no wallet / no SDK) is explicitly **off-chain**.
@@ -45,7 +47,7 @@ AuditAI now has three paths, and **zero of them require an API key**:
 1. Star the boilerplate repo + **Verify** on the portal.
 2. Add GenLayer networks + faucet **Testnet GEN**.
 3. Create ≥ 1 validator at <https://studio.genlayer.com/validators>.
-4. Studio → **Contracts → Add From File** → `contracts/audit_ai.py`.
+4. Studio → **Contracts → Add From File** → `contracts/audit_ai_v2.py`.
 5. **Run and Debug** → empty constructor → **Deploy**.
 6. Copy the address → paste in the portal step "Deploy your first contract".
 7. Test `publish_audit`, `analyze_and_publish`, and `get_audit` in the Studio panel.

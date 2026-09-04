@@ -259,7 +259,7 @@ test('monitor until FINALIZED: ACCEPTED is intermediate, resolves only at FINALI
 
 test('default GenLayer transaction network is Bradbury', function () {
   assert.equal(GenLayerClient.DEFAULT_NETWORK_ID, 'bradbury');
-  assert.equal(GenLayerClient.NETWORKS.bradbury.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
+  assert.equal(GenLayerClient.NETWORKS.bradbury.contract.toLowerCase(), '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
 });
 
 console.log('\nAll phase762 tests completed.');

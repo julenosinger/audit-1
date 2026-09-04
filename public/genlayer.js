@@ -283,6 +283,85 @@
     return getOnChain(contractAddr);
   }
 
+  // ── v2 verified publish (analyze_verified) ─────────────────────────────────
+  // The caller passes only pointers (target, chainId, blockNumber). The
+  // validators fetch the code/block themselves; the returned record is bound to
+  // that fetch (code_hash + block_hash). The verified badge is granted only when
+  // the record read back carries a code_hash and a block_hash.
+  function verifyRecordOnChain(client, target, contractAddr, id, record, expected, hash) {
+    var net = getNetwork();
+    var Verify = window.AuditAIGenLayerVerify;
+    var verification;
+    if (Verify && typeof Verify.verifyFinalizedOnChainState === 'function') {
+      verification = Verify.verifyFinalizedOnChainState({
+        action: 'analyze_verified',
+        txHash: hash,
+        contractAddress: contractAddr,
+        networkId: net ? net.id : null,
+        chainId: net ? net.chainId : null,
+        submittedBy: expected.submittedBy || null,
+        expected: { target: expected.target, chainId: expected.chainId, blockNumber: expected.blockNumber },
+        state: { record: record }
+      });
+    } else {
+      var hasCode = !!(record && record.code_hash);
+      var hasBlock = !!(record && record.block_hash);
+      verification = {
+        verified: hasCode && hasBlock,
+        status: (hasCode && hasBlock) ? 'VERIFIED_ON_CHAIN' : 'VERIFICATION_PENDING',
+        matchedFields: [],
+        mismatchFields: [],
+        verifiedAt: (hasCode && hasBlock) ? Date.now() : null
+      };
+    }
+    var explorerUrl = (Verify && typeof Verify.explorerTxUrl === 'function')
+      ? Verify.explorerTxUrl(net ? net.id : null, hash)
+      : null;
+    return {
+      ok: true,
+      hash: hash,
+      id: id,
+      record: record,
+      verified: verification.verified,
+      verificationStatus: verification.status,
+      onChain: verification.verified,
+      matchedFields: verification.matchedFields || [],
+      mismatchFields: verification.mismatchFields || [],
+      contract: target,
+      explorerUrl: explorerUrl
+    };
+  }
+
+  // analyzeVerified(addr, chainId, blockNumber, opts) -> Promise
+  //   opts: { account, onStatus, pollInterval, maxConsecutiveRpcErrors }
+  //   resolves { ok, hash, id, record, verified, verificationStatus, onChain }
+  //   only after FINALIZED + read + state verification.
+  function analyzeVerified(addr, chainId, blockNumber, opts) {
+    opts = opts || {};
+    var target = getContract();
+    if (!isSet(target)) {
+      return Promise.resolve({ ok: false, needContract: true, message: 'No GenLayer contract set. Click the top-bar pill first.' });
+    }
+    var client = getClient();
+    var account = opts.account;
+    var args = [addr, String(chainId), String(blockNumber)];
+    if (!client || typeof client.analyzeVerified !== 'function' || !account) {
+      return Promise.resolve(fallbackResult(target, 'analyze_verified', addr, args, 'No wallet connected — the result was NOT verified on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.'));
+    }
+    var expected = { target: String(addr).toLowerCase(), chainId: String(chainId), blockNumber: String(blockNumber), submittedBy: account };
+    return client.analyzeVerified(addr, chainId, blockNumber, { account: account, onStatus: opts.onStatus })
+      .then(function (outcome) {
+        return verifyRecordOnChain(client, target, addr, outcome.id, outcome.record, expected, outcome.hash);
+      })
+      .catch(function (e) {
+        var code = (e && e.message) || 'GENLAYER_ERROR';
+        if (code === 'USER_REJECTED') {
+          return fallbackResult(target, 'analyze_verified', addr, args, 'Signature canceled — the result was NOT verified on-chain. Copy the call below and run it in GenLayer Studio on ' + short(target) + '.');
+        }
+        return { ok: false, error: code, contract: target };
+      });
+  }
+
   function copyToClipboard(text) {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -320,6 +399,7 @@
     publish: publish,
     getOnChain: getOnChain,
     analyzeAndPublish: analyzeAndPublish,
+    analyzeVerified: analyzeVerified,
     getAudit: getAudit,
     getClient: getClient,
     copyToClipboard: copyToClipboard
