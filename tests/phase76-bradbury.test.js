@@ -9,9 +9,9 @@ const GenLayerClient = require('../public/genlayer-client.js');
 const Interaction = require('../public/genlayer-interaction.js');
 const Router = require('../public/intent-router.js');
 
-const BRADBURY_ADDR = '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76';
+const BRADBURY_ADDR = '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331';
 const BRADBURY_ADDR_LOWER = BRADBURY_ADDR.toLowerCase();
-const BRADBURY_TX = '';
+const BRADBURY_TX = '0x59cce95df528dc62cb3a6afeb41441f7c9dc361f799e47eb02dfc4e54c763b95';
 
 const TEST_NETWORKS = {
   studionet: { id: 'studionet', name: 'Studionet', chainId: 61999, rpc: 'https://studio.genlayer.com/api', contract: '0x' + 'ab'.repeat(20), deployed: true },

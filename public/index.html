@@ -729,7 +729,7 @@ function onAuditNetworkChange(id) {
 }
 
 // Transaction / deployment network — GENLAYER ONLY. Bradbury (4221) is the
-// default (canonical AuditAI v2 at 0xC2C6914C…); Studionet (61999) remains
+// default (canonical AuditAI v2 at 0x1BB9A3e4…); Studionet (61999) remains
 // available in the selector. No external EVM network can ever resolve here.
 function getTransactionNetwork() {
   if (!window.AuditAIGenLayer) return null;
@@ -2022,7 +2022,7 @@ function resolveGenLayerContext(d) {
   const networkId = isBradbury ? 'genlayerBradbury' : 'genlayerStudionet';
   const networkName = isBradbury ? 'GenLayer Bradbury Testnet' : 'GenLayer Studionet';
   const chainId = isBradbury ? 4221 : (d.chainId || 61999);
-  const auditorContract = isBradbury ? '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76' : '0xF2c549Bf2Dc106a28354B1444298DD460601856B';
+  const auditorContract = isBradbury ? '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331' : '0xF2c549Bf2Dc106a28354B1444298DD460601856B';
   const execNetworkId = isBradbury ? 'bradbury' : 'studionet';
   return { networkId, networkName, chainId, auditorContract, known, isBradbury, execNetworkId };
 }
@@ -2909,7 +2909,7 @@ async function publishToGenLayer(addr) {
     markGLButtonPublished(addr);
     renderSidebar();
     const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
-    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN VERIFIED** — audit record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
+    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN (caller-supplied)** — record stored on AuditAI.\n\nTransaction: `' + res.hash + '`\nNetwork: **' + (net ? net.name : 'GenLayer') + '**' + txLink + '\n\n*Caller-supplied record — NOT a verified audit (no code/block binding).*');
   } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
     appendAIMessageScoped(opSessionId, '⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state does not match the submitted record.\n\nTransaction: `' + res.hash + '`\n\nFields mismatched: ' + (res.mismatchFields && res.mismatchFields.length ? res.mismatchFields.join(', ') : 'unknown') + '\n\nNot marked on-chain.');
   } else if (res.fallback) {
@@ -2950,7 +2950,7 @@ async function adjudicateGL(addr) {
     markGLButtonPublished(addr);
     renderSidebar();
     const txLink = res.explorerUrl ? ('\n\n[View Transaction ↗](' + res.explorerUrl + ')') : '';
-    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN VERIFIED** — adjudicated record confirmed on AuditAI.\n\nTransaction: `' + res.hash + '`' + txLink + '\n\n*Mutable on-chain record — a later caller submission may overwrite it.*');
+    appendAIMessageScoped(opSessionId, '✅ **ON-CHAIN (caller-supplied LLM)** — adjudicated record stored on AuditAI.\n\nTransaction: `' + res.hash + '`' + txLink + '\n\n*LLM caller-supplied record — NOT a verified audit.*');
     applyOnChainResult(addr, res.result);
   } else if (res.ok && !res.verified && res.verificationStatus === 'VERIFICATION_FAILED') {
     appendAIMessageScoped(opSessionId, '⚠️ **VERIFICATION_FAILED** — transaction finalized, but the contract state could not be verified as a valid published record.\n\nTransaction: `' + res.hash + '`\n\nNot marked on-chain.');
@@ -2962,6 +2962,24 @@ async function adjudicateGL(addr) {
   } else {
     appendAIMessageScoped(opSessionId, '⚠️ Not published on-chain.');
   }
+}
+
+// Resolve an exact, numeric block for a verified audit. `latest` is never a valid
+// consensus context: if the app only has a tip, resolve it via eth_blockNumber on
+// the scan chain's RPC BEFORE the write. Returns a decimal string, or null when
+// the block cannot be resolved (the caller then falls back off-chain).
+async function resolveExactBlockNumber(chainId, networkId) {
+  const N = window.AuditAINetworks;
+  if (!N || typeof N.jsonRpc !== 'function') return null;
+  let scanNet = null;
+  if (networkId && typeof N.getNetwork === 'function') scanNet = N.getNetwork(networkId) || null;
+  if (!scanNet && chainId !== undefined && chainId !== null && typeof N.networkByChainId === 'function') scanNet = N.networkByChainId(chainId) || null;
+  if (!scanNet || !scanNet.rpc) return null;
+  try {
+    const raw = await N.jsonRpc(scanNet.rpc, 'eth_blockNumber', []);
+    const n = N.hexToInt ? N.hexToInt(raw) : parseInt(String(raw), 16);
+    return (n !== null && n > 0) ? String(n) : null;
+  } catch (e) { return null; }
 }
 
 // v2 verified on-chain publish: analyze_verified(target, chainId, blockNumber).
@@ -2981,7 +2999,15 @@ async function verifyOnChainV2(addr) {
   }
 
   const chainId = (data.chainId !== undefined && data.chainId !== null) ? data.chainId : (net ? net.chainId : '');
-  const blockNumber = data.blockNumber || 'latest';
+  // Never pass "latest"/"safe"/"finalized": resolve an exact block BEFORE the
+  // write. If it cannot be resolved, do NOT submit — fall back off-chain.
+  let blockNumber = data.blockNumber;
+  if (blockNumber === 'latest' || blockNumber === 'safe' || blockNumber === 'finalized' || !blockNumber) blockNumber = null;
+  if (!blockNumber) blockNumber = await resolveExactBlockNumber(chainId, data.networkId);
+  if (!blockNumber) {
+    appendAIMessageScoped(opSessionId, '⚠️ **BLOCK_UNRESOLVABLE** — could not resolve an exact block for the scan chain (' + (chainId || 'unknown') + '). Verification was NOT submitted; the result stays off-chain.');
+    return;
+  }
 
   appendAIMessageScoped(opSessionId, '⚡ Verifying on-chain (' + (net ? net.name : '') + ') — validators fetch code at block ' + blockNumber + '…');
   const res = await window.AuditAIGenLayer.analyzeVerified(addr, chainId, blockNumber, {

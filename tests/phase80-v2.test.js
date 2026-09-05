@@ -91,12 +91,13 @@ function makeAdapter(contract) {
 
 test('Bradbury registry points at the new v2 contract (not the v1 address)', function () {
   var reg = GenLayerClient.NETWORKS.bradbury;
-  assert.equal(reg.contract.toLowerCase(), '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
-  assert.equal(reg.knownContract.toLowerCase(), '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
+  assert.equal(reg.contract.toLowerCase(), '0x1bb9a3e40283808d773871a5c9f8dc0a9711b331');
+  assert.equal(reg.knownContract.toLowerCase(), '0x1bb9a3e40283808d773871a5c9f8dc0a9711b331');
   assert.notEqual(reg.contract.toLowerCase(), '0x119ac58af8546df0b0e55eb24277c756d9458000');
-  var k = GenLayerClient.knownContractFor('0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
+  var k = GenLayerClient.knownContractFor('0x1bb9a3e40283808d773871a5c9f8dc0a9711b331');
   assert.ok(k);
   assert.equal(k.chainId, 4221);
+  assert.equal(k.deploymentTx, '0x59cce95df528dc62cb3a6afeb41441f7c9dc361f799e47eb02dfc4e54c763b95');
 });
 
 // ── Adapter submits the exact v2 method ──────────────────────────────────────
@@ -104,11 +105,34 @@ test('Bradbury registry points at the new v2 contract (not the v1 address)', fun
 test('adapter analyzeVerified writes functionName analyze_verified', async function () {
   var contract = mockV2Contract();
   var a = makeAdapter(contract);
-  var out = await a.analyzeVerified(TARGET, 1, 'latest', { account: ACCOUNT });
+  var out = await a.analyzeVerified(TARGET, 1, '23900000', { account: ACCOUNT });
   assert.equal(contract.calls[0], 'analyze_verified');
   assert.ok(out.id);
   assert.equal(out.record.code_hash, '0x' + 'cd'.repeat(32));
   assert.equal(out.record.block_hash, '0x' + 'ab'.repeat(32));
+});
+
+test('adapter analyzeVerified rejects "latest" block (never an ambiguous context)', async function () {
+  var a = makeAdapter();
+  await assert.rejects(function () {
+    return a.analyzeVerified(TARGET, 1, 'latest', { account: ACCOUNT });
+  }, /BLOCK_NUMBER_LATEST_REJECTED/);
+  await assert.rejects(function () {
+    return a.analyzeVerified(TARGET, 1, 'safe', { account: ACCOUNT });
+  }, /BLOCK_NUMBER_LATEST_REJECTED/);
+  await assert.rejects(function () {
+    return a.analyzeVerified(TARGET, 1, 'finalized', { account: ACCOUNT });
+  }, /BLOCK_NUMBER_LATEST_REJECTED/);
+});
+
+test('normalizeBlockNumber accepts exact decimal + hex, rejects latest/safe/finalized/invalid', function () {
+  assert.equal(GenLayerClient.normalizeBlockNumber('23900000'), '23900000');
+  assert.equal(GenLayerClient.normalizeBlockNumber('0x16c6b80'), '0x16c6b80');
+  assert.throws(function () { GenLayerClient.normalizeBlockNumber('latest'); }, /BLOCK_NUMBER_LATEST_REJECTED/);
+  assert.throws(function () { GenLayerClient.normalizeBlockNumber('safe'); }, /BLOCK_NUMBER_LATEST_REJECTED/);
+  assert.throws(function () { GenLayerClient.normalizeBlockNumber('finalized'); }, /BLOCK_NUMBER_LATEST_REJECTED/);
+  assert.throws(function () { GenLayerClient.normalizeBlockNumber(''); }, /BLOCK_NUMBER_REQUIRED/);
+  assert.throws(function () { GenLayerClient.normalizeBlockNumber('abc'); }, /BLOCK_NUMBER_INVALID/);
 });
 
 // ── Two writes to the same addr -> two ids; record 1 intact ─────────────────
@@ -116,8 +140,8 @@ test('adapter analyzeVerified writes functionName analyze_verified', async funct
 test('two analyzeVerified writes to the same addr produce two ids; record 1 intact', async function () {
   var contract = mockV2Contract();
   var a = makeAdapter(contract);
-  var r1 = await a.analyzeVerified(TARGET, 1, 'latest', { account: ACCOUNT });
-  var r2 = await a.analyzeVerified(TARGET, 1, 'latest', { account: ACCOUNT });
+  var r1 = await a.analyzeVerified(TARGET, 1, '23900000', { account: ACCOUNT });
+  var r2 = await a.analyzeVerified(TARGET, 1, '23900001', { account: ACCOUNT });
 
   assert.notEqual(r1.id, r2.id);
   assert.equal(contract.recordCount(), 2);
@@ -139,7 +163,7 @@ test('two analyzeVerified writes to the same addr produce two ids; record 1 inta
 test('adapter analyzeVerified without account => WALLET_REQUIRED', async function () {
   var a = makeAdapter();
   await assert.rejects(function () {
-    return a.analyzeVerified(TARGET, 1, 'latest', {});
+    return a.analyzeVerified(TARGET, 1, '23900000', {});
   }, /WALLET_REQUIRED/);
 });
 

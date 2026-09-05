@@ -34,8 +34,8 @@
     chainId: 4221,
     rpc: 'https://rpc-bradbury.genlayer.com',
     explorer: 'https://explorer-bradbury.genlayer.com/',
-    contract: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76',
-    deploymentTx: ''
+    contract: '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331',
+    deploymentTx: '0x59cce95df528dc62cb3a6afeb41441f7c9dc361f799e47eb02dfc4e54c763b95'
   };
 
   // ── Explicit error taxonomy (never hide a real error behind a generic one) ──

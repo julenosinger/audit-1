@@ -62,9 +62,9 @@ test('registry: Studionet + Bradbury both deployed with AuditAI contracts', func
   assert.equal(reg.studionet.deployed, true);
   assert.match(reg.studionet.contract, /^0x[0-9a-fA-F]{40}$/);
   assert.equal(reg.bradbury.deployed, true);
-  assert.equal(reg.bradbury.contract.toLowerCase(), '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
+  assert.equal(reg.bradbury.contract.toLowerCase(), '0x1bb9a3e40283808d773871a5c9f8dc0a9711b331');
   assert.equal(reg.bradbury.chainId, 4221);
-  assert.equal(reg.bradbury.knownContract.toLowerCase(), '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76');
+  assert.equal(reg.bradbury.knownContract.toLowerCase(), '0x1bb9a3e40283808d773871a5c9f8dc0a9711b331');
 });
 
 test('studionet selects the studionet contract', function () {

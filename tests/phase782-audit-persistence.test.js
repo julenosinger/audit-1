@@ -33,7 +33,7 @@ function genLayerSourceReview(opts) {
     networkId: opts.networkId || 'genlayerBradbury',
     networkName: opts.networkName || 'GenLayer Bradbury Testnet',
     chainId: opts.chainId || 4221,
-    address: opts.address || '0x119Ac58AF8546Df0B0E55eB24277C756d9458000',
+    address: opts.address || '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331',
     txHash: opts.txHash || null,
     risk: 'UNKNOWN',
     confidence: 'LOW',

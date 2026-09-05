@@ -40,10 +40,10 @@
       rpc: 'https://rpc-bradbury.genlayer.com',
       explorer: 'https://explorer-bradbury.genlayer.com/',
       // v2 AuditAI (contracts/audit_ai_v2.py) — fresh Bradbury deployment.
-      contract: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76', deployed: true,
+      contract: '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331', deployed: true,
       currency: 'GEN',
-      knownContract: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76',
-      knownDeploymentTx: ''
+      knownContract: '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331',
+      knownDeploymentTx: '0x59cce95df528dc62cb3a6afeb41441f7c9dc361f799e47eb02dfc4e54c763b95'
     }
   };
   var DEFAULT_NETWORK_ID = 'bradbury';
@@ -52,13 +52,13 @@
   // pairs a real contract address with its deployment network + chain id so the
   // app can recognize it and interact via the GenLayer SDK (never eth_getCode).
   var KNOWN_CONTRACTS = {
-    '0xc2c6914ced272031ecf0da4739bca74a8cbb7d76': {
+    '0x1bb9a3e40283808d773871a5c9f8dc0a9711b331': {
       networkId: 'bradbury',
       network: 'bradbury',
       name: 'Bradbury Testnet',
       chainId: 4221,
-      address: '0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76',
-      deploymentTx: ''
+      address: '0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331',
+      deploymentTx: '0x59cce95df528dc62cb3a6afeb41441f7c9dc361f799e47eb02dfc4e54c763b95'
     },
     '0xf2c549bf2dc106a28354b1444298dd460601856b': {
       networkId: 'studionet',
@@ -133,6 +133,28 @@
     if (/revert|out of gas|invalid opcode/i.test(m)) return 'TRANSACTION_FAILED';
     if (/econnrefused|enotfound|unreachable|failed to fetch|fetch failed|network error/i.test(m)) return 'GENLAYER_NETWORK_UNAVAILABLE';
     return 'GENLAYER_ERROR';
+  }
+
+  // ── v2 block-number normalization (analyze_verified) ───────────────────────
+  // `analyze_verified` binds a record to an EXACT block. `latest` (or any
+  // ambiguous tag like `safe`/`finalized`) is NEVER a valid consensus context:
+  // the caller must resolve it to a concrete number BEFORE the write. Accepted
+  // forms: a decimal integer string ("23900000") or a 0x hex string ("0x16c6b80").
+  function normalizeBlockNumber(blockNumber) {
+    var s = (blockNumber === null || blockNumber === undefined) ? '' : String(blockNumber).trim();
+    if (!s) throw new Error('BLOCK_NUMBER_REQUIRED');
+    if (/^(latest|safe|finalized)$/i.test(s)) throw new Error('BLOCK_NUMBER_LATEST_REJECTED');
+    if (/^0x[0-9a-fA-F]+$/.test(s)) {
+      var hex = parseInt(s.slice(2), 16);
+      if (!Number.isFinite(hex) || hex <= 0) throw new Error('BLOCK_NUMBER_INVALID');
+      return s;
+    }
+    if (/^\d+$/.test(s)) {
+      var dec = Number(s);
+      if (!Number.isFinite(dec) || dec <= 0) throw new Error('BLOCK_NUMBER_INVALID');
+      return s;
+    }
+    throw new Error('BLOCK_NUMBER_INVALID');
   }
 
   // ── Result normalization ────────────────────────────────────────────────────
@@ -484,6 +506,11 @@
     async function analyzeVerified(target, chainId, blockNumber, opts) {
       opts = opts || {};
       emit(opts, 'PREPARING');
+      // Fail closed: `latest` / non-numeric blocks are never a valid consensus
+      // context for a verified audit. The caller must resolve an exact block
+      // BEFORE this write (resolve the tip via eth_blockNumber on the scan
+      // chain's RPC). Rejects "latest", "safe", "finalized", and non-integers.
+      var block = normalizeBlockNumber(blockNumber);
       if (!available()) throw new Error('SDK_UNAVAILABLE');
       var n = network();
       if (!n) throw new Error('UNKNOWN_NETWORK');
@@ -519,7 +546,7 @@
         tx = await wc.writeContract({
           address: auditorAddr,
           functionName: 'analyze_verified',
-          args: [target, String(chainId), String(blockNumber)],
+          args: [target, String(chainId), String(block)],
           value: BigInt(0)
         });
       } catch (e) { throw new Error(toErrorCode(e)); }
@@ -710,6 +737,7 @@
     createAdapter: createAdapter,
     getSdk: getSdk,
     toErrorCode: toErrorCode,
+    normalizeBlockNumber: normalizeBlockNumber,
     normalizeGenLayerResult: normalizeGenLayerResult,
     extractContractAddress: extractContractAddress,
     NETWORKS: NETWORKS,

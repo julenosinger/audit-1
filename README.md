@@ -20,7 +20,7 @@ Live: <https://forgecontract.xyz/> (mirror: <https://auditai-6di.pages.dev/>)
   methods produce `caller_supplied` records. See [`contracts/README.md`](contracts/README.md).
 
 The default GenLayer transaction network is **Bradbury** (AuditAI v2
-`0xC2C6914CED272031ECF0DA4739bcA74a8cbb7D76`, chainId 4221); Studionet stays
+`0x1BB9A3e40283808D773871a5C9F8Dc0a9711B331`, chainId 4221); Studionet stays
 available in the selector. On-chain publish/adjudicate waits for **FINALIZED**
 and reads the contract state before showing an on-chain badge; the Studio
 copy-call fallback (no wallet / no SDK) is explicitly **off-chain**.
